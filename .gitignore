@@ -1,18 +1,31 @@
-﻿# Unreal Engine
+﻿# Visual Studio
+.vs/
+*.VC.db
+*.opendb
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# Unreal Engine
 Binaries/
 DerivedDataCache/
 Intermediate/
 Saved/
 Build/
-.vs/
-*.VC.db
-*.opensdf
-*.opendb
-*.sdf
 *.sln
-*.suo
 *.xcodeproj
 *.xcworkspace
+
+# Compiled object files
+*.obj
+*.pdb
+*.dll
+*.exe
+*.lib
+*.exp
+*.modules
+*.target
 
 # OS
 Thumbs.db
@@ -21,3 +34,9 @@ Desktop.ini
 
 # Logs
 *.log
+
+# UGit / local scripts (optional)
+_finish_*.txt
+_rename_*.ps1
+_finish_*.ps1
+RENAME_SUMMARY.txt

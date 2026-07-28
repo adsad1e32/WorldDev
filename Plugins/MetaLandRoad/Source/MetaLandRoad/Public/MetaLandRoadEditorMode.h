@@ -13,6 +13,8 @@
 
 
 class AWorldSceneManagement;
+struct FGizmoStoredInfoParams;
+class UMoKuEditorGizmoBase;
 
 UENUM()
 enum MoKuEditDisplayMode : int
@@ -53,6 +55,7 @@ public:
 	virtual TMap<FName, TArray<TSharedPtr<FUICommandInfo>>> GetModeCommands() const override;
 	virtual bool MouseMove(FEditorViewportClient* ViewportClient, FViewport* Viewport, int32 x, int32 y) override;
 	virtual bool InputKey(FEditorViewportClient* InViewportClient, FViewport* InViewport, FKey InKey, EInputEvent InEvent)override;
+	virtual bool InputDelta(FEditorViewportClient* InViewportClient, FViewport* InViewport, FVector& InDelta, FRotator& InRot, FVector& InScale) override;
 	virtual void ModeTick(float DeltaTime)override;
 	virtual bool HandleClick(FEditorViewportClient* InViewportClient, HHitProxy* HitProxy, const FViewportClick& Click) override;
 	virtual void Render(const FSceneView* View, FViewport* Viewport, FPrimitiveDrawInterface* PDI) override;

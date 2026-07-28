@@ -36,6 +36,15 @@ public:
 	TSharedPtr<FUICommandInfo> InteractiveTool;
 	TSharedPtr<FUICommandInfo> ShapesTool;
 
+	/** Selection Mode: Alt+E toggles section center-line edit on the selected road. */
+	TSharedPtr<FUICommandInfo> ToggleSectionLineEdit;
+
+	/** Alt+W: native spline + control points for bend/curve edit. */
+	TSharedPtr<FUICommandInfo> EnterNativeSplineEdit;
+
+	/** Alt+T: lane boundary edit (no main center line). */
+	TSharedPtr<FUICommandInfo> ToggleLaneEdit;
+
 };
 
 #if UE_ENABLE_INCLUDE_ORDER_DEPRECATED_IN_5_2

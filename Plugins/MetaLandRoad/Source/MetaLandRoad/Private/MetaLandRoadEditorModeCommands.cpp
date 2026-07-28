@@ -29,6 +29,25 @@ void FMetaLandRoadEditorModeCommands::RegisterCommands()
 
 	REGISTER_TESTMODE_TOOL_COMMAND(InteractiveTool, "Spline", "Ctrl + Click to Generate mesh along with the Spline",EKeys::G);
 	REGISTER_TESTMODE_TOOL_COMMAND(ShapesTool, "Shapes", "Generate Lots mesh between Spline and Junction", EKeys::B);
+	UI_COMMAND(
+		ToggleSectionLineEdit,
+		"Toggle Section Line Edit",
+		"Show or hide section center lines for Add Section on the selected road (Alt+E).",
+		EUserInterfaceActionType::ToggleButton,
+		FInputChord(EModifierKey::Alt, EKeys::E));
+	UI_COMMAND(
+		EnterNativeSplineEdit,
+		"Native Spline Edit",
+		"Toggle native spline path and control points (Alt+W). Press again to exit. Exits section-line mode when entering.",
+		EUserInterfaceActionType::ToggleButton,
+		FInputChord(EModifierKey::Alt, EKeys::W));
+	UI_COMMAND(
+		ToggleLaneEdit,
+		"Lane Edit",
+		"Toggle lane boundary edit on the selected road (Alt+T). No main center line.",
+		EUserInterfaceActionType::ToggleButton,
+		FInputChord(EModifierKey::Alt, EKeys::T));
+
 	TArray<TSharedPtr<FUICommandInfo>> RoadCreatorCommands = {
 	InteractiveTool
 	};

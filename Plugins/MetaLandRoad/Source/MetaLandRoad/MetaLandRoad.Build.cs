@@ -22,6 +22,7 @@ public class MetaLandRoad : ModuleRules
                     "Core",
                     "CoreUObject",
                     "Engine",
+                    "StructUtils",
                     "Projects",
                     "ModelingOperators",
                      "GeometryFramework",
@@ -51,6 +52,7 @@ public class MetaLandRoad : ModuleRules
 				"ModelingComponents",
 				"GizmoEdMode",
 				"LevelEditor",
+				"ToolMenus",
 				"ContentBrowser",
 				"ContentBrowserData",
 				"Landscape",
@@ -62,6 +64,11 @@ public class MetaLandRoad : ModuleRules
 				"LandscapeEditorUtilities",
 				"LandscapeEditor",
 				"PCGEditor",
+				"ComponentVisualizers",
+				"MaterialEditor",
+				"AssetRegistry",
+				"TypedElementFramework",
+				"TypedElementRuntime",
 				// ... add private dependencies that you statically link with here ...	
 
 				// "DeveloperSettings",

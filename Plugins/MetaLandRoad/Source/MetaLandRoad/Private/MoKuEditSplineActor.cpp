@@ -10,10 +10,13 @@
 #include "LevelEditor.h"
 #include "EdModeInteractiveToolsContext.h"
 #include "MoKuEditSplinesComponent.h"
+#include "MetaLandRoadProfile.h"
+#include "MetaLandRoadSplineComponent.h"
 #include "DynamicMesh/DynamicMesh3.h"
 #include "DynamicMesh/MeshNormals.h"
 #include "EditSplineRoadInfo.h"
 #include "Components/SceneCaptureComponent2D.h"
+#include "Components/SceneComponent.h"
 #include "Kismet/KismetRenderingLibrary.h"
 
 
@@ -24,27 +27,37 @@ using namespace UE::Geometry;
 AMoKuEditSplineActor::AMoKuEditSplineActor(const FObjectInitializer& ObjectInitializer)
 	:Super(ObjectInitializer)
 {
+	DefaultRoadMaterial = TSoftObjectPtr<UMaterialInterface>(FSoftObjectPath(
+		GetAsphaltTestMaterialPath()));
+
+	SceneRoot = CreateDefaultSubobject<USceneComponent>(TEXT("SceneRoot"));
+	SetRootComponent(SceneRoot);
+
 	SplineComponent = CreateDefaultSubobject<UMoKuEditSplinesComponent>(TEXT("MoKuEditSplinesComponent"));
-	DynamicMeshComponent = CreateDefaultSubobject<UDynamicMeshComponent>(TEXT("Mesh"));
+	DynamicMeshComponent = CreateDefaultSubobject<UDynamicMeshComponent>(TEXT("MeshObjectResult"));
 
-	//SurfaceComponent->SetTangentsType(EDynamicMeshComponentTangentsMode::ExternallyProvided);
-
-	if (SplineComponent)
+	if (SceneRoot && SplineComponent)
 	{
-		SetRootComponent(SplineComponent);
-		SplineComponent->SetSplinePointType(0, ESplinePointType::Linear);
+		SplineComponent->SetupAttachment(SceneRoot);
+
+		// Curve (not Linear) — Linear creates hard V corners without mid-angle subdivision.
+		SplineComponent->SetSplinePointType(0, ESplinePointType::Curve);
 		FVector FirstTangent = SplineComponent->GetTangentAtSplinePoint(0, ESplineCoordinateSpace::Local).GetSafeNormal();
 		FVector Start = SplineComponent->GetLocationAtSplinePoint(0, ESplineCoordinateSpace::Local);
 		FVector EndPos = Start + FirstTangent * 10;
 		SplineComponent->SetLocationAtSplinePoint(1, EndPos, ESplineCoordinateSpace::World);
-		DynamicMeshComponent = CreateDefaultSubobject<UDynamicMeshComponent>(TEXT("MeshObjectResult"));
+		SplineComponent->SetSplinePointType(1, ESplinePointType::Curve);
 
 		StartAsset = CreateDefaultSubobject<UStaticMeshComponent>(TEXT("StartStaticMesh"));
 		EndAsset = CreateDefaultSubobject<UStaticMeshComponent>(TEXT("EndStaticMesh"));
-		StartAsset->SetupAttachment(RootComponent);
-		EndAsset->SetupAttachment(RootComponent);
-		DynamicMeshComponent->SetupAttachment(RootComponent);
+		StartAsset->SetupAttachment(SceneRoot);
+		EndAsset->SetupAttachment(SceneRoot);
+		DynamicMeshComponent->SetupAttachment(SceneRoot);
 
+		// Clicking the road mesh in the viewport selects actor + spline via FMetaLandRoadModule::SyncSelectedRoadActorToSpline.
+		DynamicMeshComponent->bSelectable = true;
+		StartAsset->bSelectable = false;
+		EndAsset->bSelectable = false;
 	}
 	IsInit = true;
 	WidgetHelper = CreateWidgetHelper();
@@ -56,6 +69,14 @@ AMoKuEditSplineActor::AMoKuEditSplineActor(const FObjectInitializer& ObjectIniti
 //操作方式待优化
 TArray<FVector> AMoKuEditSplineActor::UpdateInterpolateType(int32 PointIndex,int32 SegmentNum,float Radius)
 {
+	// Legacy: angle-based corner subdivision (arc insert at sharp bends).
+	// Disabled — road mesh uses MetaRoad BuildLinearApproximation instead.
+	(void)PointIndex;
+	(void)SegmentNum;
+	(void)Radius;
+	return TArray<FVector>();
+
+#if 0
 	TArray<FVector> OutInterpolatePoints;
 	if (SplineComponent)
 	{
@@ -120,7 +141,7 @@ TArray<FVector> AMoKuEditSplineActor::UpdateInterpolateType(int32 PointIndex,int
 
 	return OutInterpolatePoints;
 
-
+#endif
 }
 
 TSharedRef<FLegacyEdModeWidgetHelper> AMoKuEditSplineActor::CreateWidgetHelper()
@@ -245,9 +266,75 @@ void AMoKuEditSplineActor::SetSplineComponent(UMoKuEditSplinesComponent* InSplin
 		}
 	}
 }
+void AMoKuEditSplineActor::EnsureRoadComponentHierarchy()
+{
+	if (!SplineComponent)
+	{
+		return;
+	}
+
+	USceneComponent* AttachRoot = SceneRoot;
+	if (!AttachRoot)
+	{
+		AttachRoot = NewObject<USceneComponent>(
+			this,
+			USceneComponent::StaticClass(),
+			TEXT("SceneRoot"),
+			RF_Transactional);
+		if (!AttachRoot)
+		{
+			return;
+		}
+
+		AttachRoot->SetMobility(EComponentMobility::Static);
+		if (!AttachRoot->IsRegistered())
+		{
+			AttachRoot->RegisterComponent();
+		}
+
+		SceneRoot = AttachRoot;
+		SetRootComponent(AttachRoot);
+	}
+	else if (GetRootComponent() != AttachRoot)
+	{
+		SetRootComponent(AttachRoot);
+	}
+
+	if (SplineComponent->GetAttachParent() != AttachRoot)
+	{
+		SplineComponent->AttachToComponent(AttachRoot, FAttachmentTransformRules::KeepWorldTransform);
+	}
+
+	auto ReparentIfUnderSpline = [this, AttachRoot](USceneComponent* Comp)
+	{
+		if (Comp && Comp->GetAttachParent() == SplineComponent)
+		{
+			Comp->AttachToComponent(AttachRoot, FAttachmentTransformRules::KeepWorldTransform);
+		}
+	};
+
+	ReparentIfUnderSpline(DynamicMeshComponent);
+	ReparentIfUnderSpline(StartAsset);
+	ReparentIfUnderSpline(EndAsset);
+
+	if (DynamicMeshComponent)
+	{
+		DynamicMeshComponent->bSelectable = true;
+	}
+	if (StartAsset)
+	{
+		StartAsset->bSelectable = false;
+	}
+	if (EndAsset)
+	{
+		EndAsset->bSelectable = false;
+	}
+}
+
 void AMoKuEditSplineActor::OnConstruction(const FTransform& Transform)
 {
 	Super::OnConstruction(Transform);
+	EnsureRoadComponentHierarchy();
 	InitSceneManagement();
 	//if (bSkipConstruction)
 	//{
@@ -285,6 +372,11 @@ void AMoKuEditSplineActor::OnConstruction(const FTransform& Transform)
 void AMoKuEditSplineActor::PostLoad()
 {
 	Super::PostLoad();
+	EnsureRoadComponentHierarchy();
+	if (DynamicMeshComponent)
+	{
+		DynamicMeshComponent->SetCollisionResponseToChannel(ECC_Visibility, ECR_Block);
+	}
 	//int ExtraMeshIndex = 0;
 	//for (auto MeshComponents : ExtraLocalMeshComponents)
 	//{
@@ -464,6 +556,7 @@ void AMoKuEditSplineActor::RefreshExtraMesh()
 	
 }
 
+#if 0 // Legacy arc/polyline ribbon mesh — superseded by MetaRoad lane layout mesh (GenerateRoadFromLaneLayoutAsDynamicMesh).
 //UV还未设置
 FDynamicMesh3* AMoKuEditSplineActor::GenerateRoadFromSplineAsDynamicMesh
 (
@@ -600,6 +693,136 @@ FDynamicMesh3* AMoKuEditSplineActor::GenerateRoadFromSplineAsDynamicMesh
 	return Mesh.Release();
 }
 
+#endif // METALANDROAD legacy arc mesh
+
+FDynamicMesh3* AMoKuEditSplineActor::GenerateRoadFromLaneLayoutAsDynamicMesh(
+	UMetaLandRoadSplineComponent* RoadSplineComponent,
+	float RoadHeightOffset,
+	bool bGenerateUVs)
+{
+	TUniquePtr<FDynamicMesh3> Mesh = MakeUnique<FDynamicMesh3>();
+	Mesh->EnableAttributes();
+	Mesh->EnableTriangleGroups();
+	Mesh->EnableVertexUVs(FVector2f());
+
+	if (!RoadSplineComponent || RoadSplineComponent->GetNumberOfSplinePoints() < 2 || RoadSplineComponent->GetLaneSectionsNum() == 0)
+	{
+		return nullptr;
+	}
+
+	const FMetaLandRoadLayout& RoadLayout = RoadSplineComponent->GetRoadLayout();
+	SideCurvePaths.Empty();
+
+	auto AppendSideCurvePoints = [RoadHeightOffset](
+		TArray<FVector>& OutCurvePath,
+		const TArray<FMetaLandRoadSplinePositionLinearApproximation>& Points)
+	{
+		const int32 StartIndex = OutCurvePath.IsEmpty() ? 0 : 1;
+		for (int32 PointIndex = StartIndex; PointIndex < Points.Num(); ++PointIndex)
+		{
+			FVector WorldPoint = Points[PointIndex].Position;
+			WorldPoint.Z += RoadHeightOffset;
+			OutCurvePath.Add(WorldPoint);
+		}
+	};
+
+	for (int32 SectionIndex = 0; SectionIndex < RoadSplineComponent->GetLaneSectionsNum(); ++SectionIndex)
+	{
+		const FMetaLandRoadLaneSection& Section = RoadSplineComponent->GetLaneSection(SectionIndex);
+		const double S0 = Section.SOffset;
+		const double S1 = Section.SOffsetEnd_Cached;
+		if ((S1 - S0) < KINDA_SMALL_NUMBER)
+		{
+			continue;
+		}
+
+		const int32 LeftSectionIndex = RoadLayout.FindSideSection(SectionIndex, EMetaLandRoadLaneSectionSide::Left);
+		const int32 RightSectionIndex = RoadLayout.FindSideSection(SectionIndex, EMetaLandRoadLaneSectionSide::Right);
+		if (LeftSectionIndex != INDEX_NONE)
+		{
+			const FMetaLandRoadLaneSection& LeftSection = RoadLayout.Sections[LeftSectionIndex];
+			if (LeftSection.Left.Num() > 0)
+			{
+				TArray<FMetaLandRoadSplinePositionLinearApproximation> LeftPoints;
+				RoadSplineComponent->BuildLinearApproximation(
+					LeftPoints,
+					[&LeftSection, RoadSplineComponent](double S)
+					{
+						return LeftSection.EvalLaneROffset(-LeftSection.Left.Num(), S, 1.0) + RoadSplineComponent->EvalROffset(S);
+					},
+					S0,
+					S1,
+					MetaLandRoad::DefaultReparamStepsPerSegment,
+					MetaLandRoad::DefaultMinNumStepsPerSection,
+					ESplineCoordinateSpace::World);
+				AppendSideCurvePoints(SideCurvePaths.LeftCurvePath, LeftPoints);
+			}
+		}
+
+		if (RightSectionIndex != INDEX_NONE)
+		{
+			const FMetaLandRoadLaneSection& RightSection = RoadLayout.Sections[RightSectionIndex];
+			if (RightSection.Right.Num() > 0)
+			{
+				TArray<FMetaLandRoadSplinePositionLinearApproximation> RightPoints;
+				RoadSplineComponent->BuildLinearApproximation(
+					RightPoints,
+					[&RightSection, RoadSplineComponent](double S)
+					{
+						return RightSection.EvalLaneROffset(RightSection.Right.Num(), S, 1.0) + RoadSplineComponent->EvalROffset(S);
+					},
+					S0,
+					S1,
+					MetaLandRoad::DefaultReparamStepsPerSegment,
+					MetaLandRoad::DefaultMinNumStepsPerSection,
+					ESplineCoordinateSpace::World);
+				AppendSideCurvePoints(SideCurvePaths.RightCurvePath, RightPoints);
+			}
+		}
+	}
+
+	if (SideCurvePaths.RightCurvePath.Num() > 1 && SideCurvePaths.LeftCurvePath.Num() > 1)
+	{
+		JunctionConnections["Start"].ConnectEdge.Add(SideCurvePaths.RightCurvePath[0]);
+		JunctionConnections["Start"].ConnectEdge.Add(SideCurvePaths.LeftCurvePath[0]);
+		const FVector StartDir = RoadSplineComponent->GetTangentAtSplinePoint(0, ESplineCoordinateSpace::World).GetSafeNormal();
+		JunctionConnections["Start"].ConnectDirection.Add(-StartDir);
+		JunctionConnections["Start"].ConnectDirection.Add(-StartDir);
+
+		JunctionConnections["End"].ConnectEdge.Add(SideCurvePaths.RightCurvePath.Last());
+		JunctionConnections["End"].ConnectEdge.Add(SideCurvePaths.LeftCurvePath.Last());
+
+		const int32 SplineCount = RoadSplineComponent->GetNumberOfSplinePoints();
+		const FVector EndDir = RoadSplineComponent->GetTangentAtSplinePoint(SplineCount - 1, ESplineCoordinateSpace::World).GetSafeNormal();
+		JunctionConnections["End"].ConnectDirection.Add(EndDir);
+		JunctionConnections["End"].ConnectDirection.Add(EndDir);
+	}
+
+	if (!RoadSplineComponent->GenerateCombinedLaneDynamicMesh(
+		*Mesh,
+		RoadHeightOffset,
+		bGenerateUVs)
+		|| Mesh->TriangleCount() == 0)
+	{
+		return nullptr;
+	}
+
+	if (bGenerateUVs)
+	{
+		FinalizeRoadMeshUVs(*Mesh);
+	}
+	FinalizeRoadMeshNormalsAndOverlays(*Mesh);
+	return Mesh.Release();
+}
+
+void AMoKuEditSplineActor::EnsureRoadLayoutInitialized()
+{
+	if (UMoKuEditSplinesComponent* RoadSpline = SplineComponent)
+	{
+		MetaLandRoadProfile::SyncRoadLayout(RoadSpline);
+	}
+}
+
 //void AMoKuEditSplineActor::UpdateTrunkPathCache()
 //{
 //	if (SplineComponent)
@@ -618,43 +841,66 @@ void AMoKuEditSplineActor::PostActorCreated()
 }
 void AMoKuEditSplineActor::RefreshDynamicRoadMesh()
 {
-	if (SplineComponent)
+	if (!SplineComponent || SplineComponent->bIsRefreshingRoadMesh)
 	{
-		//SplinesCache.Vertices = UpdateInterpolateType(1);
-		bool bSuccess = SplineComponent->ConvertSplineToPolyLine(ESplineCoordinateSpace::Type::Local,120, SplinesCache.Vertices);
-		// 创建动态网格
-		if (DynamicMeshComponent)
+		return;
+	}
+
+	SplineComponent->bIsRefreshingRoadMesh = true;
+
+	if (!SplineComponent->ParentActor)
+	{
+		SplineComponent->ParentActor = this;
+	}
+
+	EnsureRoadLayoutInitialized();
+
+	if (DynamicMeshComponent)
+	{
+		UDynamicMesh* DynamicMesh = DynamicMeshComponent->GetDynamicMesh();
+		DynamicMesh->Reset();
+
+		const bool bCanBuildMesh = SplineComponent->GetNumberOfSplinePoints() >= 2
+			&& SplineComponent->GetLaneSectionsNum() > 0;
+
+		if (bCanBuildMesh)
 		{
-			UDynamicMesh* DynamicMesh = DynamicMeshComponent->GetDynamicMesh();
-			DynamicMesh->Reset();
-			if (bSuccess)
+			JunctionConnections["Start"].Empty();
+			JunctionConnections["End"].Empty();
+
+			if (FDynamicMesh3* ResultMesh = GenerateRoadFromLaneLayoutAsDynamicMesh(SplineComponent, 10.0f, true))
 			{
-				JunctionConnections["Start"].Empty();
-				JunctionConnections["End"].Empty();
-				FDynamicMesh3* ResultMesh = GenerateRoadFromSplineAsDynamicMesh(
-					SplineComponent,
-					2000.0f,
-					10.0f,
-					true);
 				DynamicMesh->SetMesh(MoveTemp(*ResultMesh));
-				
+
 				RightCurve = BuildSideSpline(SideCurvePaths.RightCurvePath);
-				LeftCurve =	BuildSideSpline(SideCurvePaths.LeftCurvePath);
-				SplineComponent->ParentActor = this;
+				LeftCurve = BuildSideSpline(SideCurvePaths.LeftCurvePath);
 				RightCurve->ParentActor = this;
 				LeftCurve->ParentActor = this;
 				RightCurve->Tag = TEXT("Side");
 				LeftCurve->Tag = TEXT("Side");
 
+				ApplyRoadMeshMaterial();
+
+				// Auto tangents need PrimaryUV + PrimaryNormals overlays (set in Finalize*).
+				DynamicMeshComponent->SetTangentsType(EDynamicMeshComponentTangentsMode::AutoCalculated);
+				DynamicMeshComponent->bSelectable = true;
 				DynamicMeshComponent->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
-				DynamicMeshComponent->GetBodySetup()->CollisionTraceFlag = CTF_UseSimpleAndComplex;
-				DynamicMeshComponent->bEnableComplexCollision = true; 
+				DynamicMeshComponent->SetCollisionResponseToChannel(ECC_Visibility, ECR_Block);
+				DynamicMeshComponent->SetCollisionResponseToChannel(ECC_Camera, ECR_Block);
+				if (UBodySetup* BodySetup = DynamicMeshComponent->GetBodySetup())
+				{
+					BodySetup->CollisionTraceFlag = CTF_UseSimpleAndComplex;
+				}
+				DynamicMeshComponent->bEnableComplexCollision = true;
 				DynamicMeshComponent->CollisionType = CTF_UseSimpleAndComplex;
 				DynamicMeshComponent->UpdateCollision(false);
 				DynamicMeshComponent->NotifyMeshUpdated();
 			}
 		}
 	}
+
+	SplineComponent->RefreshLaneVisualization();
+	SplineComponent->bIsRefreshingRoadMesh = false;
 }
 
 //void AMoKuEditSplineActor::UpdateSceneManagementData()

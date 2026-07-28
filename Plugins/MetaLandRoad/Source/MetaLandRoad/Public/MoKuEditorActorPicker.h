@@ -12,10 +12,10 @@ class FViewport;
 DECLARE_MULTICAST_DELEGATE_OneParam(FOnMoKuEditorActorPicked, AActor* /*PickedActor*/);
 
 /**
- * Editor-only actor picker (default Select Mode):
+ * Editor-only actor picker (Select Mode and World Builder Mode):
  * - Press P to toggle pick mode on/off (does not use Ctrl, so Ctrl+LMB multi-select still works).
- * - While pick mode is on: right-click in the level viewport to pick actors (repeatable).
- * - Press Esc or P again to exit pick mode.
+ * - While pick mode is on: right-click in the level viewport to pick and select actors.
+ * - Press P again to exit pick mode.
  */
 class METALANDROAD_API FMoKuEditorActorPicker
 {

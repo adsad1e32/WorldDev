@@ -17,7 +17,9 @@
 #include "MoKuEditBaseActor.h"
 #include "Tools/ShapesGenerationTool.h"
 #include "MoKuEditorUtils.h"
-#include "EditSplineRoadInfo.h"
+#include "ComponentVisualizers/MetaLandRoadSectionComponentVisualizer.h"
+#include "MetaLandRoadModule.h"
+#include "Modules/ModuleManager.h"
 #include "WorldLandscapeBlueprintBrush.h"
 #include "EngineUtils.h"
 #include "Landscape.h"
@@ -311,6 +313,27 @@ bool UMetaLandRoadEditorMode::InputKey(FEditorViewportClient* InViewportClient, 
 	return false;
 }
 
+bool UMetaLandRoadEditorMode::InputDelta(
+	FEditorViewportClient* ViewportClient,
+	FViewport* Viewport,
+	FVector& InDelta,
+	FRotator& InRot,
+	FVector& InScale)
+{
+	// ===== [ALT+W DRAG BP-5b] World Builder EdMode 必须把 delta 转给 ComponentVisualizer =====
+	if (FModuleManager::Get().IsModuleLoaded(TEXT("MetaLandRoad"))
+		&& FMetaLandRoadModule::Get().ShouldShowNativeEditOverlay()
+		&& GMoKuEditSplinesComponentVisualizer.IsValid())
+	{
+		if (GMoKuEditSplinesComponentVisualizer->HandleInputDelta(
+			ViewportClient, Viewport, InDelta, InRot, InScale))
+		{
+			return true;
+		}
+	}
+	return Super::InputDelta(ViewportClient, Viewport, InDelta, InRot, InScale);
+}
+
 void UMetaLandRoadEditorMode::ModeTick(float DeltaTime)
 {
 
@@ -330,7 +353,22 @@ void UMetaLandRoadEditorMode::ModeTick(float DeltaTime)
 
 bool UMetaLandRoadEditorMode::HandleClick(FEditorViewportClient* InViewportClient, HHitProxy* HitProxy, const FViewportClick& Click)
 {
-	return false;
+	if (!GMoKuEditSplinesComponentVisualizer.IsValid()
+		|| !GMoKuEditSplinesComponentVisualizer->IsSectionLineEditMode())
+	{
+		return false;
+	}
+
+	if (Click.GetKey() != EKeys::RightMouseButton)
+	{
+		return false;
+	}
+
+	return GMoKuEditSplinesComponentVisualizer->TryHandleRoadSplinePickClick(
+		InViewportClient,
+		HitProxy,
+		Click,
+		true);
 }
 
 void UMetaLandRoadEditorMode::RefreshGizmoVisual(AActor* InActor)
@@ -370,6 +408,14 @@ bool UMetaLandRoadEditorMode::ShouldDrawWidget() const
 	{
 		return false;
 	}
+
+	// Alt+W spline key gizmo must not compete with the actor transform widget.
+	if (FModuleManager::Get().IsModuleLoaded(TEXT("MetaLandRoad"))
+		&& FMetaLandRoadModule::Get().ShouldShowNativeEditOverlay())
+	{
+		return false;
+	}
+
 	return UBaseLegacyWidgetEdMode::ShouldDrawWidget();
 }
 void UMetaLandRoadEditorMode::UpdateAssetGizmoImpl()

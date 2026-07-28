@@ -60,7 +60,7 @@ TArray<FMoKuSplineInterpPoint> MoKuSplineEditorUtils::SplitSegmentToSpline(UMoKu
 		RefSplineComp = InSplineComponent;
 	}
 
-	//函数还未重构整合归纳
+	//??????锟斤拷??????????
 	auto GetDimensionsX = [](UStaticMesh* Mesh)->float
 		{
 			if (Mesh)
@@ -241,7 +241,7 @@ TArray<FMoKuSplineInterpPoint> MoKuSplineEditorUtils::SplitSegmentToSpline(UMoKu
 			{
 				StartLength = EndLength + NewGapSize;
 			}
-			//代码未整合
+			//????锟斤拷????
 
 
 			if (InExtraMeshInfo.EnableMirror)
@@ -250,7 +250,7 @@ TArray<FMoKuSplineInterpPoint> MoKuSplineEditorUtils::SplitSegmentToSpline(UMoKu
 				OffsetAmpEnd = OffsetAmpEndY + OffsetAmpEndX + OffsetAmpEndZ;
 
 
-				//函数参数尚未整合
+				//??????????锟斤拷????
 				FMoKuSplineInterpPoint MoKuSplineInterpPoint = FMoKuSplineInterpPoint(StartPos + OffsetAmpStart*-1, EndPos + OffsetAmpEnd, StartTangent * SplineSegmentLength, EndTangent * SplineSegmentLength, StaticMesh, WorldTransform, false, true, Method, bIsAWlaysZ, ScalarRatio);
 				ProceduralPoints.Add(MoKuSplineInterpPoint);
 				FMoKuSplineInterpPoint MirrorMoKuSplineInterpPoint = FMoKuSplineInterpPoint(StartPos + OffsetAmpStart, EndPos + OffsetAmpEnd, StartTangent * SplineSegmentLength, EndTangent * SplineSegmentLength, StaticMesh, WorldTransform, true, true, Method, bIsAWlaysZ, ScalarRatio);
@@ -632,29 +632,30 @@ AMoKuEditSplineActor* MoKuSplineEditorUtils::CreateNewMokuSplineActor(AActor* In
 
 			SplineComp->ClearSplinePoints();
 
-			TArray<FVector> SplinePositions;
 			for (const auto& Trans : InTransforms)
 			{
 				SplineComp->AddSplinePointLocation(Trans.GetLocation(), SplineComp->GetNumberOfSplinePoints());
-				SplinePositions.Add(Trans.GetLocation());
 			}
 
-
-			float SrcSplineLength = SplineComp->GetSplineLength();
-			for (int i = 0; i < SplineComp->GetNumberOfSplinePoints(); i++)
+			if (const UMetaLandRoadSplineComponent* SrcMetaLandSpline = Cast<UMetaLandRoadSplineComponent>(SrcSplineComp))
 			{
-				FVector Pos = SplineComp->GetLocationAtSplinePoint(i, ESplineCoordinateSpace::World);
-				float Dist = SrcSplineComp->GetDistanceAlongSplineAtLocation(Pos,ESplineCoordinateSpace::World);
-				float Ratio = Dist / SrcSplineLength;
-				FVector Tangent = SrcSplineComp->GetTangentAtDistanceAlongSpline(Dist, ESplineCoordinateSpace::World);
-				if (Ratio > 0)
+				for (int32 PointIndex = 0; PointIndex < SplineComp->GetNumberOfSplinePoints(); ++PointIndex)
 				{
-					Tangent *= (1- Ratio);
+					SplineComp->SetRoadSplinePointType(
+						PointIndex,
+						SrcMetaLandSpline->GetRoadSplinePointType(PointIndex),
+						false);
 				}
-				SplineComp->SetTangentAtSplinePoint(i, Tangent, ESplineCoordinateSpace::World);
-				SplineComp->SetSplinePointType(i,ESplinePointType::Curve);
 			}
-			SplineComp->SetSplineWorldPoints(SplinePositions);
+			else
+			{
+				for (int32 PointIndex = 0; PointIndex < SplineComp->GetNumberOfSplinePoints(); ++PointIndex)
+				{
+					SplineComp->SetSplinePointType(PointIndex, SrcSplineComp->GetSplinePointType(PointIndex), false);
+				}
+			}
+
+			SplineComp->UpdateSpline();
 			NewSplineActor->SetSplineComponent(SplineComp);
 			//NewSplineActor->RefreshExtraMesh();
 			NewSplineActor->RefreshDynamicRoadMesh();
@@ -752,16 +753,16 @@ void MoKuSplineEditorUtils::SplitMoKuSplineActor(AMoKuEditBaseActor* InSplineAct
 
 			UMoKuEditSplinesComponent* NewSpline = NewObject<UMoKuEditSplinesComponent>(IntersectionActor);
 
-			// 设置必要属性
+			// ??????????
 			NewSpline->SetMobility(EComponentMobility::Movable);
 			NewSpline->CreationMethod = EComponentCreationMethod::Instance;
 
-			// 附加到Actor
+			// ?????Actor
 			NewSpline->AttachToComponent(IntersectionActor->GetRootComponent(), FAttachmentTransformRules::KeepWorldTransform);
 			NewSpline->RegisterComponent();
 			NewSpline->SetLocationAtSplinePoint(0,InSertPostion, ESplineCoordinateSpace::World);
 			//NewSpline->SetLocationAtSplinePoint(1, EndPosition, ESplineCoordinateSpace::World);
-			// 添加到数组
+			// ?????????
 			IntersectionActor->SplineComps.Add(NewSpline);
 
 			IntersectionActor->SplineComp->SetLocationAtSplinePoint(0, A, ESplineCoordinateSpace::Type::World);
@@ -1018,7 +1019,7 @@ void MoKuSplineEditorUtils::OctreeSegmentsIntersect(FSplineRoadActorOctree Octre
 			EndValue = FMath::Min(EndValue, SplineLength);
 			
 
-			// 修改过程中 切记更新
+			// ???????? ?锟斤拷????
 			FVector A = SplineComponent->GetLocationAtDistanceAlongSpline(StartValue, ESplineCoordinateSpace::World);
 			FVector C = SplineComponent->GetLocationAtDistanceAlongSpline(EndValue, ESplineCoordinateSpace::World);
 
@@ -1139,7 +1140,7 @@ bool MoKuSplineEditorUtils::DoSplineIntersect(USplineComponent* Spline1, USpline
 {
 	if (!Spline1 || !Spline2)return false;
 	if(Spline1->GetNumberOfSplinePoints()<2)return false;
-	// 遍历第一条曲线的线段
+	// ?????????????????
 	for (int i = 0; i < Spline1->GetNumberOfSplinePoints()-1; i++)
 	{
 		FVector Start1 = Spline1->GetLocationAtSplinePoint(i, ESplineCoordinateSpace::World);
@@ -1162,7 +1163,7 @@ bool MoKuSplineEditorUtils::DoSplineIntersect(USplineComponent* Spline1, USpline
 				bool bIsIntersected = DoSegmentsIntersect(SegStart1, SegEnd1, SegStart2, SegEnd2, Intersection,OutSeg1Intersection, OutSeg2Intersection);
 				if (bIsIntersected)
 				{
-					//三维方向还需修改有待检验
+					//?????????????锟斤拷?????
 					OutIntersectionPoint.Z = Start1.Z;
 					OutIntersectionPoint.X = Intersection.X;
 					OutIntersectionPoint.Y = Intersection.Y;

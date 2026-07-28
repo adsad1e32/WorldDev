@@ -354,6 +354,10 @@ void AMoKuEditIntersectionActor::SortEdgePath()
 		DynamicMeshComponent->CollisionType = CTF_UseSimpleAndComplex;
 		DynamicMeshComponent->UpdateCollision(false);
 		DynamicMeshComponent->NotifyMeshUpdated();
+		if (UMaterialInterface* AsphaltMat = AMoKuEditSplineActor::EnsureAsphaltTestMaterial())
+		{
+			DynamicMeshComponent->SetMaterial(0, AsphaltMat);
+		}
 	}
 	//MeshBuilder();
 }
@@ -489,7 +493,10 @@ void AMoKuEditIntersectionActor::MeshBuilder()
 	DynamicMeshComponent->CollisionType = CTF_UseSimpleAndComplex;
 	DynamicMeshComponent->UpdateCollision(false);
 	DynamicMeshComponent->NotifyMeshUpdated();
-	
+	if (UMaterialInterface* AsphaltMat = AMoKuEditSplineActor::EnsureAsphaltTestMaterial())
+	{
+		DynamicMeshComponent->SetMaterial(0, AsphaltMat);
+	}
 }
 
 

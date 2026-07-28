@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Engine/DeveloperSettings.h"
+#include "Materials/MaterialParameterCollection.h"
 #include "WorldLandscapeBlueprintBrush.h"
 #include "WorldEditorSettings.generated.h"
 

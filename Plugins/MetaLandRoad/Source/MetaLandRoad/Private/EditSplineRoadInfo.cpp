@@ -308,7 +308,7 @@ void AWorldSceneManagement::SetMPCParams()
 			UMaterialParameterCollection* LandscapeCollection = RoadEditorSubsystem->GetLandscapeMaterialParameterCollection();
 			if (!LandscapeCollection)return;
 
-			UMaterialParameterCollectionInstance* LandscapeCollectionInstance = World->GetParameterCollectionInstance(CastChecked<UMaterialParameterCollection>(LandscapeCollection));
+			UMaterialParameterCollectionInstance* LandscapeCollectionInstance = World->GetParameterCollectionInstance(LandscapeCollection);
 			check(LandscapeCollectionInstance != nullptr);
 
 
@@ -691,7 +691,7 @@ void AWorldSceneManagement::UpdateBrushCacheKeys()
 	{
 		if (BrushActor.IsValid())
 		{
-			//ÎÊÌâËùÔÚ
+			//ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
 			ETextureRenderTargetFormat Format = ETextureRenderTargetFormat::RTF_RGBA32f;
 
 			AActor* Actor = CastChecked<AActor>(BrushActor.GetObject());
@@ -971,14 +971,14 @@ void AWorldSceneManagement::BlueprintRoadBodyChanged_Native(AActor* Actor)
 
 bool AWorldSceneManagement::SetupRoadSplineRenderMIDs(const FBrushActorRenderContext& BrushActorRenderContext, bool bRestoreMIDs, TArray<UMaterialInterface*>& InOutMIDs)
 {
-	// 1. »ñÈ¡»ù´¡ Actor
+	// 1. ï¿½ï¿½È¡ï¿½ï¿½ï¿½ï¿½ Actor
 	AMoKuEditBaseActor* RoadBasicActor = BrushActorRenderContext.GetActorAs<AMoKuEditBaseActor>();
 	if (!RoadBasicActor)
 	{
 		return false;
 	}
 
-	// 2. °²È«µØ»ñÈ¡ÐèÒªäÖÈ¾µÄ×é¼þ (Ò²¾ÍÊÇÄãµÄ DynamicMeshComponent)
+	// 2. ï¿½ï¿½È«ï¿½Ø»ï¿½È¡ï¿½ï¿½Òªï¿½ï¿½È¾ï¿½ï¿½ï¿½ï¿½ï¿½ (Ò²ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ DynamicMeshComponent)
 	UPrimitiveComponent* RenderComponents = nullptr;
 	if (AMoKuEditSplineActor* CurrentActor = Cast<AMoKuEditSplineActor>(RoadBasicActor))
 	{
@@ -992,7 +992,7 @@ bool AWorldSceneManagement::SetupRoadSplineRenderMIDs(const FBrushActorRenderCon
 		return false;
 	}
 
-	// 3. »Ö¸´²ÄÖÊµÄÂß¼­£¨µ±Ïà»úÅÄÍêÕÕÆ¬ºó£¬°ÑÔ­±¾¿áìÅµÄÂ·Ãæ²ÄÖÊ»¹¸øËü£©
+	// 3. ï¿½Ö¸ï¿½ï¿½ï¿½ï¿½Êµï¿½ï¿½ß¼ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Æ¬ï¿½ó£¬°ï¿½Ô­ï¿½ï¿½ï¿½ï¿½ï¿½Åµï¿½Â·ï¿½ï¿½ï¿½ï¿½Ê»ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
 	if (bRestoreMIDs)
 	{
 		int32 NumMats = FMath::Max(1, RenderComponents->GetNumMaterials());
@@ -1001,39 +1001,39 @@ bool AWorldSceneManagement::SetupRoadSplineRenderMIDs(const FBrushActorRenderCon
 			//FSoftObjectPath SoftPath(InOutMIDs[MatIdx]->GetMaterial());
 			//FString MySoftPathString = SoftPath.ToString();
 			//UE_LOG(LogTemp, Warning, TEXT("SoftPathString==%s"), *MySoftPathString)
-			// È·±£±¸·ÝÊý×éÀïÓÐ¶«Î÷£¬·ÀÖ¹Ô½½ç±ÀÀ£
+			// È·ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ð¶ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ö¹Ô½ï¿½ï¿½ï¿½ï¿½ï¿½
 			if (InOutMIDs.IsValidIndex(MatIdx))
 			{
 				RenderComponents->SetMaterial(MatIdx, InOutMIDs[MatIdx]);
 			}
 		}
 	}
-	// 4. Ìæ»»²ÄÖÊµÄÂß¼­£¨ÔÚÏà»úÅÄÕÕÇ°£¬°ÑÂ·Ãæ²ÄÖÊÇ¿ÖÆ»»³ÉÄÇ¸ö´¿¸ß¶ÈÍ¼²ÄÖÊ£©
+	// 4. ï¿½æ»»ï¿½ï¿½ï¿½Êµï¿½ï¿½ß¼ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ç°ï¿½ï¿½ï¿½ï¿½Â·ï¿½ï¿½ï¿½ï¿½ï¿½Ç¿ï¿½Æ»ï¿½ï¿½ï¿½ï¿½Ç¸ï¿½ï¿½ï¿½ï¿½ß¶ï¿½Í¼ï¿½ï¿½ï¿½Ê£ï¿½
 	else
 	{
-		// ¶¯Ì¬´´½¨ÓÃÀ´Êä³ö¸ß¶ÈÍ¼µÄ²ÄÖÊÊµÀý
+		// ï¿½ï¿½Ì¬ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ß¶ï¿½Í¼ï¿½Ä²ï¿½ï¿½ï¿½Êµï¿½ï¿½
 		UMaterialInstanceDynamic* TempMID = FWaterUtils::GetOrCreateTransientMID(RoadSplineMID, TEXT("RoadSplineMID"), RenderRoadSplineDepthMaterial);
 
-		// ¡¾ÐÞ¸´Âß¼­·´×ª¡¿Èç¹û²ÄÖÊ´´½¨³É¹¦£¬²ÅÈ¥Ìæ»»
+		// ï¿½ï¿½ï¿½Þ¸ï¿½ï¿½ß¼ï¿½ï¿½ï¿½×ªï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ê´ï¿½ï¿½ï¿½ï¿½É¹ï¿½ï¿½ï¿½ï¿½ï¿½È¥ï¿½æ»»
 		if (TempMID)
 		{
-			// ÏÈÇå¿ÕÓÃÀ´±¸·ÝµÄÊý×é
+			// ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ýµï¿½ï¿½ï¿½ï¿½ï¿½
 			InOutMIDs.Empty();
 
-			// ±éÀúÍø¸ñÌåÉÏµÄËùÓÐ²ÄÖÊ²Û£¨DynamicMesh Í¨³£Ö»ÓÐ1¸ö²Û£¬µ«Ð´Ñ­»·¸üÑÏ½÷£©
+			// ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ïµï¿½ï¿½ï¿½ï¿½Ð²ï¿½ï¿½Ê²Û£ï¿½DynamicMesh Í¨ï¿½ï¿½Ö»ï¿½ï¿½1ï¿½ï¿½ï¿½Û£ï¿½ï¿½ï¿½Ð´Ñ­ï¿½ï¿½ï¿½ï¿½ï¿½Ï½ï¿½ï¿½ï¿½
 			for (int32 MatIdx = 0; MatIdx < RenderComponents->GetNumMaterials(); ++MatIdx)
 			{
-				// °ÑÔ­À´µÄ²ÄÖÊ´æ½øÊý×é±¸·ÝÆðÀ´
+				// ï¿½ï¿½Ô­ï¿½ï¿½ï¿½Ä²ï¿½ï¿½Ê´ï¿½ï¿½ï¿½ï¿½ï¿½é±¸ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
 				InOutMIDs.Add(RenderComponents->GetMaterial(MatIdx));
 
-				// ¸øÍø¸ñÌå»»ÉÏÎÒÃÇÒªÅÄ¸ß¶ÈµÄ²ÄÖÊ
+				// ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½å»»ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Òªï¿½Ä¸ß¶ÈµÄ²ï¿½ï¿½ï¿½
 				RenderComponents->SetMaterial(MatIdx, TempMID);
 			}
 		}
 		else
 		{
-			// Èç¹û²ÄÖÊÃ»»ñÈ¡µ½£¬´òÓ¡¸ö¾¯¸æ²¢·ÅÆúäÖÈ¾
-			UE_LOG(LogTemp, Error, TEXT("SetupRoadSplineRenderMIDs: ÎÞ·¨´´½¨¸ß¶ÈÍ¼²ÄÖÊÊµÀý£¡"));
+			// ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ã»ï¿½ï¿½È¡ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ó¡ï¿½ï¿½ï¿½ï¿½ï¿½æ²¢ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½È¾
+			UE_LOG(LogTemp, Error, TEXT("SetupRoadSplineRenderMIDs: ï¿½Þ·ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ß¶ï¿½Í¼ï¿½ï¿½ï¿½ï¿½Êµï¿½ï¿½ï¿½ï¿½"));
 			return false;
 		}
 	}

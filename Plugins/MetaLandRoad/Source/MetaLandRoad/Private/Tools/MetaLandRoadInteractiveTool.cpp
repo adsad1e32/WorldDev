@@ -13,6 +13,7 @@
 #include "Editor/UnrealEdEngine.h"
 #include "Algo/Copy.h"
 #include "MoKuEditSplinesComponent.h"
+#include "MetaLandRoadProfile.h"
 #include "BaseGizmos/TransformGizmoUtil.h"
 #include "ToolSceneQueriesUtil.h"
 #include "SocketMarkbleGizmo.h"
@@ -27,6 +28,9 @@
 #include "Tools/UEdMode.h"
 #include "EditSplineRoadInfo.h"
 #include "PrimitiveDrawingUtils.h"
+#include "MetaLandRoadLaneVisualization.h"
+#include "MetaLandRoadModule.h"
+#include "Utils/MetaLandRoadCompVisUtils.h"
 
 
 #define LOCTEXT_NAMESPACE "UMetaLandRoadInteractiveTool"
@@ -842,6 +846,7 @@ void UMetaLandRoadInteractiveTool::AddSplinePoint(const FVector& InHitPos, const
 		SplineActor->RoadModeType = OutputProperties->RoadModeType;
 		SplineComponent = SplineActor->GetSplineComponent();
 		SplineComponent->SetVisibility(false);
+		MetaLandRoadProfile::EnsureDefaultRoadProfile(SplineComponent);
 		UpdateEditState(true);
 		PreviewComponent = NewObject<UMoKuEditSplinesComponent>(ActiveActor, NAME_None, RF_Transactional);
 		PreviewComponent->AttachToComponent(SplineActor->GetRootComponent(), FAttachmentTransformRules::KeepRelativeTransform);
@@ -1212,25 +1217,7 @@ void UMetaLandRoadInteractiveTool::Render(IToolsContextRenderAPI* RenderAPI)
 	}
 
 
-		if (HitActor)
-		{
-			if (!HitActor->IsA<AMoKuEditBaseActor>())
-			{
-				PDI->DrawPoint(
-					ResultHitPos,
-					FLinearColor(1.0f, 1.0f, 0.0f, 1.0f),
-					15.0f,
-					SDPG_World);
-			}
-			else
-			{
-				PDI->DrawPoint(
-					ResultHitPos,
-					FLinearColor(0.0f, 1.0f, 0.0f, 1.0f),
-					15.0f,
-					SDPG_World);
-			}
-		}
+		// Cursor hit preview points removed (green/yellow follow-mouse markers in World Builder).
 		//for (const auto& Bound : OutDebugBox)
 		//{
 		//	//DrawWireBox(PDI, Bound, FColor(1, 0, 0), SDPG_World);
@@ -1380,10 +1367,7 @@ void UMetaLandRoadInteractiveTool::OnFinishedSplineEdit()
 			AMoKuEditSplineActor* FinishActor = Cast<AMoKuEditSplineActor>(ActiveActor);
 			if (FinishActor)
 			{
-				TArray<FVector> OutPoints;
 				UMoKuEditSplinesComponent* Comp = FinishActor->GetSplineComponent();
-				//Comp->ConvertSplineToPolyLine(ESplineCoordinateSpace::World, 1500, OutPoints);
-				//Comp->SetSplinePoints(OutPoints, ESplineCoordinateSpace::World);
 
 				if (PreviewComponent)
 				{
@@ -1399,6 +1383,23 @@ void UMetaLandRoadInteractiveTool::OnFinishedSplineEdit()
 				StateOfEditor = EMoKuEditState::Defult;
 				this->Modify();
 				GEditor->EndTransaction();
+
+				// A-key finish: keep rings hidden until user presses Alt+W.
+				if (Comp)
+				{
+					FinishActor->RefreshDynamicRoadMesh();
+					CompVisUtils::SelectRoadSplineExclusive(FinishActor, Comp, true);
+					if (FModuleManager::Get().IsModuleLoaded(TEXT("MetaLandRoad")))
+					{
+						FMetaLandRoadModule::Get().SetRoadComponentVisMode(false);
+						FMetaLandRoadModule::Get().ExitNativeSplineEditMode();
+					}
+					MetaLandRoadLaneVisualization::RefreshLaneVisualization(Comp);
+					if (GEditor)
+					{
+						GEditor->RedrawLevelEditingViewports(true);
+					}
+				}
 			}
 		}	
 	}

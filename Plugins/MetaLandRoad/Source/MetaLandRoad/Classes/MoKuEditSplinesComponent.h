@@ -2,11 +2,10 @@
 #pragma once
 
 #include "CoreMinimal.h"
-#include "Components/SplineComponent.h"
 #include "Serialization/Archive.h"
 #include "CurveOps/TriangulateCurvesOp.h"
 #include "Components/SplineMeshComponent.h"
-
+#include "MetaLandRoadSplineComponent.h"
 
 #include "MoKuEditSplinesComponent.generated.h"
 
@@ -168,9 +167,9 @@ struct FMoKuSplineInterpPoint
 			Diff = Quat.RotateVector(Diff);
 			TArray<FVector> Vertices;
 			const FVector Axes[3] = {
-				Direction,  // 旋转后的X轴
-				bTangent,  // 旋转后的Y轴
-				FVector::UpVector  // 旋转后的Z轴
+				Direction,  // ??????X??
+				bTangent,  // ??????Y??
+				FVector::UpVector  // ??????Z??
 			};
 
 			for (int32 i = 0; i < 2; i++)
@@ -269,11 +268,13 @@ public :
 //DECLARE_EVENT_OneParam(UMoKuEditSplinesComponent, FParamsChangedEvent, AActor*)
 
 UCLASS(ClassGroup=(Custom), meta=(BlueprintSpawnableComponent))
-class UMoKuEditSplinesComponent : public USplineComponent
+class UMoKuEditSplinesComponent : public UMetaLandRoadSplineComponent
 {
 	GENERATED_UCLASS_BODY()
 
 public:
+
+	virtual void OnRegister() override;
 
 	#if WITH_EDITOR
 		virtual void PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent)override;
@@ -281,6 +282,11 @@ public:
 		virtual void PostLoad() override;
 		virtual void PostEditUndo() override;
 	#endif
+
+	virtual void UpdateRoadLayout() override;
+
+	/** Prevents UpdateRoadLayout -> RefreshDynamicRoadMesh re-entry. */
+	bool bIsRefreshingRoadMesh = false;
 
 	UPROPERTY()
 	TArray<TObjectPtr<UStaticMeshComponent>> LocalMeshComponents;

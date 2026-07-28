@@ -111,12 +111,15 @@ void AWorldLandscapeBlueprintBrush::OnLevelActorAdded(AActor* InActor)
 
 void AWorldLandscapeBlueprintBrush::OnLevelActorRemoved(AActor* InActor)
 {
-	if (InActor->GetWorld() == GetWorld())
+	if (!InActor || InActor->GetWorld() != GetWorld())
 	{
-		//if (IsActorAffectingLandscape(InActor))
-		{
-			RemoveActorInternal(InActor);
-		}
+		return;
+	}
+
+	// Only road-brush actors are tracked; deleting Landscape / SceneManagement must not CastChecked.
+	if (IsActorAffectingLandscape(InActor))
+	{
+		RemoveActorInternal(InActor);
 	}
 }
 
@@ -198,23 +201,21 @@ void AWorldLandscapeBlueprintBrush::AddActorInternal(AActor* Actor, const UWorld
 }
 void AWorldLandscapeBlueprintBrush::RemoveActorInternal(AActor* Actor)
 {
-
-	IRoadBrushActorInterface* RoadBrushActor = CastChecked<IRoadBrushActorInterface>(Actor);
+	IRoadBrushActorInterface* RoadBrushActor = Cast<IRoadBrushActorInterface>(Actor);
+	if (!RoadBrushActor)
+	{
+		return;
+	}
 
 	const bool bMarkPackageDirty = false;
 	Modify(bMarkPackageDirty);
-	int32 Index = ActorsAffectingLandscape.IndexOfByKey(TWeakInterfacePtr<IRoadBrushActorInterface>(RoadBrushActor));
+	const int32 Index = ActorsAffectingLandscape.IndexOfByKey(TWeakInterfacePtr<IRoadBrushActorInterface>(RoadBrushActor));
 	if (Index != INDEX_NONE)
 	{
 		ActorsAffectingLandscape.RemoveAt(Index);
 		Cache.Remove(TSoftObjectPtr<AActor>(Actor));
-
-		//OnActorsAffectingLandscapeChanged();
-
 		UpdateAffectedWeightmaps();
 	}
-
-
 }
 
 bool AWorldLandscapeBlueprintBrush::IsActorAffectingLandscape(AActor* Actor) const

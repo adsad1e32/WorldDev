@@ -481,7 +481,7 @@ void SMoKuRecommendAssetView::RefreshVisualView()
 	RefreshVisualViewImp();
 }
 
-//²âÊÔ´úÂë Ö±½ÓÒýÓÃµÄÂ·¾¶ ¶øÇÒÃ»ÓÐÆ¥ÅäÄ£Ê½ÇÒ·Ç²¢·¢²Ù×÷
+//ï¿½ï¿½ï¿½Ô´ï¿½ï¿½ï¿½ Ö±ï¿½ï¿½ï¿½ï¿½ï¿½Ãµï¿½Â·ï¿½ï¿½ ï¿½ï¿½ï¿½ï¿½Ã»ï¿½ï¿½Æ¥ï¿½ï¿½Ä£Ê½ï¿½Ò·Ç²ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
 void SMoKuRecommendAssetView::RefreshVisualViewImp()
 {
 	
@@ -529,8 +529,7 @@ void SMoKuRecommendAssetView::RefreshVisualViewImp()
 							UStaticMesh* Mesh = Cast<UStaticMesh>(Obj);
 							if (Mesh)
 							{
-								 //Will deprected  UE5.6
-								FAssetData MeshAssetData = AssetRegistryModule.Get().GetAssetByObjectPath(*Mesh->GetPathName());
+								FAssetData MeshAssetData = AssetRegistryModule.Get().GetAssetByObjectPath(FSoftObjectPath(Mesh));
 								TSharedPtr<FAssetData> Info = MakeShared<FAssetData>(MeshAssetData);
 								AssetVisibleView.Add(Info);
 							}

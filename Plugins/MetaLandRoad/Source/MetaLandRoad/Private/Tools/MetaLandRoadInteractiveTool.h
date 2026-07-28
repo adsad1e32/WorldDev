@@ -9,6 +9,12 @@
 #include "MoKuEditIntersectionActor.h"
 #include "Engine/StaticMeshActor.h"
 #include "InteractiveTool.h"
+#include "InteractiveGizmo.h"
+#include "InteractiveGizmoManager.h"
+#include "CurveOp.h"
+#include "MoKuEditSplinesComponent.h"
+#include "MoKuEditorUtils.h"
+#include "SocketMarkbleGizmo.h"
 #include "SplineBasicElement.h"
 #include "Landscape.h"
 
@@ -18,8 +24,6 @@
 
 
 class UMoKuEditSplinesComponent;
-class FCurvesRoadOp;
-struct FInteresectionPointInfo;
 
 UCLASS()
 class UInteractiveToolSettings : public  UInteractiveToolPropertySet

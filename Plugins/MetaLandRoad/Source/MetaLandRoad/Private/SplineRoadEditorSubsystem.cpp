@@ -5,6 +5,7 @@
 #include "Editor.h"
 #include "LevelEditor.h"
 #include "Algo/Count.h"
+#include "Materials/MaterialParameterCollection.h"
 #include "WorldEditorSettings.h"
 
 #include UE_INLINE_GENERATED_CPP_BY_NAME(SplineRoadEditorSubsystem)

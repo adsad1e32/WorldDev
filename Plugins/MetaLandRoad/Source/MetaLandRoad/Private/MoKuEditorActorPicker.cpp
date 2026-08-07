@@ -1,6 +1,8 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
 #include "MoKuEditorActorPicker.h"
+#include "MetaLandRoadEditorMode.h"
+#include "EditorModeManager.h"
 
 #include "ComponentVisualizer.h"
 #include "Editor.h"
@@ -97,12 +99,15 @@ FMoKuEditorActorPicker& FMoKuEditorActorPicker::Get()
 
 bool FMoKuEditorActorPicker::CanUsePickInput()
 {
-	if (!GEditor || !GLevelEditorModeTools().IsDefaultModeActive())
+	if (!GEditor || !FSlateApplication::IsInitialized())
 	{
 		return false;
 	}
 
-	if (!FSlateApplication::IsInitialized())
+	const bool bDefaultMode = GLevelEditorModeTools().IsDefaultModeActive();
+	const bool bWorldBuilderMode = GLevelEditorModeTools().IsModeActive(
+		UMetaLandRoadEditorMode::EM_MetaLandRoadEditorModeId);
+	if (!bDefaultMode && !bWorldBuilderMode)
 	{
 		return false;
 	}

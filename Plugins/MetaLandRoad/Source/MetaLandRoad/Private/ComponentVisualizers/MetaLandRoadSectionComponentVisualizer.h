@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ComponentVisualizer.h"
 #include "SplineComponentVisualizer.h"
 #include "MetaLandRoadVisProxy.h"
 #include "MetaLandRoadSplineComponent.h"
@@ -14,6 +15,7 @@
 #include "UnrealEdGlobals.h"
 #include "Editor/UnrealEdEngine.h"
 #include "Containers/Ticker.h"
+#include "MetaLandRoadLaneVisualization.h"
 #include "MetaLandRoadSectionComponentVisualizer.generated.h"
 
 class UToolMenu;
@@ -29,6 +31,18 @@ enum class EMetaLandRoadSectionSelectionState : uint8
 	KeyTangent,
 };
 
+USTRUCT()
+struct FMetaLandRoadSelectedLaneRefU
+{
+	GENERATED_BODY()
+
+	UPROPERTY()
+	int32 SectionIndex = INDEX_NONE;
+
+	UPROPERTY()
+	int32 LaneIndex = LANE_INDEX_NONE;
+};
+
 /** Selection state captured by scoped transactions (MetaRoad-compatible). */
 UCLASS(Transient)
 class UMetaLandRoadSectionComponentVisualizerSelectionState : public UObject
@@ -38,9 +52,30 @@ class UMetaLandRoadSectionComponentVisualizerSelectionState : public UObject
 public:
 	void ResetSelection(bool bSaveSplineSelection);
 	void SetSelectedSpline(FComponentPropertyPath& SplinePropertyPath);
+	/** Update spline path only — preserves lane / width selection (unlike SetSelectedSpline). */
+	void AssignSelectedSplinePath(const FComponentPropertyPath& InSplinePropertyPath);
 	void SetSelectedSection(int32 SectionIndex);
 	void SetSelectedLane(int32 LaneIndex);
+	void SetPrimaryLaneSelection(int32 SectionIndex, int32 LaneIndex, bool bAddToMultiSelection);
+	void ToggleLaneInMultiSelection(int32 SectionIndex, int32 LaneIndex);
+	void ClearLaneMultiSelection();
+	bool IsLaneInMultiSelection(int32 SectionIndex, int32 LaneIndex) const;
+	const TArray<FMetaLandRoadSelectedLaneRefU>& GetMultiSelectedLanes() const;
 	void SetSelectedKeyIndex(int32 KeyIndex);
+	/** Width-key only — keeps lane context for gizmo but clears lane-face multi-select. */
+	void SetWidthKeySelection(int32 SectionIndex, int32 LaneIndex, int32 KeyIndex);
+	void ClearWidthKeySelection();
+
+	/** Ctrl+LMB lane face fill — not set for boundary/width RMB context. */
+	bool IsLaneFacePrimSelected() const { return bLaneFacePrimSelected; }
+	void SetLaneFacePrimSelected(bool bInSelected) { bLaneFacePrimSelected = bInSelected; }
+
+	/** Boundary / width-key context — enables Width items in Alt+T RMB menu. */
+	bool HasLaneWidthMenuContext() const
+	{
+		return bLaneWidthMenuContext || GetStateVerified() >= EMetaLandRoadSectionSelectionState::Key;
+	}
+	void SetLaneWidthMenuContext(bool bInContext) { bLaneWidthMenuContext = bInContext; }
 
 	const FComponentPropertyPath GetSplinePropertyPath() const;
 	UMetaLandRoadSplineComponent* GetSelectedSpline() const;
@@ -55,6 +90,7 @@ public:
 	void SetCachedDataAtSectionStart(int32 SectionIndex);
 	void SetCachedDataAtLane(int32 SectionIndex, int32 LaneIndex, double SOffset, double Alpha);
 	void RecordPickSplineKey(float Key);
+	void SetLastPickSplineKey(float Key);
 	void ResetCachedData();
 
 	FVector GetCachedPosition() const;
@@ -82,6 +118,9 @@ protected:
 	int32 SelectedLaneIndex = LANE_INDEX_NONE;
 
 	UPROPERTY()
+	TArray<FMetaLandRoadSelectedLaneRefU> MultiSelectedLanes;
+
+	UPROPERTY()
 	int32 SelectedKeyIndex = INDEX_NONE;
 
 	UPROPERTY()
@@ -99,6 +138,14 @@ protected:
 	/** True only when the section START cross is selected (SOffset gizmo). Span pick keeps this false. */
 	UPROPERTY()
 	bool bSectionBoundarySelected = false;
+
+	/** True after Ctrl+LMB lane face pick (yellow fill). */
+	UPROPERTY()
+	bool bLaneFacePrimSelected = false;
+
+	/** True after boundary / width-segment / width-key pick (Width RMB menu). */
+	UPROPERTY()
+	bool bLaneWidthMenuContext = false;
 
 	UPROPERTY()
 	EMetaLandRoadSectionSelectionState State = EMetaLandRoadSectionSelectionState::None;
@@ -147,10 +194,13 @@ public:
 	/** Alt+W hover segment (when not hovering a key). */
 	mutable int32 CachedNativeHoveredSegment = INDEX_NONE;
 
-	/** Alt+T hover lane — updated from viewport hit proxy each tick. */
+	/** Alt+T hover lane — updated from viewport screen pick each tick. */
 	mutable int32 CachedLaneHoveredSectionIndex = INDEX_NONE;
 	mutable int32 CachedLaneHoveredLaneIndex = LANE_INDEX_NONE;
 	mutable int32 CachedLaneHoveredWidthIndex = INDEX_NONE;
+	mutable bool CachedLaneHoveredWidthIsKey = false;
+	mutable bool CachedLaneHoveredBoundaryLine = false;
+	mutable int32 CachedLaneHoveredSectionBoundaryIndex = INDEX_NONE;
 
 	/**
 	 * Section-line mode is owned by FMetaLandRoadModule (Alt+E).
@@ -169,50 +219,16 @@ public:
 
 	void ClearNativeKeySelection();
 
-	/** Alt+W native spline helpers (formerly MoKu visualizer). */
-	static float GetNativeEditHeightOffset(const UMetaLandRoadSplineComponent* RoadSpline);
-	static float GetNativeEditRingWorldRadius(
-		const FSceneView* View,
-		const FVector& CenterWorld,
-		const FVector& RingAxisX,
-		const FVector& RingAxisY,
-		float DesiredPixelRadius = 18.0f);
-	static int32 PickHoveredControlPointKey(
-		const UMetaLandRoadSplineComponent* RoadSpline,
-		const FSceneView* View,
-		const FIntPoint& MousePos,
-		float DesiredHoverPixelRadius = 22.0f);
-	static int32 PickHoveredSplineSegment(
-		const UMetaLandRoadSplineComponent* RoadSpline,
-		const FSceneView* View,
-		const FIntPoint& MousePos,
-		float MaxPixelDistance = 20.0f);
 	static void EnsureNativeEditTranslateWidget(FEditorViewportClient* ViewportClient = nullptr);
-	static void DrawNativeEditRingOverlay(
-		const FSceneView* View,
-		int32 HoveredKey,
-		const TSet<int32>& SelectedKeys,
-		int32 SelectedSegment,
-		const UMetaLandRoadSplineComponent* RoadSpline,
-		FPrimitiveDrawInterface* PDI);
-	static void DrawLaneWidthKeyRingOverlay(
-		const FSceneView* View,
-		const UMetaLandRoadSplineComponent* RoadSpline,
-		FPrimitiveDrawInterface* PDI,
-		const FMetaLandRoadLaneEditHighlight& Highlight,
-		int32 HoveredSectionIndex,
-		int32 HoveredLaneIndex,
-		int32 HoveredWidthIndex);
-	static void DrawNativeEditSplineOverlay(
-		const UMetaLandRoadSplineComponent* RoadSpline,
-		FPrimitiveDrawInterface* PDI,
-		int32 HoveredKey,
-		int32 HoveredSegment,
-		int32 SelectedSegment,
-		const TSet<int32>& SelectedKeys);
 
-	/** Alt+E: true when main center line is hovered or selected (not boundary-only). */
+	/** Alt+E: true when main center line or selected lane strips allow Add Section. */
 	bool HasMainLineSectionMenuContext() const;
+
+	/** Face to split from selected lanes (Both if none / both faces). */
+	EMetaLandRoadLaneSectionSide ResolveAddSectionSideFromLaneSelection() const;
+
+	/** Add Section using selected-lane faces (or Both). */
+	int32 TryAddSectionFromLaneSelection(float OverrideSplitKey = -1.0f);
 
 	/** Alt+E section pick: optionally push the section context menu. */
 	bool FinishPickContextMenu(FEditorViewportClient* ViewportClient, bool bShowContextMenu) const;
@@ -225,6 +241,13 @@ public:
 
 	/** Pick section center line near cursor; optionally show the section context menu. */
 	bool TryHandleRoadSplinePickClick(
+		FEditorViewportClient* InViewportClient,
+		HHitProxy* HitProxy,
+		const FViewportClick& Click,
+		bool bShowContextMenu);
+
+	/** Alt+T RMB: screen-pick selection then lane/width context menu. */
+	bool TryHandleLaneEditPickClick(
 		FEditorViewportClient* InViewportClient,
 		HHitProxy* HitProxy,
 		const FViewportClick& Click,
@@ -243,6 +266,19 @@ public:
 	 * Enables path drag without switching to Alt+W.
 	 */
 	bool SelectMainLineForPathDrag(int32 SectionIndex, float SplineKey);
+
+	/** Alt+T: screen-pick lane face selection without stack hit proxy. */
+	bool SelectLaneFaceFromScreenPick(
+		UMetaLandRoadSplineComponent* SplineComp,
+		int32 SectionIndex,
+		int32 LaneIndex,
+		const FViewportClick& Click,
+		bool bLaneFaceFill = true);
+
+	/** Alt+T: clear width-key + lane face selection (empty-space click). */
+	bool ClearLaneEditSelection();
+
+	bool TryHandleLaneEditMousePress(FEditorViewportClient* ViewportClient, FViewport* Viewport);
 
 	/** Move selected/dragged section boundary to world point projected onto the center spline. */
 	bool ApplySectionBoundaryWorldDrag(int32 SectionIndex, const FVector& WorldPoint);
@@ -267,6 +303,7 @@ protected:
 		HComponentVisProxy* VisProxy,
 		FEditorViewportClient* InViewportClient,
 		const USplineComponent* SplineComp);
+	bool TryHandleNativeEditMousePress(FEditorViewportClient* ViewportClient, FViewport* Viewport);
 	void RefreshRoadMeshForSpline(UMetaLandRoadSplineComponent* SplineComp) const;
 	void RefreshRoadMeshAndRedraw(UMetaLandRoadSplineComponent* SplineComp, bool bForceRedraw = true) const;
 	void EnsureDefaultProfileIfNeeded(UMetaLandRoadSplineComponent* SplineComp) const;
@@ -300,5 +337,3 @@ protected:
 	void TickLaneEditHover();
 	void UpdateNativeHoverCacheFromViewport();
 };
-
-extern TSharedPtr<FMoKuEditSplinesComponentVisualizer> GMoKuEditSplinesComponentVisualizer;

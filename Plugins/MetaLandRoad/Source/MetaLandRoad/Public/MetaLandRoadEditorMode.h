@@ -5,6 +5,7 @@
 #include "CoreMinimal.h"
 #include "Tools/UEdMode.h"
 #include "Tools/LegacyEdModeWidgetHelpers.h"
+#include "MetaLandRoadTypes.h"
 
 #include "MetaLandRoadEditorMode.generated.h"
 
@@ -15,6 +16,7 @@
 class AWorldSceneManagement;
 struct FGizmoStoredInfoParams;
 class UMoKuEditorGizmoBase;
+class AMoKuEditSplineActor;
 
 UENUM()
 enum MoKuEditDisplayMode : int
@@ -67,9 +69,37 @@ public:
 	MoKuEditDisplayMode GetDisplayMode() const {return DisplayMode;}
 	void RefreshGizmoVisual(AActor* InActor);
 	void CreateGizmoHandle(UStaticMeshComponent* InMesh,const FGizmoStoredInfoParams& InGizmoInfoParams);
-	
+
+	/** True when the MetaLandRoad spline draw tool is the active left tool in this mode. */
+	bool IsInteractiveSplineToolActive() const;
+
+	/** Clear junction session data (Enter/Exit). */
+	void ResetInteractiveJunctionSession();
+
+	/** Interactive draw finish: local junction cook on DrawnRoad (default). bFullWorldRebuild = future debug toggle. */
+	void ProcessInteractiveFinishedRoadDraw(AMoKuEditSplineActor* DrawnRoad, bool bFullWorldRebuild = false);
+
+	/** Recalculate arm cuts + trim zones; optionally refresh all linked road meshes. */
+	void RecookJunctionActor(class AMoKuEditIntersectionActor* JunctionActor, bool bRefreshLinkedRoadMeshes = true);
+
+	/**
+	 * Full junction recook (Finalize/Topology/ConnectSide/Link/road mesh/cover).
+	 * Does NOT require MetaLandRoad Editor Mode to be active — Details Debug buttons use this.
+	 */
+	static void RecookJunctionActorStatic(class AMoKuEditIntersectionActor* JunctionActor, bool bRefreshLinkedRoadMeshes = true);
+
+	const TArray<FMetaLandRoadJunctionNode>& GetInteractiveJunctions() const { return InteractiveJunctions; }
+
+	const FMetaLandRoadEditTarget& GetEditTarget() const { return EditTarget; }
+	void SetEditTarget(const FMetaLandRoadEditTarget& Target);
+	void ClearEditTarget();
+
+	/** LMB lane pick in World Builder (Shift = multi/toggle, Shift+miss = clear). */
+	bool TryHandleLaneAnchorPickClick(FEditorViewportClient* InViewportClient, const FViewportClick& Click);
+
 protected:
 	virtual void OnToolStarted(UInteractiveToolManager* Manager, UInteractiveTool* Tool) override;
+	virtual void OnToolEnded(UInteractiveToolManager* Manager, UInteractiveTool* Tool) override;
 
 private:
 		
@@ -77,5 +107,12 @@ private:
 	MoKuEditDisplayMode DisplayMode = MoKuEditDisplayMode::EditMode;
 	
 	void OnLevelActorAddedToWorld(AActor* Actor);
+
+	TArray<FMetaLandRoadJunctionNode> InteractiveJunctions;
+	double InteractiveJunctionForwardIndent = 600.0;
+	/** Must cover a whole N-way footprint. 200cm split one 5-way into multiple actors (叠面). */
+	double InteractiveJunctionClusterRadius = 1500.0;
+
+	FMetaLandRoadEditTarget EditTarget;
 
 };

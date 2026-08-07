@@ -147,14 +147,34 @@ public:
 	int32 EstimateCornerExtraSteps(double S0Param, double S1Param) const
 	{
 		const int32 NumPoints = GetNumberOfSplinePoints();
-		if (NumPoints < 3)
+		if (NumPoints < 2)
 		{
 			return 0;
 		}
 
+		int32 Extra = 0;
+
+		// 2-point Hermite: no mid joint — measure leave vs chord (was always 0 → faceted arc).
+		if (NumPoints == 2)
+		{
+			const FVector P0 = GetLocationAtSplinePoint(0, ESplineCoordinateSpace::Local);
+			const FVector P1 = GetLocationAtSplinePoint(1, ESplineCoordinateSpace::Local);
+			const FVector Chord = (P1 - P0).GetSafeNormal();
+			const FVector Leave0 = GetLeaveTangentAtSplinePoint(0, ESplineCoordinateSpace::Local).GetSafeNormal();
+			if (!Chord.IsNearlyZero() && !Leave0.IsNearlyZero())
+			{
+				const float Dot = FMath::Clamp(FVector::DotProduct(Leave0, Chord), -1.0f, 1.0f);
+				const float AngleDeg = FMath::RadiansToDegrees(FMath::Acos(Dot));
+				if (AngleDeg > 12.0f)
+				{
+					Extra = AngleDeg > 45.0f ? 5 : (AngleDeg > 25.0f ? 4 : 3);
+				}
+			}
+			return FMath::Clamp(Extra, 0, 6);
+		}
+
 		const int32 KeyStart = FMath::Max(FMath::FloorToInt(static_cast<float>(S0Param)), 1);
 		const int32 KeyEnd = FMath::Min(FMath::CeilToInt(static_cast<float>(S1Param)), NumPoints - 2);
-		int32 Extra = 0;
 		for (int32 KeyIdx = KeyStart; KeyIdx <= KeyEnd; ++KeyIdx)
 		{
 			const FVector Prev = GetLocationAtSplinePoint(KeyIdx - 1, ESplineCoordinateSpace::Local);
@@ -168,12 +188,12 @@ public:
 			}
 			const float Dot = FMath::Clamp(FVector::DotProduct(InDir, OutDir), -1.0f, 1.0f);
 			const float AngleDeg = FMath::RadiansToDegrees(FMath::Acos(Dot));
-			if (AngleDeg > 12.0f)
+			if (AngleDeg > 18.0f)
 			{
-				Extra = FMath::Max(Extra, FMath::RoundToInt(AngleDeg / 8.0f) * 5);
+				Extra = FMath::Max(Extra, AngleDeg > 50.0f ? 4 : (AngleDeg > 30.0f ? 3 : 2));
 			}
 		}
-		return FMath::Clamp(Extra, 0, 64);
+		return FMath::Clamp(Extra, 0, 6);
 	}
 
 	/** Convert Linear keys to Curve so bends subdivide instead of hard corners. */
@@ -229,14 +249,24 @@ public:
 			return;
 		}
 
-		int32 NumStep = static_cast<int32>((S1_Param - S0_Param) * InReparamStepsPerSegment + 0.5);
-		if (NumStep < MinNumSteps)
+		// World-length driven density. Do NOT force MinNumSteps=20 on short spans —
+		// that was ~20 rings on a few meters (lane-extend orange brick of faces).
+		const double SpanLenCm = FMath::Max(S1 - S0, KINDA_SMALL_NUMBER);
+		// Denser rings so Hermite bends read round (300cm was two-chord faceted).
+		constexpr double TargetSampleCm = 140.0;
+		const int32 LengthBasedSteps = FMath::Max(2, FMath::CeilToInt(SpanLenCm / TargetSampleCm));
+		const int32 KeyBasedSteps = FMath::Max(
+			1,
+			static_cast<int32>((S1_Param - S0_Param) * InReparamStepsPerSegment + 0.5));
+		// Prefer denser of length/key so curved 1-span roads keep rings.
+		int32 NumStep = FMath::Max(KeyBasedSteps, LengthBasedSteps);
+		if (SpanLenCm >= static_cast<double>(MinNumSteps) * TargetSampleCm * 0.35)
 		{
-			NumStep = MinNumSteps;
+			NumStep = FMath::Max(NumStep, FMath::Min(MinNumSteps, LengthBasedSteps + 2));
 		}
-		// Extra samples near bends only — do not freeze a single RightVector for the whole span
-		// (that caused V-gaps at Left/Right-only section seams vs MetaRoad).
+		NumStep = FMath::Max(NumStep, 2);
 		NumStep += EstimateCornerExtraSteps(S0_Param, S1_Param);
+		NumStep = FMath::Clamp(NumStep, 2, 48);
 
 		const double Step = (S1_Param - S0_Param) / static_cast<double>(NumStep);
 		for (int32 i = 0; i <= NumStep; ++i)
@@ -260,8 +290,71 @@ public:
 		float RoadHeightOffset = 10.0f,
 		bool bGenerateUVs = true);
 
+	/** Total half-width (left/right outer edge distance from center) at distance S. */
+	double GetRoadHalfWidthAtS(double S) const;
+
+	/** Outer left/right edge and center at distance S along the road. */
+	bool GetRoadEdgePointsAtS(
+		double S,
+		FVector& OutLeft,
+		FVector& OutRight,
+		FVector& OutCenter,
+		ESplineCoordinateSpace::Type CoordinateSpace = ESplineCoordinateSpace::World) const;
+
+	/**
+	 * Full cross-section vertices at S, ordered left-outer → right-outer
+	 * (one point per lane outer edge + center). Matches road mesh cut point indices.
+	 */
+	bool GetRoadCrossSectionPointsAtS(
+		double S,
+		TArray<FVector>& OutPoints,
+		ESplineCoordinateSpace::Type CoordinateSpace = ESplineCoordinateSpace::World) const;
+
+	/**
+	 * Cross-section for a contiguous ConnectedLaneIndices subset at S.
+	 * Empty / invalid set falls back to full GetRoadCrossSectionPointsAtS.
+	 */
+	bool GetRoadCrossSectionPointsForLaneIndicesAtS(
+		double S,
+		const TArray<int32>& LaneIndices,
+		TArray<FVector>& OutPoints,
+		ESplineCoordinateSpace::Type CoordinateSpace = ESplineCoordinateSpace::World) const;
+
+	/** Half-width of the ConnectedLaneIndices mouth (or full road if empty). */
+	double GetRoadHalfWidthForLaneIndicesAtS(double S, const TArray<int32>& LaneIndices) const;
+
 	UFUNCTION(BlueprintCallable, Category = Road)
 	void RefreshLaneVisualization();
+
+	bool EvalMouthTransform(const FMetaLandRoadDrawAnchor& Anchor, FTransform& OutTransform) const;
+
+	bool BuildDrawAnchorForLaneMouth(
+		int32 SpanSectionIndex,
+		int32 LaneIndex,
+		double AnchorS,
+		EMetaLandRoadMouthSide MouthSide,
+		FMetaLandRoadDrawAnchor& OutAnchor) const;
+
+	/**
+	 * MetaRoad FitSplineToBegin/EndConnection: pin tip control point to Anchor mouth + outward tangent.
+	 * bAtSplineStart=true → point 0 (draw from Lane Successor); false → last point (finish at target mouth).
+	 */
+	void FitSplineToAnchor(const FMetaLandRoadDrawAnchor& Anchor, bool bAtSplineStart);
+
+	/**
+	 * MetaRoad FromConnection: Road Predecessor/Successor ↔ source Lane Successor/Predecessor.
+	 * Returns true if at least the primary lane link was written.
+	 */
+	bool ConnectRoadToDrawAnchor(const FMetaLandRoadDrawAnchor& SourceAnchor, bool bAttachAtSplineStart);
+
+	/**
+	 * EndConnection width mix toward the snapped target lane mouth.
+	 * SpanMode: last 2 / last 3 spline spans, or entire road. Width lerps Current→Target along the window.
+	 */
+	bool BlendEndWidthToTargetMouth(
+		const FMetaLandRoadDrawAnchor& TargetAnchor,
+		EMetaLandRoadEndWidthBlendSpan SpanMode = EMetaLandRoadEndWidthBlendSpan::LastTwoSegments,
+		double BlendLengthCm = 0.0);
 
 protected:
 	void FixUpSegments();

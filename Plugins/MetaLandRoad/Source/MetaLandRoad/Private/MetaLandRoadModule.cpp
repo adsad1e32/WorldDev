@@ -5,6 +5,9 @@
 #include "MetaLandRoadProfile.h"
 #include "MoKuEditorActorPicker.h"
 #include "MetaLandRoadEditorModeCommands.h"
+#include "MetaLandRoadEditorMode.h"
+#include "MoKuEditorUtils.h"
+#include "HAL/IConsoleManager.h"
 #include "PropertyEditorModule.h"
 #include "MoKuSplineActorCustomization.h"
 #include "MoKuEditSplineActor.h"
@@ -25,6 +28,7 @@
 #include "Engine/Engine.h"
 #include "UnrealEdGlobals.h"
 #include "MetaLandRoadSplineComponent.h"
+#include "Tools/MetaLandRoadInteractiveTool.h"
 #include "Editor.h"
 #include "Editor/EditorPerProjectUserSettings.h"
 #include "EditorViewportClient.h"
@@ -39,8 +43,6 @@
 #define LOCTEXT_NAMESPACE "MetaLandRoadModule"
 
 //DEFINE_LOG_CATEGORY(LogRoadEditor);
-
-TSharedPtr<FMoKuEditSplinesComponentVisualizer> GMoKuEditSplinesComponentVisualizer;
 
 #if WITH_EDITOR
 static UMetaLandRoadSplineComponent* MetaLandRoadDebugFindSelectedSpline()
@@ -72,6 +74,25 @@ static UMetaLandRoadSplineComponent* MetaLandRoadDebugFindSelectedSpline()
 	return nullptr;
 }
 
+static void RestoreAllRoadActorsViewportSelectionInWorld(UWorld* World)
+{
+	if (!World)
+	{
+		return;
+	}
+
+	for (TActorIterator<AMoKuEditSplineActor> It(World); It; ++It)
+	{
+		AMoKuEditSplineActor* Road = *It;
+		if (!IsValid(Road) || !Road->DynamicMeshComponent)
+		{
+			continue;
+		}
+		Road->DynamicMeshComponent->bSelectable = true;
+		Road->DynamicMeshComponent->SetCollisionResponseToChannel(ECC_Visibility, ECR_Block);
+	}
+}
+
 static FAutoConsoleCommand CMetaLandRoadToggleSectionLine(
 	TEXT("MetaLandRoad.ToggleSectionLineEdit"),
 	TEXT("Toggle native spline visualizer vs section-line visualizer (same as Alt+E)."),
@@ -80,6 +101,62 @@ static FAutoConsoleCommand CMetaLandRoadToggleSectionLine(
 		if (FModuleManager::Get().IsModuleLoaded(TEXT("MetaLandRoad")))
 		{
 			FMetaLandRoadModule::Get().ToggleRoadComponentVisMode();
+		}
+	}));
+#endif
+
+#if WITH_EDITOR
+static FAutoConsoleCommand CMetaLandRoadDebugEvalMouth(
+	TEXT("MetaLandRoad.DebugEvalMouth"),
+	TEXT("Log EvalMouthTransform for World Builder EditTarget anchor (Lane Anchor pick)."),
+	FConsoleCommandDelegate::CreateStatic([]()
+	{
+		if (!GEditor)
+		{
+			return;
+		}
+
+		UMetaLandRoadEditorMode* RoadMode = MoKuSplineEditorUtils::GetCurrentEditMode<UMetaLandRoadEditorMode>(
+			UMetaLandRoadEditorMode::EM_MetaLandRoadEditorModeId);
+		if (!RoadMode)
+		{
+			UE_LOG(LogTemp, Warning, TEXT("[LaneAnchor] DebugEvalMouth: not in World Builder mode"));
+			return;
+		}
+
+		const FMetaLandRoadEditTarget& Target = RoadMode->GetEditTarget();
+		if (!Target.bHasPendingAnchor || !Target.PendingAnchor.IsValid())
+		{
+			UE_LOG(LogTemp, Warning, TEXT("[LaneAnchor] DebugEvalMouth: no EditTarget anchor — LMB a lane first"));
+			return;
+		}
+
+		UMetaLandRoadSplineComponent* Spline = Target.Spline.Get();
+		if (!Spline)
+		{
+			Spline = Target.PendingAnchor.SourceSpline.Get();
+		}
+
+		if (!Spline)
+		{
+			UE_LOG(LogTemp, Warning, TEXT("[LaneAnchor] DebugEvalMouth: no spline on EditTarget"));
+			return;
+		}
+
+		MetaLandRoadLogDrawAnchor(TEXT("DebugEvalMouth"), Target.PendingAnchor);
+		FTransform MouthTransform = FTransform::Identity;
+		if (Spline->EvalMouthTransform(Target.PendingAnchor, MouthTransform))
+		{
+			UE_LOG(
+				LogTemp,
+				Log,
+				TEXT("[LaneAnchor] EvalMouth  Loc=%s Rot=%s"),
+				*MouthTransform.GetLocation().ToString(),
+				*MouthTransform.Rotator().ToString());
+		}
+		else
+		{
+			UE_LOG(LogTemp, Warning, TEXT("[LaneAnchor] DebugEvalMouth: EvalMouthTransform failed"));
 		}
 	}));
 #endif
@@ -139,14 +216,14 @@ void FMetaLandRoadModule::EnsureComponentVisualizersRegistered()
 		ComponentVisRegisterTickerHandle.Reset();
 	}
 
-	const bool bCreatedVisualizer = !GMoKuEditSplinesComponentVisualizer.IsValid();
+	const bool bCreatedVisualizer = !RoadComponentVisualizer.IsValid();
 	if (bCreatedVisualizer)
 	{
-		GMoKuEditSplinesComponentVisualizer = MakeShareable(new FMoKuEditSplinesComponentVisualizer);
+		RoadComponentVisualizer = MakeShareable(new FMoKuEditSplinesComponentVisualizer);
 	}
 
 	const TSharedPtr<FComponentVisualizer> VisualizerPtr =
-		StaticCastSharedPtr<FComponentVisualizer>(GMoKuEditSplinesComponentVisualizer);
+		StaticCastSharedPtr<FComponentVisualizer>(RoadComponentVisualizer);
 
 	RegisterComponentVisualizer(
 		UMoKuEditSplinesComponent::StaticClass()->GetFName(),
@@ -155,14 +232,19 @@ void FMetaLandRoadModule::EnsureComponentVisualizersRegistered()
 		UMetaLandRoadSplineComponent::StaticClass()->GetFName(),
 		VisualizerPtr);
 
-	if (bCreatedVisualizer && GMoKuEditSplinesComponentVisualizer.IsValid())
+	if (bCreatedVisualizer && RoadComponentVisualizer.IsValid())
 	{
-		GMoKuEditSplinesComponentVisualizer->OnRegister();
+		RoadComponentVisualizer->OnRegister();
 	}
 
 	bComponentVisualizersRegistered = true;
 
 	CompVisUtils::RefreshComponentVisualizersForSelection();
+}
+
+TSharedPtr<FMoKuEditSplinesComponentVisualizer> FMetaLandRoadModule::GetRoadComponentVisualizer() const
+{
+	return RoadComponentVisualizer;
 }
 
 void FMetaLandRoadModule::TryRegisterComponentVisualizers()
@@ -215,10 +297,13 @@ void FMetaLandRoadModule::OnEditorActorPicked(AActor* PickedActor)
 	{
 		CompVisUtils::SelectRoadSplineExclusive(PickedActor, PickedSpline, true);
 
-		if (FMetaLandRoadModule::Get().ShouldShowNativeEditOverlay()
-			&& GMoKuEditSplinesComponentVisualizer.IsValid())
+		if (FMetaLandRoadModule::Get().ShouldShowNativeEditOverlay())
 		{
-			GMoKuEditSplinesComponentVisualizer->SetActiveForSpline(PickedSpline);
+			FMetaLandRoadModule::Get().SyncNativeEditTargetToSelection(PickedSpline);
+		}
+		else if (RoadComponentVisualizer.IsValid())
+		{
+			RoadComponentVisualizer->SetActiveForSpline(PickedSpline);
 		}
 	}
 	else
@@ -297,14 +382,14 @@ void FMetaLandRoadModule::ApplyEditorVisModeSideEffects(bool bShowSectionEdit)
 		}
 	}
 
-	if (!GMoKuEditSplinesComponentVisualizer.IsValid())
+	if (!RoadComponentVisualizer.IsValid())
 	{
 		EnsureComponentVisualizersRegistered();
 	}
 
-	if (GMoKuEditSplinesComponentVisualizer.IsValid())
+	if (RoadComponentVisualizer.IsValid())
 	{
-		GMoKuEditSplinesComponentVisualizer->SyncSectionLineEditModeFlag(bShowSectionEdit);
+		RoadComponentVisualizer->SyncSectionLineEditModeFlag(bShowSectionEdit);
 
 		if (RoadSpline)
 		{
@@ -324,11 +409,19 @@ void FMetaLandRoadModule::ApplyEditorVisModeSideEffects(bool bShowSectionEdit)
 			{
 				if (RoadActor->DynamicMeshComponent)
 				{
-					RoadActor->DynamicMeshComponent->bSelectable = IsStandardMode();
-					// Alt+W: let viewport hit tests reach spline segment/key proxies underneath the road mesh.
+					const bool bAllowMeshPick = IsStandardMode();
+					RoadActor->DynamicMeshComponent->bSelectable = bAllowMeshPick;
 					RoadActor->DynamicMeshComponent->SetCollisionResponseToChannel(
 						ECC_Visibility,
 						IsNativeEditMode() ? ECR_Ignore : ECR_Block);
+				}
+			}
+
+			if (IsStandardMode())
+			{
+				if (UWorld* World = RoadSpline->GetWorld())
+				{
+					RestoreAllRoadActorsViewportSelectionInWorld(World);
 				}
 			}
 
@@ -340,7 +433,7 @@ void FMetaLandRoadModule::ApplyEditorVisModeSideEffects(bool bShowSectionEdit)
 				{
 					GCurrentLevelEditingViewportClient->SetGameView(false);
 				}
-				GMoKuEditSplinesComponentVisualizer->ActivateRoadVisualization();
+				RoadComponentVisualizer->ActivateRoadVisualization();
 			}
 			else if (IsLaneEditMode())
 			{
@@ -349,11 +442,11 @@ void FMetaLandRoadModule::ApplyEditorVisModeSideEffects(bool bShowSectionEdit)
 				{
 					GCurrentLevelEditingViewportClient->SetGameView(false);
 				}
-				GMoKuEditSplinesComponentVisualizer->ActivateRoadVisualization();
+				RoadComponentVisualizer->ActivateRoadVisualization();
 			}
 			else if (ShouldShowNativeEditOverlay())
 			{
-				GMoKuEditSplinesComponentVisualizer->SetActiveForSpline(RoadSpline);
+				RoadComponentVisualizer->SetActiveForSpline(RoadSpline);
 			}
 		}
 	}
@@ -372,7 +465,13 @@ void FMetaLandRoadModule::ApplyEditorVisModeSideEffects(bool bShowSectionEdit)
 			[WeakSpline, bLaneMode](float)
 			{
 				UMetaLandRoadSplineComponent* Spline = WeakSpline.Get();
-				if (!Spline || !GEditor || !GMoKuEditSplinesComponentVisualizer.IsValid())
+				if (!Spline || !GEditor)
+				{
+					return false;
+				}
+				const TSharedPtr<FMoKuEditSplinesComponentVisualizer> RoadVis =
+					FMetaLandRoadModule::Get().GetRoadComponentVisualizer();
+				if (!RoadVis.IsValid())
 				{
 					return false;
 				}
@@ -394,7 +493,7 @@ void FMetaLandRoadModule::ApplyEditorVisModeSideEffects(bool bShowSectionEdit)
 
 				CompVisUtils::SelectRoadSplineExclusive(Spline->GetOwner(), Spline, false);
 				CompVisUtils::RefreshComponentVisualizersForSelection();
-				GMoKuEditSplinesComponentVisualizer->ActivateRoadVisualization();
+				RoadVis->ActivateRoadVisualization();
 				GEditor->RedrawLevelEditingViewports(true);
 				return false;
 			}),
@@ -488,11 +587,69 @@ void FMetaLandRoadModule::SyncSelectedRoadActorToSpline()
 void FMetaLandRoadModule::OnEditorSelectionChanged(UObject* /*NewSelection*/)
 {
 	SyncSelectedRoadActorToSpline();
+
+	if (IsNativeEditMode())
+	{
+		if (UMetaLandRoadSplineComponent* SelectedSpline = FindSelectedOrOwnedRoadSpline())
+		{
+			SyncNativeEditTargetToSelection(SelectedSpline);
+		}
+	}
+}
+
+void FMetaLandRoadModule::SyncNativeEditTargetToSelection(UMetaLandRoadSplineComponent* SplineComp)
+{
+	if (!IsNativeEditMode() || !SplineComp)
+	{
+		return;
+	}
+
+	if (UMetaLandRoadSplineComponent* Prev = ActiveNativeEditSpline.Get())
+	{
+		if (Prev != SplineComp)
+		{
+			if (AMoKuEditSplineActor* PrevRoad = Cast<AMoKuEditSplineActor>(Prev->GetOwner()))
+			{
+				if (PrevRoad->DynamicMeshComponent)
+				{
+					PrevRoad->DynamicMeshComponent->bSelectable = true;
+					PrevRoad->DynamicMeshComponent->SetCollisionResponseToChannel(
+						ECC_Visibility, ECR_Block);
+				}
+			}
+			if (RoadComponentVisualizer.IsValid())
+			{
+				RoadComponentVisualizer->ClearNativeKeySelection();
+			}
+		}
+	}
+
+	ActiveNativeEditSpline = SplineComp;
+
+	if (AMoKuEditSplineActor* Road = Cast<AMoKuEditSplineActor>(SplineComp->GetOwner()))
+	{
+		if (Road->DynamicMeshComponent)
+		{
+			Road->DynamicMeshComponent->bSelectable = false;
+			Road->DynamicMeshComponent->SetCollisionResponseToChannel(
+				ECC_Visibility, ECR_Ignore);
+		}
+	}
+
+	if (RoadComponentVisualizer.IsValid())
+	{
+		RoadComponentVisualizer->SetActiveForSpline(SplineComp);
+	}
 }
 
 void FMetaLandRoadModule::SetEditorVisMode(EMetaLandRoadEditorVisMode NewMode)
 {
 	if (!GUnrealEd)
+	{
+		return;
+	}
+
+	if (NewMode != EMetaLandRoadEditorVisMode::Standard && IsInteractiveSplineDrawToolActive())
 	{
 		return;
 	}
@@ -507,9 +664,9 @@ void FMetaLandRoadModule::SetEditorVisMode(EMetaLandRoadEditorVisMode NewMode)
 	// Keep ActiveNativeEditSpline through Apply so W→E still finds the road for selection/profile.
 	// Clear native key selection only; reset ActiveNativeEditSpline after Apply when leaving NativeEdit.
 	if (PreviousMode == EMetaLandRoadEditorVisMode::NativeEdit
-		&& GMoKuEditSplinesComponentVisualizer.IsValid())
+		&& RoadComponentVisualizer.IsValid())
 	{
-		GMoKuEditSplinesComponentVisualizer->ClearNativeKeySelection();
+		RoadComponentVisualizer->ClearNativeKeySelection();
 	}
 
 	if (PreviousMode == EMetaLandRoadEditorVisMode::Section && NewMode != EMetaLandRoadEditorVisMode::Section && GEditor)
@@ -525,17 +682,17 @@ void FMetaLandRoadModule::SetEditorVisMode(EMetaLandRoadEditorVisMode NewMode)
 				}
 			}
 		}
-		if (GMoKuEditSplinesComponentVisualizer.IsValid())
+		if (RoadComponentVisualizer.IsValid())
 		{
-			GMoKuEditSplinesComponentVisualizer->ClearSectionHighlight();
+			RoadComponentVisualizer->ClearSectionHighlight();
 		}
 	}
 
 	if (PreviousMode == EMetaLandRoadEditorVisMode::Lane && NewMode != EMetaLandRoadEditorVisMode::Lane)
 	{
-		if (GMoKuEditSplinesComponentVisualizer.IsValid())
+		if (RoadComponentVisualizer.IsValid())
 		{
-			GMoKuEditSplinesComponentVisualizer->ClearSectionHighlight();
+			RoadComponentVisualizer->ClearSectionHighlight();
 		}
 		if (GEditor)
 		{
@@ -560,6 +717,7 @@ void FMetaLandRoadModule::SetEditorVisMode(EMetaLandRoadEditorVisMode NewMode)
 	if (NewMode == EMetaLandRoadEditorVisMode::Standard)
 	{
 		ActiveNativeEditSpline.Reset();
+		ClearInteractiveSessionLeftovers();
 	}
 
 	FMoKuEditSplinesComponentVisualizer::UpdateEditorViewportTick();
@@ -571,6 +729,79 @@ void FMetaLandRoadModule::SetEditorVisMode(EMetaLandRoadEditorVisMode NewMode)
 		GEditor->RedrawLevelEditingViewports(true);
 	}
 
+}
+
+bool FMetaLandRoadModule::IsInteractiveSplineDrawToolActive() const
+{
+	if (!GEditor)
+	{
+		return false;
+	}
+
+	if (UMetaLandRoadEditorMode* RoadMode = MoKuSplineEditorUtils::GetCurrentEditMode<UMetaLandRoadEditorMode>(
+		UMetaLandRoadEditorMode::EM_MetaLandRoadEditorModeId))
+	{
+		return RoadMode->IsInteractiveSplineToolActive();
+	}
+
+	return false;
+}
+
+void FMetaLandRoadModule::AbortSplineVisualizerTracking()
+{
+	// EndEditing clears the visualizer edited-component path before draw tool SelectNone.
+	// Do not call FEditorViewportClient::StopTracking() here — it is protected; mouse-up
+	// ComponentVisManager::TrackingStopped skips when GetEditedComponent() is already null.
+	if (RoadComponentVisualizer.IsValid())
+	{
+		RoadComponentVisualizer->EndEditing();
+	}
+}
+
+bool FMetaLandRoadModule::CanUseEditorVisModeHotkeys() const
+{
+	return !IsInteractiveSplineDrawToolActive();
+}
+
+void FMetaLandRoadModule::ClearInteractiveSessionLeftovers()
+{
+	if (RoadComponentVisualizer.IsValid())
+	{
+		RoadComponentVisualizer->ClearNativeKeySelection();
+	}
+
+	if (UMetaLandRoadEditorMode* RoadMode = MoKuSplineEditorUtils::GetCurrentEditMode<UMetaLandRoadEditorMode>(
+		UMetaLandRoadEditorMode::EM_MetaLandRoadEditorModeId))
+	{
+		RoadMode->ClearEditTarget();
+		RoadMode->ResetInteractiveJunctionSession();
+
+		if (UInteractiveToolManager* ToolManager = RoadMode->GetToolManager())
+		{
+			if (UMetaLandRoadInteractiveTool* DrawTool =
+				Cast<UMetaLandRoadInteractiveTool>(ToolManager->GetActiveTool(EToolSide::Left)))
+			{
+				DrawTool->ResetDrawSessionState();
+			}
+		}
+	}
+
+	if (GEditor)
+	{
+		if (UWorld* World = GEditor->GetEditorWorldContext().World())
+		{
+			RestoreAllRoadActorsViewportSelectionInWorld(World);
+		}
+		GEditor->RedrawLevelEditingViewports(false);
+	}
+}
+
+void FMetaLandRoadModule::RestoreAllRoadActorsViewportSelection()
+{
+	if (GEditor)
+	{
+		RestoreAllRoadActorsViewportSelectionInWorld(GEditor->GetEditorWorldContext().World());
+	}
 }
 
 void FMetaLandRoadModule::ToggleRoadComponentVisMode()
@@ -645,7 +876,8 @@ void FMetaLandRoadModule::RegisterSectionLineEditHotkey()
 		}),
 		FCanExecuteAction::CreateLambda([]()
 		{
-			return FModuleManager::Get().IsModuleLoaded(TEXT("MetaLandRoad"));
+			return FModuleManager::Get().IsModuleLoaded(TEXT("MetaLandRoad"))
+				&& FMetaLandRoadModule::Get().CanUseEditorVisModeHotkeys();
 		}),
 		FIsActionChecked::CreateLambda([]()
 		{
@@ -666,7 +898,8 @@ void FMetaLandRoadModule::RegisterSectionLineEditHotkey()
 			}),
 			FCanExecuteAction::CreateLambda([]()
 			{
-				return FModuleManager::Get().IsModuleLoaded(TEXT("MetaLandRoad"));
+				return FModuleManager::Get().IsModuleLoaded(TEXT("MetaLandRoad"))
+					&& FMetaLandRoadModule::Get().CanUseEditorVisModeHotkeys();
 			}),
 			FIsActionChecked::CreateLambda([]()
 			{
@@ -688,7 +921,8 @@ void FMetaLandRoadModule::RegisterSectionLineEditHotkey()
 			}),
 			FCanExecuteAction::CreateLambda([]()
 			{
-				return FModuleManager::Get().IsModuleLoaded(TEXT("MetaLandRoad"));
+				return FModuleManager::Get().IsModuleLoaded(TEXT("MetaLandRoad"))
+					&& FMetaLandRoadModule::Get().CanUseEditorVisModeHotkeys();
 			}),
 			FIsActionChecked::CreateLambda([]()
 			{
@@ -759,6 +993,7 @@ UMetaLandRoadSplineComponent* FMetaLandRoadModule::FindSelectedOrOwnedRoadSpline
 		return nullptr;
 	}
 
+	// Viewport selection wins over EditTarget (extend session must not hijack Alt+W on another road).
 	for (FSelectionIterator It(GEditor->GetSelectedComponentIterator()); It; ++It)
 	{
 		if (UMetaLandRoadSplineComponent* Spline = Cast<UMetaLandRoadSplineComponent>(*It))
@@ -782,9 +1017,19 @@ UMetaLandRoadSplineComponent* FMetaLandRoadModule::FindSelectedOrOwnedRoadSpline
 		}
 	}
 
-	if (GMoKuEditSplinesComponentVisualizer.IsValid())
+	if (UMetaLandRoadEditorMode* RoadMode = MoKuSplineEditorUtils::GetCurrentEditMode<UMetaLandRoadEditorMode>(
+		UMetaLandRoadEditorMode::EM_MetaLandRoadEditorModeId))
 	{
-		return GMoKuEditSplinesComponentVisualizer->GetEditedMetaLandRoadSpline();
+		const FMetaLandRoadEditTarget& Target = RoadMode->GetEditTarget();
+		if (Target.Spline.IsValid())
+		{
+			return Target.Spline.Get();
+		}
+	}
+
+	if (RoadComponentVisualizer.IsValid())
+	{
+		return RoadComponentVisualizer->GetEditedMetaLandRoadSpline();
 	}
 
 	if (IsNativeEditMode() || IsLaneEditMode())
@@ -801,9 +1046,9 @@ void FMetaLandRoadModule::ExitNativeSplineEditMode()
 		return;
 	}
 
-	if (GMoKuEditSplinesComponentVisualizer.IsValid())
+	if (RoadComponentVisualizer.IsValid())
 	{
-		GMoKuEditSplinesComponentVisualizer->ClearNativeKeySelection();
+		RoadComponentVisualizer->ClearNativeKeySelection();
 	}
 
 	if (GEditor)
@@ -841,8 +1086,6 @@ void FMetaLandRoadModule::EnterNativeSplineEditMode()
 		return;
 	}
 
-	ActiveNativeEditSpline = RoadSpline;
-
 	if (GCurrentLevelEditingViewportClient && GCurrentLevelEditingViewportClient->IsInGameView())
 	{
 		UE_LOG(LogTemp, Warning,
@@ -851,6 +1094,7 @@ void FMetaLandRoadModule::EnterNativeSplineEditMode()
 	}
 
 	SetEditorVisMode(EMetaLandRoadEditorVisMode::NativeEdit);
+	SyncNativeEditTargetToSelection(RoadSpline);
 
 	RoadSpline->EnsureAllCurvePointTypesForSmoothCorners();
 	if (GEditor)
@@ -875,9 +1119,9 @@ void FMetaLandRoadModule::ExitLaneEditMode()
 		return;
 	}
 
-	if (GMoKuEditSplinesComponentVisualizer.IsValid())
+	if (RoadComponentVisualizer.IsValid())
 	{
-		GMoKuEditSplinesComponentVisualizer->ClearSectionHighlight();
+		RoadComponentVisualizer->ClearSectionHighlight();
 	}
 
 	ActiveNativeEditSpline.Reset();
@@ -968,6 +1212,7 @@ void FMetaLandRoadModule::ShutdownModule()
 		}
 	}
 	bComponentVisualizersRegistered = false;
+	RoadComponentVisualizer.Reset();
 
 	if (ActorPickerHandle.IsValid())
 	{

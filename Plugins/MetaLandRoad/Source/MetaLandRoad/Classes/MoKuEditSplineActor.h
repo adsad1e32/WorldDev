@@ -231,6 +231,26 @@ struct FConnectionInfo
 
 
 
+/** One junction gap on a road spline (supports multiple junctions per road). */
+USTRUCT(BlueprintType)
+struct FMetaLandRoadJunctionTrimZone
+{
+	GENERATED_BODY()
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = Junction)
+	TWeakObjectPtr<AMoKuEditIntersectionActor> Junction;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = Junction)
+	double ApproachCutS = -1.0;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = Junction)
+	double DepartCutS = -1.0;
+
+	/** T through: Left/Right = half-notch only (far asphalt stays). Both = full gap (Cross). */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = Junction)
+	EMetaLandRoadJunctionConnectSide ConnectSide = EMetaLandRoadJunctionConnectSide::Both;
+};
+
 
 
 UCLASS(Blueprintable, hidecategories = (Replication, Input, LOD, Actor, Cooking, Rendering))
@@ -260,6 +280,21 @@ public:
 
 	// 假如当前道路为DynamicMesh 则需要刷新
 	virtual void RefreshDynamicRoadMesh();
+
+	/**
+	 * Debug: recook Start/End/TrimZone junctions + refresh this road (no redraw).
+	 * Details panel button under MetaLandRoad|Debug.
+	 */
+	UFUNCTION(CallInEditor, Category = "MetaLandRoad|Debug", meta = (DisplayName = "Recook Linked Junctions"))
+	void DebugRecookLinkedJunctions();
+
+	/** Debug: full-world junction scan + cook (all road pairs). Prefer local cook during draw; use sparingly. */
+	UFUNCTION(CallInEditor, Category = "MetaLandRoad|Debug", meta = (DisplayName = "Full World Junction Recook"))
+	void DebugFullWorldJunctionRecook();
+
+	/** Guard: prevents road refresh → junction recook recursion during batch junction cook. */
+	static bool bSuppressJunctionRecookFromRoadRefresh;
+
 	void EnsureRoadLayoutInitialized();
 	//virtual void UpdateSceneManagementData()override;
 	virtual FEditSplineIntersectInfo CheckIntersectionState(AMoKuEditBaseActor* InEditActor);
@@ -407,6 +442,12 @@ public:
 #endif
 	}
 
+	/** Same asphalt UV as lane mesh: U = lateral cm, V = spline S (tile = DefaultAsphaltUvTileCm). */
+	static FVector2f MakeAsphaltUVAtDistance(
+		const UMetaLandRoadSplineComponent* Spline,
+		double DistanceS,
+		const FVector& WorldPos);
+
 	/**
 	 * Promote per-vertex UVs → PrimaryUV overlay (required for UDynamicMeshComponent render).
 	 * Must use CopyVertexUVsToOverlay (element ID == vertex ID); hand-rolled AppendElement
@@ -544,6 +585,24 @@ public:
 
 	UPROPERTY()
 	TWeakObjectPtr<AMoKuEditIntersectionActor> EndOfJunction;
+
+	/** Mesh generation starts here when StartOfJunction is set (-1 = full spline start). Spline geometry unchanged. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = Junction)
+	double StartJunctionMeshTrimS = -1.0;
+
+	/** Mesh generation ends here when EndOfJunction is set (-1 = full spline end). Spline geometry unchanged. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = Junction)
+	double EndJunctionMeshTrimS = -1.0;
+
+	/** Multiple junction gaps along one road (preferred over Start/End trim fields). */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = Junction)
+	TArray<FMetaLandRoadJunctionTrimZone> JunctionTrimZones;
+
+	/** Active [SMin, SMax] for lane mesh generation (respects junction trim, not spline length). */
+	void GetJunctionMeshGenerationRange(double& OutSMin, double& OutSMax) const;
+
+	/** One or two spans when a through road has a middle gap at a junction. */
+	void GetJunctionMeshGenerationSpans(TArray<TPair<double, double>>& OutSpans) const;
 
 	//UPROPERTY()
 	//TWeakObjectPtr<AWorldSceneManagement> SceneManagement;

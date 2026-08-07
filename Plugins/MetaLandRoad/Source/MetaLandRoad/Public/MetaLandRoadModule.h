@@ -12,6 +12,7 @@ class AActor;
 class AMoKuEditSplineActor;
 class UObject;
 class FComponentVisualizer;
+class FMoKuEditSplinesComponentVisualizer;
 class UMetaLandRoadSplineComponent;
 
 /**
@@ -47,6 +48,16 @@ public:
 	void SetEditorVisMode(EMetaLandRoadEditorVisMode NewMode);
 	void SetRoadComponentVisMode(bool bShowEditSpline);
 	void ToggleRoadComponentVisMode();
+	/** True when Alt+E / Alt+W / Alt+T hotkeys may run (interactive draw tool must be inactive). */
+	bool CanUseEditorVisModeHotkeys() const;
+	/** True while MetaLandRoad spline draw / lane-extend interactive tool owns input. */
+	bool IsInteractiveSplineDrawToolActive() const;
+	/** Stop viewport drag tracking + end spline visualizer before draw tool clears selection. */
+	void AbortSplineVisualizerTracking();
+	/** Clear EditTarget + interactive draw leftovers when leaving editor vis modes. */
+	void ClearInteractiveSessionLeftovers();
+	/** Restore road mesh viewport pick after Alt+W / draw session (bSelectable + visibility). */
+	void RestoreAllRoadActorsViewportSelection();
 	void EnterNativeSplineEditMode();
 	void ExitNativeSplineEditMode();
 	void ToggleNativeSplineEditMode();
@@ -54,6 +65,8 @@ public:
 	void ExitLaneEditMode();
 	void ToggleLaneEditMode();
 	void EnsureComponentVisualizersRegistered();
+
+	TSharedPtr<FMoKuEditSplinesComponentVisualizer> GetRoadComponentVisualizer() const;
 
 private:
 	void OnLevelActorAddedToWorld(AActor* Actor);
@@ -67,6 +80,7 @@ private:
 	void ApplyEditorVisModeSideEffects(bool bSectionMode);
 	void OnEditorSelectionChanged(UObject* NewSelection);
 	void SyncSelectedRoadActorToSpline();
+	void SyncNativeEditTargetToSelection(UMetaLandRoadSplineComponent* SplineComp);
 	UMetaLandRoadSplineComponent* FindSelectedOrOwnedRoadSpline() const;
 
 	TArray<FName> RegisteredComponentClassNames;
@@ -81,4 +95,5 @@ private:
 	EMetaLandRoadEditorVisMode EditorVisMode = EMetaLandRoadEditorVisMode::Standard;
 	TWeakObjectPtr<UMetaLandRoadSplineComponent> ActiveNativeEditSpline;
 	TOptional<bool> SavedShowSelectionSubcomponents;
+	TSharedPtr<FMoKuEditSplinesComponentVisualizer> RoadComponentVisualizer;
 };

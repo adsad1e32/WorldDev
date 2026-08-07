@@ -1,4 +1,5 @@
 #include "MoKuEditorUtils.h"
+#include "Components/SplineComponent.h"
 #include "Async/Async.h"
 #include "Misc/Guid.h" 
 #include "Engine/Level.h"
@@ -1138,40 +1139,110 @@ void MoKuSplineEditorUtils::OctreeSegmentsIntersect(FSplineRoadActorOctree Octre
 
 bool MoKuSplineEditorUtils::DoSplineIntersect(USplineComponent* Spline1, USplineComponent* Spline2, FVector& OutIntersectionPoint)
 {
-	if (!Spline1 || !Spline2)return false;
-	if(Spline1->GetNumberOfSplinePoints()<2)return false;
-	// ?????????????????
-	for (int i = 0; i < Spline1->GetNumberOfSplinePoints()-1; i++)
+	if (!Spline1 || !Spline2)
 	{
-		FVector Start1 = Spline1->GetLocationAtSplinePoint(i, ESplineCoordinateSpace::World);
-		FVector End1 = Spline1->GetLocationAtSplinePoint(i+1, ESplineCoordinateSpace::World);
-		FVector2d SegStart1(Start1.X,Start1.Y);
-		FVector2d SegEnd1(End1.X, End1.Y);
-		int SplineCount = Spline2->GetNumberOfSplinePoints();
+		return false;
+	}
+	if (Spline1->GetNumberOfSplinePoints() < 2 || Spline2->GetNumberOfSplinePoints() < 2)
+	{
+		return false;
+	}
 
-		if (SplineCount > 1)
+	auto BuildSampledSegments = [](USplineComponent* Spline, TArray<TPair<FVector2D, FVector2D>>& OutSegments)
+	{
+		OutSegments.Reset();
+		const float SplineLength = Spline->GetSplineLength();
+		if (SplineLength <= KINDA_SMALL_NUMBER)
 		{
-			for (int j = 0; j < Spline2->GetNumberOfSplinePoints() - 1; j++)
-			{
-				FVector Start2 = Spline2->GetLocationAtSplinePoint(j, ESplineCoordinateSpace::World);
-				FVector End2 = Spline2->GetLocationAtSplinePoint(j+1, ESplineCoordinateSpace::World);
-				FVector2d SegStart2(Start2.X, Start2.Y);
-				FVector2d SegEnd2(End2.X, End2.Y);
-				FVector2d Intersection;
-				double  OutSeg1Intersection ;
-				double OutSeg2Intersection;
-				bool bIsIntersected = DoSegmentsIntersect(SegStart1, SegEnd1, SegStart2, SegEnd2, Intersection,OutSeg1Intersection, OutSeg2Intersection);
-				if (bIsIntersected)
-				{
-					//?????????????��?????
-					OutIntersectionPoint.Z = Start1.Z;
-					OutIntersectionPoint.X = Intersection.X;
-					OutIntersectionPoint.Y = Intersection.Y;
-					return true;
-				}
-			}
-
+			return;
 		}
+
+		const int32 NumSteps = FMath::Clamp(
+			FMath::CeilToInt(SplineLength / 250.0f) * 8,
+			16,
+			128);
+		FVector PrevPos = Spline->GetLocationAtDistanceAlongSpline(0.0f, ESplineCoordinateSpace::World);
+		for (int32 Step = 1; Step <= NumSteps; ++Step)
+		{
+			const float Distance = SplineLength * static_cast<float>(Step) / static_cast<float>(NumSteps);
+			const FVector CurPos = Spline->GetLocationAtDistanceAlongSpline(Distance, ESplineCoordinateSpace::World);
+			OutSegments.Emplace(
+				FVector2D(PrevPos.X, PrevPos.Y),
+				FVector2D(CurPos.X, CurPos.Y));
+			PrevPos = CurPos;
+		}
+	};
+
+	TArray<TPair<FVector2D, FVector2D>> Segments1;
+	TArray<TPair<FVector2D, FVector2D>> Segments2;
+	BuildSampledSegments(Spline1, Segments1);
+	BuildSampledSegments(Spline2, Segments2);
+	if (Segments1.IsEmpty() || Segments2.IsEmpty())
+	{
+		return false;
+	}
+
+	for (const TPair<FVector2D, FVector2D>& Seg1 : Segments1)
+	{
+		for (const TPair<FVector2D, FVector2D>& Seg2 : Segments2)
+		{
+			FVector2D Intersection2D;
+			double Seg1Alpha = 0.0;
+			double Seg2Alpha = 0.0;
+			if (DoSegmentsIntersect(
+				Seg1.Key,
+				Seg1.Value,
+				Seg2.Key,
+				Seg2.Value,
+				Intersection2D,
+				Seg1Alpha,
+				Seg2Alpha))
+			{
+				OutIntersectionPoint = FVector(Intersection2D.X, Intersection2D.Y, 0.0f);
+				const float ClosestKey = Spline1->FindInputKeyClosestToWorldLocation(OutIntersectionPoint);
+				OutIntersectionPoint.Z = Spline1->GetLocationAtSplineInputKey(ClosestKey, ESplineCoordinateSpace::World).Z;
+				return true;
+			}
+		}
+	}
+
+	const float ProximityTolerance = 800.f;
+	const float ProximityToleranceSq = ProximityTolerance * ProximityTolerance;
+	double BestDistSq = TNumericLimits<double>::Max();
+	FVector BestPointOnSpline1 = FVector::ZeroVector;
+	FVector BestPointOnSpline2 = FVector::ZeroVector;
+
+	const int32 ProximitySteps = FMath::Clamp(
+		FMath::Max(Segments1.Num(), Segments2.Num()),
+		16,
+		64);
+	const float Length1 = Spline1->GetSplineLength();
+	const float Length2 = Spline2->GetSplineLength();
+
+	for (int32 Step1 = 0; Step1 <= ProximitySteps; ++Step1)
+	{
+		const float Distance1 = Length1 * static_cast<float>(Step1) / static_cast<float>(ProximitySteps);
+		const FVector Pos1 = Spline1->GetLocationAtDistanceAlongSpline(Distance1, ESplineCoordinateSpace::World);
+		for (int32 Step2 = 0; Step2 <= ProximitySteps; ++Step2)
+		{
+			const float Distance2 = Length2 * static_cast<float>(Step2) / static_cast<float>(ProximitySteps);
+			const FVector Pos2 = Spline2->GetLocationAtDistanceAlongSpline(Distance2, ESplineCoordinateSpace::World);
+			const double DistSq = FVector::DistSquared2D(Pos1, Pos2);
+			if (DistSq < BestDistSq)
+			{
+				BestDistSq = DistSq;
+				BestPointOnSpline1 = Pos1;
+				BestPointOnSpline2 = Pos2;
+			}
+		}
+	}
+
+	if (BestDistSq <= ProximityToleranceSq)
+	{
+		OutIntersectionPoint = (BestPointOnSpline1 + BestPointOnSpline2) * 0.5;
+		const float ClosestKey = Spline1->FindInputKeyClosestToWorldLocation(OutIntersectionPoint);
+		OutIntersectionPoint.Z = Spline1->GetLocationAtSplineInputKey(ClosestKey, ESplineCoordinateSpace::World).Z;
+		return true;
 	}
 
 	return false;

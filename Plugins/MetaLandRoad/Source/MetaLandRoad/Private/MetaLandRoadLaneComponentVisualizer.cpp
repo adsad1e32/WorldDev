@@ -4,7 +4,6 @@
 #include "MetaLandRoadModule.h"
 #include "MetaLandRoadSplineComponent.h"
 #include "Modules/ModuleManager.h"
-#include "MoKuEditSplinesComponent.h"
 
 void FMetaLandRoadLaneComponentVisualizer::DrawVisualization(const UActorComponent* Component, const FSceneView* View, FPrimitiveDrawInterface* PDI)
 {
@@ -14,11 +13,19 @@ void FMetaLandRoadLaneComponentVisualizer::DrawVisualization(const UActorCompone
 		return;
 	}
 
-	// Alt+E shows CompVis main/section only — skip lane LineBatch/PDI overlays.
-	if (FModuleManager::Get().IsModuleLoaded(TEXT("MetaLandRoad"))
-		&& (FMetaLandRoadModule::Get().IsSectionMode() || FMetaLandRoadModule::Get().IsLaneEditMode()))
+	if (FModuleManager::Get().IsModuleLoaded(TEXT("MetaLandRoad")))
 	{
-		return;
+		// Spline draw / lane-extend: mouth bars + green guidance only (no lane boundary spam).
+		if (FMetaLandRoadModule::Get().IsInteractiveSplineDrawToolActive())
+		{
+			return;
+		}
+
+		// Alt+E / Alt+T use CompVis overlays — skip persistent lane LineBatch/PDI.
+		if (FMetaLandRoadModule::Get().IsSectionMode() || FMetaLandRoadModule::Get().IsLaneEditMode())
+		{
+			return;
+		}
 	}
 
 	MetaLandRoadLaneVisualization::DrawLaneVisualization(RoadSpline, PDI);

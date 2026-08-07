@@ -25,8 +25,12 @@ namespace MetaLandRoad
 	 */
 	constexpr int32 DefaultReparamStepsPerSegment = 20;
 	constexpr int32 DefaultMinNumStepsPerSection = 20;
+	/** Alt+T editor overlay — denser than mesh so width keys / curves match face fill and boundary lines. */
+	constexpr int32 LaneEditReparamStepsPerSegment = 40;
+	constexpr int32 LaneEditMinNumStepsPerSection = 32;
 
 	METALANDROAD_API void TrimCurveInRang(FRichCurve& Curve, double Time0, double Time1, bool bFitBorders);
+	METALANDROAD_API void EnsureLaneWidthCurveCubic(FRichCurve& Width);
 	METALANDROAD_API FQuat InvertRotation(const FQuat& Quat);
 
 	FORCEINLINE int LaneIndex2SeqIndex(int LeftNum, int LaneIndex)
@@ -42,6 +46,7 @@ namespace MetaLandRoad
 	}
 }
 
+class AMoKuEditSplineActor;
 class UMetaLandRoadSplineComponent;
 class UMetaLandRoadConnection;
 class UMetaLandRoadLaneConnection;
@@ -115,7 +120,7 @@ namespace MetaLandRoad
 		const UMetaLandRoadSplineComponent* SplineComp,
 		int32 SectionIndex,
 		double CandidateS,
-		double MinSectionLength = 100.0,
+		double MinSectionLength = 10.0,
 		double SameBoundaryTolerance = 0.1);
 }
 
@@ -125,6 +130,90 @@ enum class EMetaLandRoadDirection : uint8
 	LeftHand,
 	RightHand
 };
+
+/** Which end of a lane span the user picked (路尾 / 闸口 / 路口 arm 统一). */
+UENUM(BlueprintType)
+enum class EMetaLandRoadMouthSide : uint8
+{
+	Start,
+	End,
+};
+
+/** Draw finish policy (P1+). */
+UENUM(BlueprintType)
+enum class EMetaLandRoadDrawFinishMode : uint8
+{
+	Direct,
+	Blend,
+	Junction,
+};
+
+/** EndConnection width mix: how far back from the tip to lerp toward the target lane mouth width. */
+UENUM(BlueprintType)
+enum class EMetaLandRoadEndWidthBlendSpan : uint8
+{
+	/** Smooth over the last 2 spline spans (tip ← previous ← previous-1). Default. */
+	LastTwoSegments UMETA(DisplayName = "Last 2 Segments"),
+	/** Smooth over the last 3 spline spans. */
+	LastThreeSegments UMETA(DisplayName = "Last 3 Segments"),
+	/** Lerp width from road start to tip (entire extend path). */
+	EntireRoad UMETA(DisplayName = "Entire Road"),
+};
+
+/** User lane-pick anchor for continue-draw / connect. */
+USTRUCT(BlueprintType)
+struct METALANDROAD_API FMetaLandRoadDrawAnchor
+{
+	GENERATED_BODY()
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = LaneAnchor)
+	TWeakObjectPtr<UMetaLandRoadSplineComponent> SourceSpline;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = LaneAnchor)
+	int32 SectionIndex = INDEX_NONE;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = LaneAnchor)
+	int32 LaneIndex = METALANDROAD_LANE_INDEX_NONE;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = LaneAnchor)
+	double AnchorS = 0.0;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = LaneAnchor)
+	EMetaLandRoadMouthSide MouthSide = EMetaLandRoadMouthSide::End;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = LaneAnchor)
+	TArray<int32> BundledLaneIndices;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = LaneAnchor)
+	bool bFromSuccessor = true;
+
+	bool IsValid() const;
+};
+
+/** World Builder edit context — decoupled from UE actor selection. */
+USTRUCT(BlueprintType)
+struct METALANDROAD_API FMetaLandRoadEditTarget
+{
+	GENERATED_BODY()
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = LaneAnchor)
+	TWeakObjectPtr<AMoKuEditSplineActor> RoadActor;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = LaneAnchor)
+	TWeakObjectPtr<UMetaLandRoadSplineComponent> Spline;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = LaneAnchor)
+	FMetaLandRoadDrawAnchor PendingAnchor;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = LaneAnchor)
+	bool bHasPendingAnchor = false;
+};
+
+METALANDROAD_API bool MetaLandRoadBuildDrawAnchorFromLaneConnection(
+	const UMetaLandRoadLaneConnection& LaneConnection,
+	FMetaLandRoadDrawAnchor& OutAnchor);
+
+METALANDROAD_API void MetaLandRoadLogDrawAnchor(const TCHAR* Context, const FMetaLandRoadDrawAnchor& Anchor);
 
 /** Unified viewport edit mode for FMoKuEditSplinesComponentVisualizer (mutually exclusive). */
 UENUM(BlueprintType)
@@ -140,6 +229,97 @@ enum class EMetaLandRoadEditorVisMode : uint8
 	Connection,
 	/** Alt+T: per-lane boundary edit (no main center line). */
 	Lane,
+};
+
+/** Interactive draw tool: detected junction shape (MetaLandRoad editor mode only). */
+UENUM(BlueprintType)
+enum class EMetaLandRoadJunctionTopology : uint8
+{
+	Unknown,
+	T,
+	Cross,
+	MultiWay,
+};
+
+/**
+ * Which flank of a through-road CS participates in the junction cover.
+ * T-junction: Left OR Right from interaction / stub side (spline lane sense).
+ * Cross: Both.
+ */
+UENUM(BlueprintType)
+enum class EMetaLandRoadJunctionConnectSide : uint8
+{
+	Both UMETA(DisplayName = "Both"),
+	Left UMETA(DisplayName = "Left"),
+	Right UMETA(DisplayName = "Right"),
+};
+
+/** One road arm attached to a junction node inside the interactive editor mode session. */
+USTRUCT(BlueprintType)
+struct METALANDROAD_API FMetaLandRoadJunctionArmRef
+{
+	GENERATED_BODY()
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = Junction)
+	TWeakObjectPtr<UMetaLandRoadSplineComponent> Spline;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = Junction)
+	double IntersectDistanceS = 0.0;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = Junction)
+	double CutDistanceS = 0.0;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = Junction)
+	double DepartCutS = 0.0;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = Junction)
+	double ForwardIndent = 600.0;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = Junction)
+	bool bThroughArm = false;
+
+	/** T through-arm: only this half of Left→Center→Right CS is meshed. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = Junction)
+	EMetaLandRoadJunctionConnectSide ConnectSide = EMetaLandRoadJunctionConnectSide::Both;
+
+	/**
+	 * Lane indices on this arm that connect into the junction (from per-lane ConnectTo).
+	 * Empty = full road mouth. Non-empty proper subset = 2-lane extend opens only that width.
+	 */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = Junction)
+	TArray<int32> ConnectedLaneIndices;
+};
+
+/** Persisted junction node (UMetaLandRoadJunctionComponent on AMoKuEditIntersectionActor). */
+USTRUCT(BlueprintType)
+struct METALANDROAD_API FMetaLandRoadJunctionNode
+{
+	GENERATED_BODY()
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = Junction)
+	FGuid Id;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = Junction)
+	FVector AnchorWorld = FVector::ZeroVector;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = Junction)
+	TArray<FMetaLandRoadJunctionArmRef> Arms;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = Junction)
+	EMetaLandRoadJunctionTopology Topology = EMetaLandRoadJunctionTopology::Unknown;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = Junction)
+	double ForwardIndent = 600.0;
+
+	/**
+	 * Multiplier on auto CAD fillet indent (cut farther from intersect = larger hub).
+	 * Indent scale on corner clear. 1.15 default; cook clamps to [0.9, 1.5].
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Junction, meta = (ClampMin = "0.9", ClampMax = "1.5", UIMin = "0.9", UIMax = "1.5"))
+	float CutExpandScale = 1.15f;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = Junction)
+	int32 LayoutVersion = 0;
 };
 
 USTRUCT(BlueprintType, Blueprintable)
@@ -288,6 +468,19 @@ private:
 	int LaneIndex = METALANDROAD_LANE_INDEX_NONE;
 };
 
+/** Profile clone for branch road spawn (P1). Declared after FMetaLandRoadLane for UHT. */
+USTRUCT(BlueprintType)
+struct METALANDROAD_API FMetaLandRoadDrawSeed
+{
+	GENERATED_BODY()
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = LaneAnchor)
+	FMetaLandRoadDrawAnchor Anchor;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = LaneAnchor)
+	TArray<FMetaLandRoadLane> ProfileLanes;
+};
+
 USTRUCT(BlueprintType, Blueprintable)
 struct METALANDROAD_API FMetaLandRoadLaneSection
 {
@@ -420,6 +613,8 @@ public:
 	bool IsSuccessorConnection() const;
 	bool IsPredecessorConnection() const;
 	void Disconnect();
+	bool CanConnectTo(const UMetaLandRoadLaneConnection* OtherLaneConnection) const;
+	void ConnectTo(UMetaLandRoadLaneConnection* OtherLaneConnection);
 };
 
 /**
@@ -457,4 +652,5 @@ public:
 	bool IsConnectionValid() const;
 	bool IsConnected() const;
 	void DisconnectAll();
+	FTransform EvalTransform() const;
 };

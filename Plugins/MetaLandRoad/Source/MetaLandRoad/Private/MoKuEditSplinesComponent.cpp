@@ -1,6 +1,8 @@
 #include "MoKuEditSplinesComponent.h"
 #include "MoKuEditSplineActor.h"
 #include "MetaLandRoadSplineComponent.h"
+#include "MetaLandRoadProfile.h"
+#include "Misc/ScopeExit.h"
 
 namespace MoKuEditSplinesComponentPrivate
 {
@@ -81,13 +83,23 @@ void UMoKuEditSplinesComponent::PostLoad()
 void UMoKuEditSplinesComponent::PostEditUndo()
 {
 	Super::PostEditUndo();
+	if (UMetaLandRoadSplineComponent* RoadSpline = Cast<UMetaLandRoadSplineComponent>(this))
+	{
+		TGuardValue<bool> SuppressJunctionRecook(
+			AMoKuEditSplineActor::bSuppressJunctionRecookFromRoadRefresh, true);
+		MetaLandRoadProfile::RecookLocalJunctionsForSpline(RoadSpline);
+		MetaLandRoadProfile::RefreshConnectedRoadMeshes(RoadSpline);
+	}
 }
 #endif
 
 void UMoKuEditSplinesComponent::UpdateRoadLayout()
 {
 	Super::UpdateRoadLayout();
-	if (ParentActor && !bIsRefreshingRoadMesh)
+	// During junction Recook, SplitSection/Purge call this — must not Refresh→Recook again.
+	if (ParentActor
+		&& !bIsRefreshingRoadMesh
+		&& !AMoKuEditSplineActor::bSuppressJunctionRecookFromRoadRefresh)
 	{
 		ParentActor->RefreshDynamicRoadMesh();
 	}

@@ -315,13 +315,24 @@ struct FMetaLandRoadSectionHover
 		const FMetaLandRoadLaneSection& Section = Spline->GetLaneSection(SectionIndex);
 		const double S = Section.SOffset;
 		const float Z = Spline->LaneVisualizationHeightOffset;
-		const FMetaLandRoadLayout& Layout = Spline->GetRoadLayout();
+
+		FVector EdgeL;
+		FVector EdgeR;
+		FVector EdgeC;
+		if (Spline->GetRoadEdgePointsAtS(S, EdgeL, EdgeR, EdgeC, ESplineCoordinateSpace::World))
+		{
+			OutLeft = EdgeL + FVector(0, 0, Z);
+			OutRight = EdgeR + FVector(0, 0, Z);
+			OutCenter = EdgeC + FVector(0, 0, Z);
+			return;
+		}
 
 		OutCenter = Spline->EvalLanePosition(SectionIndex, LANE_INDEX_NONE, S, 0.0, ESplineCoordinateSpace::World)
 			+ FVector(0, 0, Z);
 		OutLeft = OutCenter;
 		OutRight = OutCenter;
 
+		const FMetaLandRoadLayout& Layout = Spline->GetRoadLayout();
 		const FVector RightVec = Spline->GetRightVectorAtDistanceAlongSpline(S, ESplineCoordinateSpace::World);
 		const float HalfW = static_cast<float>(MetaLandRoad::DefaultRoadLaneWidth * 2.0);
 
@@ -580,7 +591,7 @@ struct FMetaLandRoadSectionHover
 		return INDEX_NONE;
 	}
 
-	/** Live mouse → road plane → spline key. Preferred for Add Section (avoids stale LastPick / midpoint). */
+	/** Live mouse → closest approach to spline (avoids mid-height plane miss on long/curved roads). */
 	static float PickSplineKeyFromMouseRay(const UMetaLandRoadSplineComponent* Spline, FEditorViewportClient* ViewportClient)
 	{
 		if (!Spline || !ViewportClient || !ViewportClient->Viewport)
@@ -590,23 +601,43 @@ struct FMetaLandRoadSectionHover
 
 		const FViewportCursorLocation Cursor = ViewportClient->GetCursorWorldLocationFromMousePos();
 		const FVector Origin = Cursor.GetOrigin();
-		const FVector Dir = Cursor.GetDirection();
-
-		const float MidKey = FMath::Max(Spline->GetNumberOfSplinePoints() - 1, 1) * 0.5f;
-		FVector PlanePoint = Spline->GetLocationAtSplineInputKey(MidKey, ESplineCoordinateSpace::World);
-		PlanePoint.Z += Spline->LaneVisualizationHeightOffset;
-
-		FVector Hit = Origin + Dir * 5000.0f;
-		if (FMath::Abs(Dir.Z) > KINDA_SMALL_NUMBER)
+		FVector Dir = Cursor.GetDirection();
+		if (Dir.IsNearlyZero())
 		{
-			const double T = (PlanePoint.Z - Origin.Z) / Dir.Z;
-			if (T > 0.0)
+			return -1.0f;
+		}
+		Dir.Normalize();
+
+		const double SplineLength = Spline->GetSplineLength();
+		if (SplineLength <= KINDA_SMALL_NUMBER)
+		{
+			return -1.0f;
+		}
+
+		const float LiftZ = Spline->LaneVisualizationHeightOffset;
+		const int32 NumSteps = FMath::Clamp(FMath::CeilToInt(static_cast<float>(SplineLength / 150.0)), 24, 320);
+		double BestDistSq = TNumericLimits<double>::Max();
+		double BestS = 0.0;
+		for (int32 StepIdx = 0; StepIdx <= NumSteps; ++StepIdx)
+		{
+			const double S = SplineLength * (static_cast<double>(StepIdx) / NumSteps);
+			FVector Point = Spline->GetLocationAtDistanceAlongSpline(S, ESplineCoordinateSpace::World);
+			Point.Z += LiftZ;
+			const double T = FMath::Max(0.0, FVector::DotProduct(Point - Origin, Dir));
+			const FVector OnRay = Origin + Dir * static_cast<float>(T);
+			const double DistSq = FVector::DistSquared(OnRay, Point);
+			if (DistSq < BestDistSq)
 			{
-				Hit = Origin + Dir * static_cast<float>(T);
+				BestDistSq = DistSq;
+				BestS = S;
 			}
 		}
 
-		return Spline->FindInputKeyClosestToWorldLocation(Hit);
+		FVector RefineHit = Spline->GetLocationAtDistanceAlongSpline(BestS, ESplineCoordinateSpace::World);
+		RefineHit.Z += LiftZ;
+		const double RefineT = FMath::Max(0.0, FVector::DotProduct(RefineHit - Origin, Dir));
+		RefineHit = Origin + Dir * static_cast<float>(RefineT);
+		return Spline->FindInputKeyClosestToWorldLocation(RefineHit);
 	}
 
 	static void ClearHoverOverlay(UMetaLandRoadSplineComponent* Spline)
@@ -657,6 +688,9 @@ struct FMetaLandRoadSectionHover
 			return true;
 		}
 
+		const TSharedPtr<FMoKuEditSplinesComponentVisualizer> RoadVis =
+			FMetaLandRoadModule::Get().GetRoadComponentVisualizer();
+
 		UMetaLandRoadSplineComponent* Spline = FindTargetSpline();
 		if (!Spline || Spline->GetLaneSectionsNum() == 0)
 		{
@@ -665,11 +699,11 @@ struct FMetaLandRoadSectionHover
 		GetLastSpline() = Spline;
 
 		// Win the race against viewport LMB clearing ComponentVis selection.
-		if (GetPendingDragSection() > 0 && GMoKuEditSplinesComponentVisualizer.IsValid())
+		if (GetPendingDragSection() > 0 && RoadVis.IsValid())
 		{
 			const int32 Pending = GetPendingDragSection();
 			GetPendingDragSection() = INDEX_NONE;
-			GMoKuEditSplinesComponentVisualizer->SelectSectionBoundaryForDrag(Pending);
+			RoadVis->SelectSectionBoundaryForDrag(Pending);
 		}
 
 		FIntPoint MousePos;
@@ -741,7 +775,7 @@ struct FMetaLandRoadSectionHover
 			|| FSlateApplication::Get().GetModifierKeys().IsControlDown()
 			|| FSlateApplication::Get().GetModifierKeys().IsShiftDown();
 
-		if (bLMBPressed && !bMods && GMoKuEditSplinesComponentVisualizer.IsValid())
+		if (bLMBPressed && !bMods && RoadVis.IsValid())
 		{
 			const int32 DragSection = (BoundaryHovered != INDEX_NONE)
 				? BoundaryHovered
@@ -750,7 +784,7 @@ struct FMetaLandRoadSectionHover
 			{
 				GetPendingDragSection() = DragSection;
 				GetActiveDragSection() = DragSection;
-				GMoKuEditSplinesComponentVisualizer->SelectSectionBoundaryForDrag(DragSection);
+				RoadVis->SelectSectionBoundaryForDrag(DragSection);
 				Spline->Modify();
 				if (!GetDragTransactionOpen())
 				{
@@ -768,7 +802,7 @@ struct FMetaLandRoadSectionHover
 					Spline, *View, MousePos, ScreenSection, ScreenKey, 40.0f);
 				if (!bNearMain)
 				{
-					GMoKuEditSplinesComponentVisualizer->ClearSectionHighlight();
+					RoadVis->ClearSectionHighlight();
 					ClearHoverOverlay(Spline);
 					GetLastHoveredBoundarySection() = INDEX_NONE;
 					GetLastHoveredSection() = INDEX_NONE;
@@ -778,14 +812,14 @@ struct FMetaLandRoadSectionHover
 			}
 		}
 
-		if (bLMB && GetActiveDragSection() > 0 && GMoKuEditSplinesComponentVisualizer.IsValid())
+		if (bLMB && GetActiveDragSection() > 0 && RoadVis.IsValid())
 		{
 			const int32 DragSection = GetActiveDragSection();
 			const FVector WorldPoint = MouseToWorldOnRoadPlane(GCurrentLevelEditingViewportClient, Spline, DragSection);
-			if (GMoKuEditSplinesComponentVisualizer->ApplySectionBoundaryWorldDrag(DragSection, WorldPoint))
+			if (RoadVis->ApplySectionBoundaryWorldDrag(DragSection, WorldPoint))
 			{
 				if (UMetaLandRoadSectionComponentVisualizerSelectionState* Sel =
-					GMoKuEditSplinesComponentVisualizer->GetSelectionState())
+					RoadVis->GetSelectionState())
 				{
 					if (Sel->IsSectionBoundarySelected())
 					{

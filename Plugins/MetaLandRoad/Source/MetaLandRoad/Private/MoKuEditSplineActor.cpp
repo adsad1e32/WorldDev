@@ -15,6 +15,11 @@
 #include "DynamicMesh/DynamicMesh3.h"
 #include "DynamicMesh/MeshNormals.h"
 #include "EditSplineRoadInfo.h"
+#include "MoKuEditIntersectionActor.h"
+#include "Editor.h"
+#include "EngineUtils.h"
+#include "ScopedTransaction.h"
+#include "Misc/ScopeExit.h"
 #include "Components/SceneCaptureComponent2D.h"
 #include "Components/SceneComponent.h"
 #include "Kismet/KismetRenderingLibrary.h"
@@ -23,6 +28,8 @@
 using namespace UE::Geometry;
 #include UE_INLINE_GENERATED_CPP_BY_NAME(MoKuEditSplineActor)
 #define LOCTEXT_NAMESPACE "MoKuEditSplineActor"
+
+bool AMoKuEditSplineActor::bSuppressJunctionRecookFromRoadRefresh = false;
 
 AMoKuEditSplineActor::AMoKuEditSplineActor(const FObjectInitializer& ObjectInitializer)
 	:Super(ObjectInitializer)
@@ -713,89 +720,134 @@ FDynamicMesh3* AMoKuEditSplineActor::GenerateRoadFromLaneLayoutAsDynamicMesh(
 	const FMetaLandRoadLayout& RoadLayout = RoadSplineComponent->GetRoadLayout();
 	SideCurvePaths.Empty();
 
-	auto AppendSideCurvePoints = [RoadHeightOffset](
-		TArray<FVector>& OutCurvePath,
-		const TArray<FMetaLandRoadSplinePositionLinearApproximation>& Points)
+	double MeshSMin = 0.0;
+	double MeshSMax = RoadSplineComponent->GetSplineLength();
+	TArray<TPair<double, double>> MeshSpans;
+	GetJunctionMeshGenerationSpans(MeshSpans);
+	if (MeshSpans.Num() == 0)
 	{
-		const int32 StartIndex = OutCurvePath.IsEmpty() ? 0 : 1;
-		for (int32 PointIndex = StartIndex; PointIndex < Points.Num(); ++PointIndex)
+		return nullptr;
+	}
+	MeshSMin = MeshSpans[0].Key;
+	MeshSMax = MeshSpans.Last().Value;
+
+	auto AppendSideEdgePoint = [RoadHeightOffset](TArray<FVector>& OutPath, const FVector& WorldPoint)
+	{
+		FVector P = WorldPoint;
+		P.Z += RoadHeightOffset;
+		if (OutPath.IsEmpty() || FVector::DistSquared2D(OutPath.Last(), P) > 1.0)
 		{
-			FVector WorldPoint = Points[PointIndex].Position;
-			WorldPoint.Z += RoadHeightOffset;
-			OutCurvePath.Add(WorldPoint);
+			OutPath.Add(P);
 		}
 	};
 
-	for (int32 SectionIndex = 0; SectionIndex < RoadSplineComponent->GetLaneSectionsNum(); ++SectionIndex)
+	// Side curves (副线): sample road outer edges — matches mesh, stable across section splits.
+	for (const TPair<double, double>& Span : MeshSpans)
 	{
-		const FMetaLandRoadLaneSection& Section = RoadSplineComponent->GetLaneSection(SectionIndex);
-		const double S0 = Section.SOffset;
-		const double S1 = Section.SOffsetEnd_Cached;
+		const double S0 = Span.Key;
+		const double S1 = Span.Value;
 		if ((S1 - S0) < KINDA_SMALL_NUMBER)
 		{
 			continue;
 		}
 
-		const int32 LeftSectionIndex = RoadLayout.FindSideSection(SectionIndex, EMetaLandRoadLaneSectionSide::Left);
-		const int32 RightSectionIndex = RoadLayout.FindSideSection(SectionIndex, EMetaLandRoadLaneSectionSide::Right);
-		if (LeftSectionIndex != INDEX_NONE)
+		const double SpanLen = S1 - S0;
+		const int32 Steps = FMath::Max(
+			2,
+			FMath::CeilToInt(SpanLen / FMath::Max(MetaLandRoad::DefaultReparamStepsPerSegment, 50.0)));
+		for (int32 StepIdx = 0; StepIdx <= Steps; ++StepIdx)
 		{
-			const FMetaLandRoadLaneSection& LeftSection = RoadLayout.Sections[LeftSectionIndex];
-			if (LeftSection.Left.Num() > 0)
+			const double S = FMath::Lerp(S0, S1, StepIdx / static_cast<double>(Steps));
+			FVector LeftWorld;
+			FVector RightWorld;
+			FVector CenterWorld;
+			if (!RoadSplineComponent->GetRoadEdgePointsAtS(
+				S, LeftWorld, RightWorld, CenterWorld, ESplineCoordinateSpace::World))
 			{
-				TArray<FMetaLandRoadSplinePositionLinearApproximation> LeftPoints;
-				RoadSplineComponent->BuildLinearApproximation(
-					LeftPoints,
-					[&LeftSection, RoadSplineComponent](double S)
-					{
-						return LeftSection.EvalLaneROffset(-LeftSection.Left.Num(), S, 1.0) + RoadSplineComponent->EvalROffset(S);
-					},
-					S0,
-					S1,
-					MetaLandRoad::DefaultReparamStepsPerSegment,
-					MetaLandRoad::DefaultMinNumStepsPerSection,
-					ESplineCoordinateSpace::World);
-				AppendSideCurvePoints(SideCurvePaths.LeftCurvePath, LeftPoints);
+				continue;
 			}
-		}
-
-		if (RightSectionIndex != INDEX_NONE)
-		{
-			const FMetaLandRoadLaneSection& RightSection = RoadLayout.Sections[RightSectionIndex];
-			if (RightSection.Right.Num() > 0)
-			{
-				TArray<FMetaLandRoadSplinePositionLinearApproximation> RightPoints;
-				RoadSplineComponent->BuildLinearApproximation(
-					RightPoints,
-					[&RightSection, RoadSplineComponent](double S)
-					{
-						return RightSection.EvalLaneROffset(RightSection.Right.Num(), S, 1.0) + RoadSplineComponent->EvalROffset(S);
-					},
-					S0,
-					S1,
-					MetaLandRoad::DefaultReparamStepsPerSegment,
-					MetaLandRoad::DefaultMinNumStepsPerSection,
-					ESplineCoordinateSpace::World);
-				AppendSideCurvePoints(SideCurvePaths.RightCurvePath, RightPoints);
-			}
+			AppendSideEdgePoint(SideCurvePaths.LeftCurvePath, LeftWorld);
+			AppendSideEdgePoint(SideCurvePaths.RightCurvePath, RightWorld);
 		}
 	}
 
 	if (SideCurvePaths.RightCurvePath.Num() > 1 && SideCurvePaths.LeftCurvePath.Num() > 1)
 	{
-		JunctionConnections["Start"].ConnectEdge.Add(SideCurvePaths.RightCurvePath[0]);
-		JunctionConnections["Start"].ConnectEdge.Add(SideCurvePaths.LeftCurvePath[0]);
-		const FVector StartDir = RoadSplineComponent->GetTangentAtSplinePoint(0, ESplineCoordinateSpace::World).GetSafeNormal();
-		JunctionConnections["Start"].ConnectDirection.Add(-StartDir);
-		JunctionConnections["Start"].ConnectDirection.Add(-StartDir);
+		JunctionConnections.FindOrAdd(TEXT("Start")).Empty();
+		JunctionConnections.FindOrAdd(TEXT("End")).Empty();
 
-		JunctionConnections["End"].ConnectEdge.Add(SideCurvePaths.RightCurvePath.Last());
-		JunctionConnections["End"].ConnectEdge.Add(SideCurvePaths.LeftCurvePath.Last());
+		const double SplineLength = RoadSplineComponent->GetSplineLength();
+		auto AddJunctionConnectionAtS = [this, RoadSplineComponent, SplineLength](double ConnectionS)
+		{
+			if (ConnectionS <= KINDA_SMALL_NUMBER || ConnectionS >= SplineLength - KINDA_SMALL_NUMBER)
+			{
+				return;
+			}
 
-		const int32 SplineCount = RoadSplineComponent->GetNumberOfSplinePoints();
-		const FVector EndDir = RoadSplineComponent->GetTangentAtSplinePoint(SplineCount - 1, ESplineCoordinateSpace::World).GetSafeNormal();
-		JunctionConnections["End"].ConnectDirection.Add(EndDir);
-		JunctionConnections["End"].ConnectDirection.Add(EndDir);
+			FVector LeftWorld;
+			FVector RightWorld;
+			FVector CenterWorld;
+			if (!RoadSplineComponent->GetRoadEdgePointsAtS(
+				ConnectionS,
+				LeftWorld,
+				RightWorld,
+				CenterWorld,
+				ESplineCoordinateSpace::World))
+			{
+				return;
+			}
+
+			const bool bNearStart = ConnectionS <= SplineLength * 0.5;
+			const FString ConnectionKey = bNearStart ? TEXT("Start") : TEXT("End");
+			FConnectionInfo& Connection = JunctionConnections.FindOrAdd(ConnectionKey);
+			if (Connection.ConnectEdge.Num() > 0)
+			{
+				return;
+			}
+
+			Connection.ConnectEdge.Add(RightWorld);
+			Connection.ConnectEdge.Add(LeftWorld);
+			const FVector Tangent = RoadSplineComponent->GetTangentAtDistanceAlongSpline(
+				ConnectionS,
+				ESplineCoordinateSpace::World).GetSafeNormal();
+			const FVector Direction = bNearStart ? -Tangent : Tangent;
+			Connection.ConnectDirection.Add(Direction);
+			Connection.ConnectDirection.Add(Direction);
+		};
+
+		if (JunctionTrimZones.Num() > 0)
+		{
+			for (const FMetaLandRoadJunctionTrimZone& TrimZone : JunctionTrimZones)
+			{
+				if (TrimZone.ApproachCutS >= 0.0)
+				{
+					AddJunctionConnectionAtS(TrimZone.ApproachCutS);
+				}
+				if (TrimZone.DepartCutS >= 0.0)
+				{
+					AddJunctionConnectionAtS(TrimZone.DepartCutS);
+				}
+			}
+		}
+		else
+		{
+			JunctionConnections["Start"].ConnectEdge.Add(SideCurvePaths.RightCurvePath[0]);
+			JunctionConnections["Start"].ConnectEdge.Add(SideCurvePaths.LeftCurvePath[0]);
+			const FVector StartDir = RoadSplineComponent->GetTangentAtDistanceAlongSpline(
+				MeshSMin,
+				ESplineCoordinateSpace::World).GetSafeNormal();
+			JunctionConnections["Start"].ConnectDirection.Add(-StartDir);
+			JunctionConnections["Start"].ConnectDirection.Add(-StartDir);
+
+			JunctionConnections["End"].ConnectEdge.Add(SideCurvePaths.RightCurvePath.Last());
+			JunctionConnections["End"].ConnectEdge.Add(SideCurvePaths.LeftCurvePath.Last());
+
+			const FVector EndDir = RoadSplineComponent->GetTangentAtDistanceAlongSpline(
+				MeshSMax,
+				ESplineCoordinateSpace::World).GetSafeNormal();
+			JunctionConnections["End"].ConnectDirection.Add(EndDir);
+			JunctionConnections["End"].ConnectDirection.Add(EndDir);
+		}
 	}
 
 	if (!RoadSplineComponent->GenerateCombinedLaneDynamicMesh(
@@ -813,6 +865,24 @@ FDynamicMesh3* AMoKuEditSplineActor::GenerateRoadFromLaneLayoutAsDynamicMesh(
 	}
 	FinalizeRoadMeshNormalsAndOverlays(*Mesh);
 	return Mesh.Release();
+}
+
+FVector2f AMoKuEditSplineActor::MakeAsphaltUVAtDistance(
+	const UMetaLandRoadSplineComponent* Spline,
+	double DistanceS,
+	const FVector& WorldPos)
+{
+	if (!Spline)
+	{
+		return FVector2f::ZeroVector;
+	}
+
+	const float UvTileCm = FMath::Max(MetaLandRoad::DefaultAsphaltUvTileCm, 1.0f);
+	const FVector LocalPos = Spline->GetComponentTransform().InverseTransformPosition(WorldPos);
+	const FVector Center = Spline->GetLocationAtDistanceAlongSpline(DistanceS, ESplineCoordinateSpace::Local);
+	const FVector Right = Spline->GetRightVectorAtDistanceAlongSpline(DistanceS, ESplineCoordinateSpace::Local);
+	const float LateralCm = static_cast<float>(FVector::DotProduct(LocalPos - Center, Right));
+	return FVector2f(LateralCm / UvTileCm, static_cast<float>(DistanceS) / UvTileCm);
 }
 
 void AMoKuEditSplineActor::EnsureRoadLayoutInitialized()
@@ -834,6 +904,122 @@ void AMoKuEditSplineActor::EnsureRoadLayoutInitialized()
 //}
 
 
+void AMoKuEditSplineActor::GetJunctionMeshGenerationSpans(TArray<TPair<double, double>>& OutSpans) const
+{
+	OutSpans.Reset();
+	const double Length = SplineComponent ? SplineComponent->GetSplineLength() : 0.0;
+	if (Length <= KINDA_SMALL_NUMBER)
+	{
+		return;
+	}
+
+	if (JunctionTrimZones.Num() > 0)
+	{
+		TArray<TPair<double, double>> Gaps;
+		Gaps.Reserve(JunctionTrimZones.Num());
+		for (const FMetaLandRoadJunctionTrimZone& Zone : JunctionTrimZones)
+		{
+			const double Approach = Zone.ApproachCutS;
+			const double Depart = Zone.DepartCutS;
+			// Always full S-gap for through/stub cuts. T half-CS is cover-only
+			// (ConnectSide); do not skip gaps or roads stay continuous under cover.
+			if (Approach >= 0.0 && Depart >= 0.0 && Approach < Depart)
+			{
+				Gaps.Emplace(
+					FMath::Clamp(Approach, 0.0, Length),
+					FMath::Clamp(Depart, 0.0, Length));
+			}
+			else if (Approach >= 0.0 && Depart < 0.0)
+			{
+				Gaps.Emplace(FMath::Clamp(Approach, 0.0, Length), Length);
+			}
+			else if (Approach < 0.0 && Depart >= 0.0)
+			{
+				Gaps.Emplace(0.0, FMath::Clamp(Depart, 0.0, Length));
+			}
+		}
+
+		Gaps.Sort([](const TPair<double, double>& A, const TPair<double, double>& B)
+		{
+			return A.Key < B.Key;
+		});
+
+		TArray<TPair<double, double>> MergedGaps;
+		for (const TPair<double, double>& Gap : Gaps)
+		{
+			if (MergedGaps.Num() == 0 || Gap.Key > MergedGaps.Last().Value + KINDA_SMALL_NUMBER)
+			{
+				MergedGaps.Add(Gap);
+			}
+			else
+			{
+				MergedGaps.Last().Value = FMath::Max(MergedGaps.Last().Value, Gap.Value);
+			}
+		}
+
+		// Tip S == CutS (Aug2). TipWeld into hub made asphalt tip ≠ cover mouth → weld gap/fan.
+		double Cursor = 0.0;
+		for (const TPair<double, double>& Gap : MergedGaps)
+		{
+			if (Gap.Key > Cursor + KINDA_SMALL_NUMBER)
+			{
+				OutSpans.Emplace(Cursor, Gap.Key);
+			}
+			Cursor = FMath::Max(Cursor, Gap.Value);
+		}
+		if (Cursor < Length - KINDA_SMALL_NUMBER)
+		{
+			OutSpans.Emplace(Cursor, Length);
+		}
+		return;
+	}
+
+	const bool bHasEndTrim = EndOfJunction.IsValid() && EndJunctionMeshTrimS >= 0.0;
+	const bool bHasStartTrim = StartOfJunction.IsValid() && StartJunctionMeshTrimS >= 0.0;
+	const bool bSameJunctionGap = bHasEndTrim && bHasStartTrim
+		&& StartOfJunction.Get() == EndOfJunction.Get()
+		&& EndJunctionMeshTrimS < StartJunctionMeshTrimS;
+
+	if (bSameJunctionGap)
+	{
+		OutSpans.Emplace(0.0, FMath::Clamp(EndJunctionMeshTrimS, 0.0, Length));
+		OutSpans.Emplace(FMath::Clamp(StartJunctionMeshTrimS, 0.0, Length), Length);
+	}
+	else
+	{
+		double SMin = 0.0;
+		double SMax = Length;
+		if (bHasStartTrim)
+		{
+			SMin = FMath::Clamp(StartJunctionMeshTrimS, 0.0, Length);
+		}
+		if (bHasEndTrim)
+		{
+			SMax = FMath::Clamp(EndJunctionMeshTrimS, SMin, Length);
+		}
+		if ((SMax - SMin) > KINDA_SMALL_NUMBER)
+		{
+			OutSpans.Emplace(SMin, SMax);
+		}
+	}
+}
+
+void AMoKuEditSplineActor::GetJunctionMeshGenerationRange(double& OutSMin, double& OutSMax) const
+{
+	OutSMin = 0.0;
+	OutSMax = SplineComponent ? SplineComponent->GetSplineLength() : 0.0;
+
+	TArray<TPair<double, double>> Spans;
+	GetJunctionMeshGenerationSpans(Spans);
+	if (Spans.Num() == 0)
+	{
+		return;
+	}
+
+	OutSMin = Spans[0].Key;
+	OutSMax = Spans.Last().Value;
+}
+
 void AMoKuEditSplineActor::PostActorCreated()
 {
 	Super::PostActorCreated();
@@ -854,6 +1040,45 @@ void AMoKuEditSplineActor::RefreshDynamicRoadMesh()
 	}
 
 	EnsureRoadLayoutInitialized();
+
+	// Never Recook from mesh refresh during package load / missing world (RegisterComponent crash).
+	const bool bCanRecookLinkedJunctions =
+		!AMoKuEditSplineActor::bSuppressJunctionRecookFromRoadRefresh
+		&& JunctionTrimZones.Num() > 0
+		&& GEditor
+		&& GetWorld()
+		&& !GIsEditorLoadingPackage;
+	if (bCanRecookLinkedJunctions)
+	{
+		TSet<AMoKuEditIntersectionActor*> LinkedJunctions;
+		for (const FMetaLandRoadJunctionTrimZone& TrimZone : JunctionTrimZones)
+		{
+			if (AMoKuEditIntersectionActor* Junction = TrimZone.Junction.Get())
+			{
+				LinkedJunctions.Add(Junction);
+			}
+		}
+
+		if (LinkedJunctions.Num() > 0)
+		{
+			if (UMetaLandRoadEditorMode* RoadMode =
+				MoKuSplineEditorUtils::GetCurrentEditMode<UMetaLandRoadEditorMode>(
+					UMetaLandRoadEditorMode::EM_MetaLandRoadEditorModeId))
+			{
+				for (AMoKuEditIntersectionActor* Junction : LinkedJunctions)
+				{
+					RoadMode->RecookJunctionActor(Junction, true);
+				}
+			}
+			else
+			{
+				for (AMoKuEditIntersectionActor* Junction : LinkedJunctions)
+				{
+					UMetaLandRoadEditorMode::RecookJunctionActorStatic(Junction, true);
+				}
+			}
+		}
+	}
 
 	if (DynamicMeshComponent)
 	{
@@ -901,6 +1126,126 @@ void AMoKuEditSplineActor::RefreshDynamicRoadMesh()
 
 	SplineComponent->RefreshLaneVisualization();
 	SplineComponent->bIsRefreshingRoadMesh = false;
+}
+
+void AMoKuEditSplineActor::DebugRecookLinkedJunctions()
+{
+#if WITH_EDITOR
+	TSet<AMoKuEditIntersectionActor*> Junctions;
+	if (AMoKuEditIntersectionActor* StartJ = StartOfJunction.Get())
+	{
+		Junctions.Add(StartJ);
+	}
+	if (AMoKuEditIntersectionActor* EndJ = EndOfJunction.Get())
+	{
+		Junctions.Add(EndJ);
+	}
+	for (const FMetaLandRoadJunctionTrimZone& Zone : JunctionTrimZones)
+	{
+		if (AMoKuEditIntersectionActor* J = Zone.Junction.Get())
+		{
+			Junctions.Add(J);
+		}
+	}
+
+	// TrimZones/Start/End often stale after bad cooks — also scan world by arm spline.
+	if (UWorld* World = GetWorld())
+	{
+		UMetaLandRoadSplineComponent* SelfSpline = GetSplineComponent();
+		for (TActorIterator<AMoKuEditIntersectionActor> It(World); It; ++It)
+		{
+			AMoKuEditIntersectionActor* Junction = *It;
+			if (!Junction || !Junction->JunctionData)
+			{
+				continue;
+			}
+			for (const FMetaLandRoadJunctionArmRef& Arm : Junction->JunctionData->JunctionNode.Arms)
+			{
+				if (Arm.Spline.Get() == SelfSpline)
+				{
+					Junctions.Add(Junction);
+					break;
+				}
+			}
+		}
+	}
+
+	if (Junctions.Num() == 0)
+	{
+		UE_LOG(
+			LogTemp,
+			Warning,
+			TEXT("[DebugRecook] %s has no linked junctions (TrimZones=%d Start=%d End=%d) — only refreshing self mesh"),
+			*GetName(),
+			JunctionTrimZones.Num(),
+			StartOfJunction.IsValid() ? 1 : 0,
+			EndOfJunction.IsValid() ? 1 : 0);
+		RefreshDynamicRoadMesh();
+		if (GEditor)
+		{
+			GEditor->RedrawLevelEditingViewports(true);
+		}
+		return;
+	}
+
+	const FScopedTransaction Transaction(LOCTEXT("DebugRecookLinkedJunctions", "Debug Recook Linked Junctions"));
+	Modify();
+
+	UE_LOG(LogTemp, Log, TEXT("[DebugRecook] road=%s junctions=%d (mode-independent Static recook)"),
+		*GetName(), Junctions.Num());
+
+	for (AMoKuEditIntersectionActor* Junction : Junctions)
+	{
+		if (!Junction)
+		{
+			continue;
+		}
+		UE_LOG(LogTemp, Log, TEXT("[DebugRecook] road=%s → junction=%s BEGIN"), *GetName(), *Junction->GetName());
+		// Always full pipeline — do not require MetaLandRoad Editor Mode active.
+		UMetaLandRoadEditorMode::RecookJunctionActorStatic(Junction, true);
+		const int32 TriCount = Junction->DynamicMeshComponent && Junction->DynamicMeshComponent->GetDynamicMesh()
+			? Junction->DynamicMeshComponent->GetDynamicMesh()->GetTriangleCount()
+			: 0;
+		if (TriCount > 0)
+		{
+			UE_LOG(LogTemp, Log, TEXT("[DebugRecook] road=%s → junction=%s END tris=%d"),
+				*GetName(), *Junction->GetName(), TriCount);
+		}
+		else
+		{
+			UE_LOG(LogTemp, Error, TEXT("[DebugRecook] road=%s → junction=%s END tris=0 (cook failed)"),
+				*GetName(), *Junction->GetName());
+		}
+	}
+
+	// Ensure this road mesh matches latest trim zones written by LinkRoadActor.
+	RefreshDynamicRoadMesh();
+
+	if (GEditor)
+	{
+		GEditor->RedrawLevelEditingViewports(true);
+	}
+#endif
+}
+
+void AMoKuEditSplineActor::DebugFullWorldJunctionRecook()
+{
+#if WITH_EDITOR
+	if (UMetaLandRoadEditorMode* RoadMode =
+		MoKuSplineEditorUtils::GetCurrentEditMode<UMetaLandRoadEditorMode>(
+			UMetaLandRoadEditorMode::EM_MetaLandRoadEditorModeId))
+	{
+		RoadMode->ProcessInteractiveFinishedRoadDraw(this, true);
+	}
+	else if (GEngine)
+	{
+		GEngine->AddOnScreenDebugMessage(
+			-1,
+			5.0f,
+			FColor::Red,
+			TEXT("Full world junction recook: MetaLandRoad EditorMode not active"));
+	}
+#endif
 }
 
 //void AMoKuEditSplineActor::UpdateSceneManagementData()
@@ -1079,6 +1424,13 @@ void AMoKuEditSplineActor::PostEditUndo()
 {
 	Super::PostEditUndo();
 
+	if (UMoKuEditSplinesComponent* RoadSpline = GetSplineComponent())
+	{
+		TGuardValue<bool> SuppressJunctionRecook(
+			AMoKuEditSplineActor::bSuppressJunctionRecookFromRoadRefresh, true);
+		MetaLandRoadProfile::RecookLocalJunctionsForSpline(RoadSpline);
+		MetaLandRoadProfile::RefreshConnectedRoadMeshes(RoadSpline);
+	}
 }
 
 void AMoKuEditSplineActor::RemoveAllExtraMesh()

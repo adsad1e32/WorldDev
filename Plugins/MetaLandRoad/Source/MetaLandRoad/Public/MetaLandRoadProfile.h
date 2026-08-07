@@ -49,4 +49,59 @@ namespace MetaLandRoadProfile
 
 	/** Refresh layout bounds after spline edits. */
 	METALANDROAD_API void SyncRoadLayout(UMetaLandRoadSplineComponent* TargetSpline);
+
+	/** Seed new branch spline lanes/widths from a World Builder draw anchor. */
+	METALANDROAD_API void ApplyRoadProfileFromDrawAnchor(
+		UMetaLandRoadSplineComponent* TargetSpline,
+		const UMetaLandRoadSplineComponent* SourceSpline,
+		const FMetaLandRoadDrawAnchor& Anchor);
+
+	/**
+	 * Ensure TargetSpline lane counts match the anchor bundle (N parallel lanes).
+	 * Mutates existing sections in place so start-mouth RoadConnections survive EndConnection.
+	 * Falls back to ApplyRoadProfileFromDrawAnchor when the target has no sections.
+	 */
+	METALANDROAD_API void EnsureLaneCountFromDrawAnchor(
+		UMetaLandRoadSplineComponent* TargetSpline,
+		const UMetaLandRoadSplineComponent* SourceSpline,
+		const FMetaLandRoadDrawAnchor& Anchor);
+
+	/** Sorted bundle lane indices + mouth widths (from BuildProfileFromDrawAnchor). */
+	METALANDROAD_API bool GetDrawAnchorBundleLaneWidths(
+		const UMetaLandRoadSplineComponent* SourceSpline,
+		const FMetaLandRoadDrawAnchor& Anchor,
+		TArray<int32>& OutLaneIndices,
+		TArray<float>& OutWidths);
+
+	/** Section that owns lane arrays for Add/Delete (prefers Both — Side markers get wiped by UpdateLayout). */
+	METALANDROAD_API int32 ResolveLaneMutationSectionIndex(
+		const UMetaLandRoadSplineComponent* TargetSpline,
+		int32 SpanSectionIndex,
+		int32 LaneIndex,
+		bool bOnLeft);
+
+	/** Keep the opposite road edge fixed when inserting an outermost lane. */
+	METALANDROAD_API void ShiftROffsetForOuterLaneAdd(
+		UMetaLandRoadSplineComponent* TargetSpline,
+		bool bAddedOnLeft,
+		double LaneWidthCm);
+
+	/** After layout undo/edit, refresh this spline and any connected parent/child road mesh. */
+	METALANDROAD_API void RefreshConnectedRoadMeshes(UMetaLandRoadSplineComponent* TargetSpline);
+
+	/** Re-cut + rebuild cover for junction hubs linked to this road only (not full-world scan). */
+	METALANDROAD_API void RecookLocalJunctionsForSpline(UMetaLandRoadSplineComponent* TargetSpline);
+
+	/** Add lane on left/right; promotes Left/Right-only sections to Both and syncs all longitudinal sections. */
+	struct FMetaLandRoadAddLaneResult
+	{
+		bool bSuccess = false;
+		int32 NewSelectedLaneIndex = LANE_INDEX_NONE;
+	};
+
+	METALANDROAD_API FMetaLandRoadAddLaneResult AddLaneToRoadLayout(
+		UMetaLandRoadSplineComponent* TargetSpline,
+		int32 SpanSectionIndex,
+		int32 LaneIndex,
+		bool bOnLeft);
 }

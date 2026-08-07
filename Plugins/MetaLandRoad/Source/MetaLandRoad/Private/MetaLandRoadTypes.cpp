@@ -1,5 +1,6 @@
 #include "MetaLandRoadTypes.h"
 #include "MetaLandRoadSplineComponent.h"
+#include "MetaLandRoadLaneEditPick.h"
 
 bool MetaLandRoad::HasLeftSide(EMetaLandRoadLaneSectionSide Side)
 {
@@ -258,6 +259,19 @@ void MetaLandRoad::TrimCurveInRang(FRichCurve& Curve, double Time0, double Time1
 	Curve.AutoSetTangents();
 }
 
+void MetaLandRoad::EnsureLaneWidthCurveCubic(FRichCurve& Width)
+{
+	for (FRichCurveKey& Key : Width.Keys)
+	{
+		Key.InterpMode = ERichCurveInterpMode::RCIM_Cubic;
+		Key.TangentMode = ERichCurveTangentMode::RCTM_Auto;
+	}
+	if (Width.GetNumKeys() > 0)
+	{
+		Width.AutoSetTangents();
+	}
+}
+
 static bool IsCurveZero(const FRichCurve& Curve, float ErrorTolerance = 2.0f)
 {
 	if (Curve.GetNumKeys() == 0)
@@ -456,7 +470,8 @@ double FMetaLandRoadLaneSection::EvalLaneROffset(int LaneIndex, double InSOffset
 	for (int32 i = 0; i < AbsLaneIndex; ++i)
 	{
 		PreBorderOffset = BorderOffset;
-		BorderOffset += (*LanesInfo)[i].Width.Eval(static_cast<float>(InSOffset - SOffset));
+		BorderOffset += (*LanesInfo)[i].Width.Eval(
+			static_cast<float>(InSOffset - (*LanesInfo)[i].GetStartOffset()));
 	}
 
 	return FMath::Lerp(PreBorderOffset, BorderOffset, Alpha) * (LaneIndex >= 0 ? 1.0 : -1.0);
@@ -647,7 +662,9 @@ void FMetaLandRoadLayout::UpdateBounds(double SplineLength)
 		Sections.Last().SOffsetEnd_Cached = SplineLength;
 	}
 
-	static constexpr double MinSectionLength = 100.0;
+	// Keep cuts/split markers near junction mouths. 100cm clamp parked orange
+	// section lines far inside the road while rails/mesh tip sit at CutS.
+	static constexpr double MinSectionLength = 10.0;
 	const double MaxInteriorS = FMath::Max(MinSectionLength, SplineLength - MinSectionLength);
 	for (int32 SectionIndex = 1; SectionIndex < Sections.Num(); ++SectionIndex)
 	{
@@ -730,6 +747,10 @@ void FMetaLandRoadLayout::UpdateBounds(double SplineLength)
 		{
 			ResetToConstant(FallbackWidth);
 		}
+		else
+		{
+			MetaLandRoad::EnsureLaneWidthCurveCubic(Lane.Width);
+		}
 	};
 
 	for (FMetaLandRoadLaneSection& Section : Sections)
@@ -756,19 +777,39 @@ void FMetaLandRoadLayout::TrimSections(double SplineLength, double Tolerance, UM
 	do
 	{
 		bWasRemoved = false;
-		for (auto It = Sections.CreateIterator(); It; ++It)
+		for (int32 SectionIndex = 0; SectionIndex < Sections.Num();)
 		{
-			if ((It->SOffset >= SplineLength) || ((It->SOffsetEnd_Cached - It->SOffset) <= Tolerance))
+			const FMetaLandRoadLaneSection& Section = Sections[SectionIndex];
+			// Array-neighbor End_Cached is 0 for co-located Left|Right at the same S
+			// (dual-lane face split). Use face-aware length so we do not delete a valid side.
+			double FaceLen = Section.SOffsetEnd_Cached - Section.SOffset;
+			if (OwnedRoadSpline)
 			{
-				const auto NextIt = (It + 1);
-				if (NextIt && (NextIt->SOffsetEnd_Cached - It->SOffset) <= Tolerance)
-				{
-					++It;
-				}
-				It.RemoveCurrent();
+				FaceLen = MetaLandRoad::ResolveSectionEndS(OwnedRoadSpline, SectionIndex) - Section.SOffset;
+			}
+
+			const bool bPastEnd = Section.SOffset >= SplineLength;
+			const bool bZeroSpan = FaceLen <= Tolerance;
+			bool bCoLocatedOppositeFace = false;
+			if (bZeroSpan
+				&& SectionIndex + 1 < Sections.Num()
+				&& FMath::Abs(Sections[SectionIndex + 1].SOffset - Section.SOffset) <= Tolerance
+				&& Section.Side != EMetaLandRoadLaneSectionSide::Both
+				&& Sections[SectionIndex + 1].Side != EMetaLandRoadLaneSectionSide::Both
+				&& Section.Side != Sections[SectionIndex + 1].Side)
+			{
+				// Left@S + Right@S markers — keep both for dual-lane face tracks.
+				bCoLocatedOppositeFace = true;
+			}
+
+			if (bPastEnd || (bZeroSpan && !bCoLocatedOppositeFace))
+			{
+				Sections.RemoveAt(SectionIndex);
 				bWasRemoved = true;
 				UpdateBounds(SplineLength);
+				continue;
 			}
+			++SectionIndex;
 		}
 	} while (bWasRemoved);
 
@@ -795,32 +836,74 @@ int FMetaLandRoadLayout::FindSideSection(int SectionIndex, EMetaLandRoadLaneSect
 	{
 		return INDEX_NONE;
 	}
+	if (!Sections.IsValidIndex(SectionIndex))
+	{
+		SectionIndex = Sections.Num() - 1;
+	}
 
 	for (; SectionIndex >= 0; --SectionIndex)
 	{
-		if (Sections[SectionIndex].Side == Side || Sections[SectionIndex].Side == EMetaLandRoadLaneSectionSide::Both)
+		const FMetaLandRoadLaneSection& Candidate = Sections[SectionIndex];
+		if (Candidate.Side != Side && Candidate.Side != EMetaLandRoadLaneSectionSide::Both)
 		{
-			break;
+			continue;
+		}
+		// Must own lanes on the requested face. Old fallback to section 0 returned the
+		// opposite face and poisoned junction EdgeL/EdgeR (section Left/Right mix-up).
+		if (Side == EMetaLandRoadLaneSectionSide::Left)
+		{
+			if (MetaLandRoad::HasLeftSide(Candidate.Side) && !Candidate.Left.IsEmpty())
+			{
+				return SectionIndex;
+			}
+			continue;
+		}
+		if (Side == EMetaLandRoadLaneSectionSide::Right)
+		{
+			if (MetaLandRoad::HasRightSide(Candidate.Side) && !Candidate.Right.IsEmpty())
+			{
+				return SectionIndex;
+			}
+			continue;
+		}
+		// Both: any non-empty face on a Both/matching section.
+		if (!Candidate.Left.IsEmpty() || !Candidate.Right.IsEmpty())
+		{
+			return SectionIndex;
 		}
 	}
-	if (SectionIndex < 0)
-	{
-		SectionIndex = 0;
-	}
-	return SectionIndex;
+	return INDEX_NONE;
 }
 
 TPair<FMetaLandRoadLaneSection&, FMetaLandRoadLaneSection&> FMetaLandRoadLayout::GetLeftRightSections(int SectionIndex)
 {
-	const int32 LeftSectionIndex = FindSideSection(SectionIndex, EMetaLandRoadLaneSectionSide::Left);
-	const int32 RightSectionIndex = FindSideSection(SectionIndex, EMetaLandRoadLaneSectionSide::Right);
+	int32 LeftSectionIndex = FindSideSection(SectionIndex, EMetaLandRoadLaneSectionSide::Left);
+	int32 RightSectionIndex = FindSideSection(SectionIndex, EMetaLandRoadLaneSectionSide::Right);
+	const int32 Fallback = Sections.IsValidIndex(SectionIndex) ? SectionIndex : 0;
+	if (LeftSectionIndex == INDEX_NONE)
+	{
+		LeftSectionIndex = Fallback;
+	}
+	if (RightSectionIndex == INDEX_NONE)
+	{
+		RightSectionIndex = Fallback;
+	}
 	return { Sections[LeftSectionIndex], Sections[RightSectionIndex] };
 }
 
 TPair<const FMetaLandRoadLaneSection&, const FMetaLandRoadLaneSection&> FMetaLandRoadLayout::GetLeftRightSections(int SectionIndex) const
 {
-	const int32 LeftSectionIndex = FindSideSection(SectionIndex, EMetaLandRoadLaneSectionSide::Left);
-	const int32 RightSectionIndex = FindSideSection(SectionIndex, EMetaLandRoadLaneSectionSide::Right);
+	int32 LeftSectionIndex = FindSideSection(SectionIndex, EMetaLandRoadLaneSectionSide::Left);
+	int32 RightSectionIndex = FindSideSection(SectionIndex, EMetaLandRoadLaneSectionSide::Right);
+	const int32 Fallback = Sections.IsValidIndex(SectionIndex) ? SectionIndex : 0;
+	if (LeftSectionIndex == INDEX_NONE)
+	{
+		LeftSectionIndex = Fallback;
+	}
+	if (RightSectionIndex == INDEX_NONE)
+	{
+		RightSectionIndex = Fallback;
+	}
 	return { Sections[LeftSectionIndex], Sections[RightSectionIndex] };
 }
 
@@ -845,7 +928,15 @@ int FMetaLandRoadLayout::FindSectionAtSOffset(double S) const
 
 	for (int32 SectionIndex = 0; SectionIndex < Sections.Num(); ++SectionIndex)
 	{
-		if (Sections[SectionIndex].SOffsetEnd_Cached > S)
+		const FMetaLandRoadLaneSection& Section = Sections[SectionIndex];
+		// Co-located Left|Right markers share S; array End_Cached == SOffset (zero span).
+		// Skip them as hosts — FindSideSection still resolves both faces from the real span.
+		if (Section.SOffsetEnd_Cached <= Section.SOffset + KINDA_SMALL_NUMBER)
+		{
+			continue;
+		}
+		// Inclusive end: tip S == CutS must stay on the approach section (not hub span).
+		if (Section.SOffsetEnd_Cached >= S - KINDA_SMALL_NUMBER)
 		{
 			return SectionIndex;
 		}
@@ -1087,4 +1178,145 @@ void UMetaLandRoadLaneConnection::DisconnectAll()
 		}
 	}
 	OuterRoadConnections.Reset();
+}
+
+bool FMetaLandRoadDrawAnchor::IsValid() const
+{
+	if (!SourceSpline.IsValid() || SectionIndex == INDEX_NONE || LaneIndex == METALANDROAD_LANE_INDEX_NONE)
+	{
+		return false;
+	}
+
+	const UMetaLandRoadSplineComponent* Spline = SourceSpline.Get();
+	if (!::IsValid(Spline) || !Spline->GetLaneSections().IsValidIndex(SectionIndex))
+	{
+		return false;
+	}
+
+	if (!MetaLandRoadLaneEditPick::IsLaneValidOnSpanSection(Spline, SectionIndex, LaneIndex))
+	{
+		return false;
+	}
+
+	const UMetaLandRoadSplineComponent::FMetaLandRoadLaneRange Range =
+		Spline->GetLaneRange(SectionIndex, LaneIndex);
+	if (AnchorS < Range.StartS - KINDA_SMALL_NUMBER || AnchorS > Range.EndS + KINDA_SMALL_NUMBER)
+	{
+		return false;
+	}
+
+	return true;
+}
+
+void MetaLandRoadLogDrawAnchor(const TCHAR* Context, const FMetaLandRoadDrawAnchor& Anchor)
+{
+	const TCHAR* MouthName = Anchor.MouthSide == EMetaLandRoadMouthSide::Start ? TEXT("Start") : TEXT("End");
+	UE_LOG(
+		LogTemp,
+		Log,
+		TEXT("[LaneAnchor] %s Spline=%s Section=%d Lane=%d AnchorS=%.1f Mouth=%s Bundle=%d FromSuccessor=%d"),
+		Context,
+		Anchor.SourceSpline.IsValid() ? *Anchor.SourceSpline->GetName() : TEXT("None"),
+		Anchor.SectionIndex,
+		Anchor.LaneIndex,
+		Anchor.AnchorS,
+		MouthName,
+		Anchor.BundledLaneIndices.Num(),
+		Anchor.bFromSuccessor ? 1 : 0);
+}
+
+bool MetaLandRoadBuildDrawAnchorFromLaneConnection(
+	const UMetaLandRoadLaneConnection& LaneConnection,
+	FMetaLandRoadDrawAnchor& OutAnchor)
+{
+	OutAnchor = FMetaLandRoadDrawAnchor();
+	UMetaLandRoadSplineComponent* Spline = LaneConnection.OwnedRoadSpline.Get();
+	if (!IsValid(Spline) || LaneConnection.SectionIndex == INDEX_NONE
+		|| LaneConnection.LaneIndex == METALANDROAD_LANE_INDEX_NONE)
+	{
+		return false;
+	}
+
+	const FMetaLandRoadLane* Lane = Spline->GetRoadLane(LaneConnection.SectionIndex, LaneConnection.LaneIndex);
+	if (!Lane || !Lane->IsLaneValid())
+	{
+		return false;
+	}
+
+	OutAnchor.SourceSpline = Spline;
+	OutAnchor.SectionIndex = LaneConnection.SectionIndex;
+	OutAnchor.LaneIndex = LaneConnection.LaneIndex;
+
+	if (Lane->SuccessorConnection == &LaneConnection)
+	{
+		OutAnchor.MouthSide = EMetaLandRoadMouthSide::End;
+		OutAnchor.AnchorS = Lane->GetEndOffset();
+		OutAnchor.bFromSuccessor = true;
+	}
+	else if (Lane->PredecessorConnection == &LaneConnection)
+	{
+		OutAnchor.MouthSide = EMetaLandRoadMouthSide::Start;
+		OutAnchor.AnchorS = Lane->GetStartOffset();
+		OutAnchor.bFromSuccessor = false;
+	}
+	else
+	{
+		return false;
+	}
+
+	OutAnchor.BundledLaneIndices.Reset();
+	OutAnchor.BundledLaneIndices.Add(LaneConnection.LaneIndex);
+	return OutAnchor.IsValid();
+}
+
+FTransform UMetaLandRoadLaneConnection::EvalTransform() const
+{
+	FMetaLandRoadDrawAnchor Anchor;
+	if (!MetaLandRoadBuildDrawAnchorFromLaneConnection(*this, Anchor))
+	{
+		return FTransform::Identity;
+	}
+
+	FTransform MouthTransform = FTransform::Identity;
+	if (Anchor.SourceSpline.IsValid()
+		&& Anchor.SourceSpline->EvalMouthTransform(Anchor, MouthTransform))
+	{
+		return MouthTransform;
+	}
+
+	return FTransform::Identity;
+}
+
+bool UMetaLandRoadConnection::CanConnectTo(const UMetaLandRoadLaneConnection* OtherLaneConnection) const
+{
+	if (!OtherLaneConnection || !OtherLaneConnection->IsConnectionValid() || !IsConnectionValid())
+	{
+		return false;
+	}
+
+	if (IsConnected())
+	{
+		return false;
+	}
+
+	if (GetOwnedRoadSpline() == OtherLaneConnection->OwnedRoadSpline.Get())
+	{
+		return false;
+	}
+
+	return true;
+}
+
+void UMetaLandRoadConnection::ConnectTo(UMetaLandRoadLaneConnection* OtherLaneConnection)
+{
+	if (!CanConnectTo(OtherLaneConnection))
+	{
+		return;
+	}
+
+	Modify();
+	OtherLaneConnection->Modify();
+	Disconnect();
+	OuterLaneConnection = OtherLaneConnection;
+	OtherLaneConnection->OuterRoadConnections.Add(this);
 }

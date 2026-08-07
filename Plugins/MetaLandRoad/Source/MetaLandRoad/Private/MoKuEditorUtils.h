@@ -105,7 +105,7 @@ public:
 			TSharedPtr<ILevelEditor> LevelEditorPtr = LevelEditorModule->GetLevelEditorInstance().Pin();
 			if (LevelEditorPtr.IsValid())
 			{
-				ModeType* EditMode = Cast<ModeType>(LevelEditorPtr->GetEditorModeManager().GetActiveScriptableMode(Id));
+					ModeType* EditMode = Cast<ModeType>(LevelEditorPtr->GetEditorModeManager().GetActiveScriptableMode(Id));
 				if (EditMode) return EditMode;
 			}
 		}

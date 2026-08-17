@@ -7,7 +7,7 @@
 #include "PropertyEditorModule.h"
 #include "IDetailsView.h"
 #include "EditorModeManager.h"
-#include "EdModeInteractiveToolsContext.h"
+#include "Tools/EdModeInteractiveToolsContext.h"
 #include "MoKuEditSplineActor.h"
 #include "MetaLandRoadEditorModeCommands.h"
 

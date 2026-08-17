@@ -77,7 +77,16 @@ public:
 
 	static bool DoSegmentsIntersect(const FVector2D& Segment1Start, const FVector2D& Segment1End, const FVector2D& Segment2Start, const FVector2D& Segment2End, FVector2D& OutIntersectionPoint,double& OutSeg1Intersection, double& OutSeg2Intersection);
 
-	static bool DoSplineIntersect(USplineComponent* Spline1, USplineComponent* Spline2, FVector3d& OutIntersectionPoint);
+	/**
+	 * XY centerline / proximity intersect.
+	 * MaxHeightDeltaCm <= 0: ignore height (always accept XY cross — default).
+	 * MaxHeightDeltaCm > 0: reject when |Z1-Z2| exceeds this (overpass).
+	 */
+	static bool DoSplineIntersect(
+		USplineComponent* Spline1,
+		USplineComponent* Spline2,
+		FVector3d& OutIntersectionPoint,
+		float MaxHeightDeltaCm = 0.0f);
 
 	static TArray<FVector3d> BezierLineConvert(const TArray<FVector3d>& InBaseCurve,uint32 Segment);
 

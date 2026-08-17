@@ -8,6 +8,11 @@ namespace MoKuEditSplinesComponentPrivate
 {
 	static bool ShouldRefreshRoadMeshFromPropertyChange(const FPropertyChangedEvent& PropertyChangedEvent)
 	{
+		if (PropertyChangedEvent.ChangeType == EPropertyChangeType::Interactive)
+		{
+			return false;
+		}
+
 		if (!PropertyChangedEvent.Property)
 		{
 			return false;
@@ -59,7 +64,10 @@ void UMoKuEditSplinesComponent::PostEditChangeProperty(FPropertyChangedEvent& Pr
 {
 	Super::PostEditChangeProperty(PropertyChangedEvent);
 
-	if (ParentActor && !bIsRefreshingRoadMesh && MoKuEditSplinesComponentPrivate::ShouldRefreshRoadMeshFromPropertyChange(PropertyChangedEvent))
+	if (ParentActor
+		&& !bIsRefreshingRoadMesh
+		&& !bDeferRoadMeshRefresh
+		&& MoKuEditSplinesComponentPrivate::ShouldRefreshRoadMeshFromPropertyChange(PropertyChangedEvent))
 	{
 		ParentActor->RefreshDynamicRoadMesh();
 	}
@@ -69,7 +77,10 @@ void UMoKuEditSplinesComponent::PostEditChangeChainProperty(FPropertyChangedChai
 {
 	Super::PostEditChangeChainProperty(PropertyChangedEvent);
 
-	if (ParentActor && !bIsRefreshingRoadMesh && MoKuEditSplinesComponentPrivate::ShouldRefreshRoadMeshFromPropertyChange(PropertyChangedEvent))
+	if (ParentActor
+		&& !bIsRefreshingRoadMesh
+		&& !bDeferRoadMeshRefresh
+		&& MoKuEditSplinesComponentPrivate::ShouldRefreshRoadMeshFromPropertyChange(PropertyChangedEvent))
 	{
 		ParentActor->RefreshDynamicRoadMesh();
 	}
@@ -99,6 +110,7 @@ void UMoKuEditSplinesComponent::UpdateRoadLayout()
 	// During junction Recook, SplitSection/Purge call this — must not Refresh→Recook again.
 	if (ParentActor
 		&& !bIsRefreshingRoadMesh
+		&& !bDeferRoadMeshRefresh
 		&& !AMoKuEditSplineActor::bSuppressJunctionRecookFromRoadRefresh)
 	{
 		ParentActor->RefreshDynamicRoadMesh();

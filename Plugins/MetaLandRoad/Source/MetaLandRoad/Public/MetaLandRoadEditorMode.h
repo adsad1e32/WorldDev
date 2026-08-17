@@ -41,8 +41,9 @@ public:
 
 	TObjectPtr<AWorldSceneManagement> SceneManagement;
 
-	//virtual bool UsesTransformWidget() const override;
-	//virtual bool UsesTransformWidget(UE::Widget::EWidgetMode CheckMode) const override;
+	virtual bool UsesTransformWidget() const override;
+	virtual bool UsesTransformWidget(UE::Widget::EWidgetMode CheckMode) const override;
+	virtual FVector GetWidgetLocation() const override;
 
 	UMetaLandRoadEditorMode(FVTableHelper& Helper);
 	UMetaLandRoadEditorMode();
@@ -76,8 +77,14 @@ public:
 	/** Clear junction session data (Enter/Exit). */
 	void ResetInteractiveJunctionSession();
 
-	/** Interactive draw finish: local junction cook on DrawnRoad (default). bFullWorldRebuild = future debug toggle. */
-	void ProcessInteractiveFinishedRoadDraw(AMoKuEditSplineActor* DrawnRoad, bool bFullWorldRebuild = false);
+	/**
+	 * Interactive draw finish: local junction cook on DrawnRoad (default).
+	 * MaxHeightDeltaCm: 0 = ignore height; >0 = overpass gate (|ΔZ| must be ≤ this).
+	 */
+	void ProcessInteractiveFinishedRoadDraw(
+		AMoKuEditSplineActor* DrawnRoad,
+		bool bFullWorldRebuild = false,
+		float MaxHeightDeltaCm = 0.0f);
 
 	/** Recalculate arm cuts + trim zones; optionally refresh all linked road meshes. */
 	void RecookJunctionActor(class AMoKuEditIntersectionActor* JunctionActor, bool bRefreshLinkedRoadMeshes = true);

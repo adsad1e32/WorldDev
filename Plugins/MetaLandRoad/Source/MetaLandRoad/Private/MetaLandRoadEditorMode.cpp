@@ -2,7 +2,7 @@
 #include "MetaLandRoadEditorMode.h"
 #include "Engine/Engine.h"
 #include "MetaLandRoadEditorModeToolkit.h"
-#include "EdModeInteractiveToolsContext.h"
+#include "Tools/EdModeInteractiveToolsContext.h"
 #include "InteractiveToolManager.h"
 #include "MetaLandRoadEditorModeCommands.h"
 #include "EngineUtils.h"
@@ -19,12 +19,14 @@
 #include "Tools/ShapesGenerationTool.h"
 #include "MoKuEditorUtils.h"
 #include "ComponentVisualizers/MetaLandRoadSectionComponentVisualizer.h"
+#include "ComponentVisualizer.h"
 #include "MetaLandRoadModule.h"
 #include "MetaLandRoadLaneEditPick.h"
 #include "Utils/MetaLandRoadCompVisUtils.h"
 #include "Modules/ModuleManager.h"
 #include "Framework/Application/SlateApplication.h"
 #include "WorldLandscapeBlueprintBrush.h"
+#include "EditSplineRoadInfo.h"
 #include "Landscape.h"
 #include "WorldEditorSettings.h"
 #include "WorldBrushEditorManagerFactory.h"
@@ -148,6 +150,27 @@ bool UMetaLandRoadEditorMode::TryHandleLaneAnchorPickClick(
 
 	if (!bPicked)
 	{
+		if (bShiftDown)
+		{
+			if (UMetaLandRoadInteractiveTool* DrawTool =
+				Cast<UMetaLandRoadInteractiveTool>(GetToolManager()->GetActiveTool(EToolSide::Left)))
+			{
+				if (DrawTool->HasLaneDrawEndSnap())
+				{
+					DrawTool->ClearLaneDrawEndSnap(true);
+					if (GEngine)
+					{
+						GEngine->AddOnScreenDebugMessage(
+							991130, 2.0f, FColor::Silver, TEXT("Target snap cleared"));
+					}
+					if (GEditor)
+					{
+						GEditor->RedrawLevelEditingViewports(true);
+					}
+					return true;
+				}
+			}
+		}
 		// Miss with an existing bundle: keep selection (accidental empty clicks).
 		// Only clear when there was nothing to expand.
 		if (bShiftDown && !EditTarget.bHasPendingAnchor)
@@ -179,6 +202,31 @@ bool UMetaLandRoadEditorMode::TryHandleLaneAnchorPickClick(
 	}
 
 	AMoKuEditSplineActor* RoadActor = PickedSpline ? Cast<AMoKuEditSplineActor>(PickedSpline->GetOwner()) : nullptr;
+	if (EditTarget.bHasPendingAnchor
+		&& RoadActor
+		&& EditTarget.RoadActor.Get()
+		&& RoadActor != EditTarget.RoadActor.Get())
+	{
+		if (UMetaLandRoadInteractiveTool* DrawTool =
+			Cast<UMetaLandRoadInteractiveTool>(GetToolManager()->GetActiveTool(EToolSide::Left)))
+		{
+			DrawTool->ApplyIdleEndSnapTarget(PickedAnchor);
+		}
+		if (GEngine)
+		{
+			GEngine->AddOnScreenDebugMessage(
+				991131,
+				2.5f,
+				FColor::Cyan,
+				TEXT("[MetaLandRoad] Target mouth locked — source kept | A connects"));
+		}
+		if (GEditor)
+		{
+			GEditor->RedrawLevelEditingViewports(true);
+		}
+		return true;
+	}
+
 	FMetaLandRoadEditTarget NewTarget;
 	NewTarget.RoadActor = RoadActor;
 	NewTarget.Spline = PickedSpline;
@@ -257,166 +305,66 @@ void UMetaLandRoadEditorMode::Enter()
 	RegisterTool(SampleToolCommands.InteractiveTool, InteractiveToolName, NewObject<UMetaLandRoadInteractiveToolBuilder>(this));
 	RegisterTool(SampleToolCommands.ShapesTool, ShapesGenerationName, NewObject<UShapesGenerationToolBuilder>(this));
 
-
 	if (GEditor)
 	{
 		GEditor->SelectNone(true, true);
 		GEditor->OnLevelActorDeleted().AddUObject(this, &UMetaLandRoadEditorMode::RefreshGizmoVisual);
-		//GEditor->OnLevelActorAdded().AddUObject(this, &UMetaLandRoadEditorMode::OnLevelActorAddedToWorld);
 	}
-	return;
 
-	if (MoKuSplineEditorUtils::CreateSceneStructure())
+	MoKuSplineEditorUtils::CreateSceneStructure();
+
+	SceneManagement = nullptr;
+	if (UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr)
 	{
-		UWorld* World = GEditor->GetEditorWorldContext().World();
-		if (World)
+		TArray<ALandscape*> LandscapesNeedingEditor;
+		for (ALandscape* Landscape : TActorRange<ALandscape>(World))
 		{
-			TArray<AActor*>ActorList = MoKuSplineEditorUtils::GetActorListByFolderPath("Procedural_Scene");
-			FActorSpawnParameters SpawnParams;
-			SpawnParams.OverrideLevel = World->PersistentLevel;
-			SpawnParams.bNoFail = true;
-			SpawnParams.ObjectFlags |= RF_Transactional;
-			if (ActorList.Num() == 0)
+			if (IsValid(Landscape) && Landscape->GetLandscapeGuid().IsValid() && Landscape->CanHaveLayersContent())
 			{
-				SceneManagement = World->SpawnActor<AWorldSceneManagement>(FVector(0, 0, 0), FRotator(0.0f, 0.0f, 0.0f), SpawnParams);
+				LandscapesNeedingEditor.Add(Landscape);
 			}
-			else
-			{
-				int Index = 0;
-				for (auto& ChildActor : ActorList)
-				{
-					if (SceneManagement = Cast<AWorldSceneManagement>(ChildActor))
-					{
-						break;
-					}
+		}
 
+		for (ALandscape* Landscape : LandscapesNeedingEditor)
+		{
+			if (AWorldSceneManagement* Manager = AWorldLandscapeBlueprintBrush::EnsureWorldEditorManagerForLandscape(Landscape))
+			{
+				if (!SceneManagement)
+				{
+					SceneManagement = Manager;
 				}
 			}
-			if (SceneManagement)
+		}
+
+		// Register default "Road" weightmap on existing roads so WorldEditor paints Road_LayerInfo under meshes.
+		for (TActorIterator<AMoKuEditBaseActor> It(World); It; ++It)
+		{
+			AMoKuEditBaseActor* RoadBody = *It;
+			if (!IsValid(RoadBody) || !RoadBody->AffectsLandscape())
 			{
+				continue;
+			}
+			RoadBody->EnsureDefaultTerrainInfluenceSettings();
+			FOnRoadBodyChangedParams Params;
+			Params.PropertyChangedEvent.ChangeType = EPropertyChangeType::ValueSet;
+			Params.bWeightmapSettingsChanged = true;
+			Params.bShapeOrPositionChanged = true;
+			Params.bUserTriggered = false;
+			RoadBody->OnRoadBodyChanged(Params);
+		}
 
-				const UWorldEditorSettings* WorldEditorSettings = GetDefault<UWorldEditorSettings>();
-				check(WorldEditorSettings != nullptr);
-				AWorldLandscapeBlueprintBrush* WorldEditBlueprintBrush = Cast<AWorldLandscapeBlueprintBrush>(SceneManagement);
-				if (WorldEditBlueprintBrush)
+		if (!SceneManagement)
+		{
+			for (TActorIterator<AWorldSceneManagement> It(World); It; ++It)
+			{
+				if (IsValid(*It))
 				{
-					UWorld* ActorWorld = WorldEditBlueprintBrush->GetWorld();
-
-					if (ActorWorld)
-					{
-						FBox WaterZoneBounds(ForceInit);
-						TArray<ALandscape*> FoundLandscapes;
-						bool bFoundIntersectingLandscape = false;
-
-						const bool bNonColliding = true;
-						const bool bIncludeChildActors = false;
-						const FBox ActorBounds = SceneManagement->GetComponentsBoundingBox(bNonColliding, bIncludeChildActors);
-
-						ALandscape* FallbackLandscape = nullptr;
-						for (ALandscape* Landscape : TActorRange<ALandscape>(ActorWorld))
-						{
-							check(Landscape);
-							if (Landscape->GetLandscapeGuid().IsValid())
-							{
-								if (FallbackLandscape == nullptr)
-								{
-									FallbackLandscape = Landscape;
-								}
-								
-								const FBox LandscapeBounds = Landscape->GetCompleteBounds();
-								if (LandscapeBounds.Intersect(ActorBounds))
-								{
-									FoundLandscapes.Add(Landscape);
-									// Make sure the water zone's bounds is large enough to fit all landscapes that intersect with this water body :
-									WaterZoneBounds += LandscapeBounds;
-									bFoundIntersectingLandscape = true;
-								}
-							}
-						}
-
-						if (!bFoundIntersectingLandscape && FallbackLandscape != nullptr)
-						{
-							FoundLandscapes.Add(FallbackLandscape);
-							const FBox LandscapeBounds = FallbackLandscape->GetCompleteBounds();
-							WaterZoneBounds += LandscapeBounds;
-						}
-						
-
-						TSubclassOf<AWorldLandscapeBlueprintBrush> WorldEditBrushClass = WorldEditorSettings->GetWorldEditorManagerClass();
-						if (UClass* WorldEditBrushClassPtr = WorldEditBrushClass.Get())
-						{
-							for (ALandscape* FoundLandscape : FoundLandscapes)
-							{
-								check(IsValid(FoundLandscape));
-
-								bool bHasWaterManager = false;
-								FoundLandscape->ForEachLayerConst([&bHasWaterManager](const FLandscapeLayer& Layer)
-									{
-										for (const FLandscapeLayerBrush& Brush : Layer.Brushes)
-										{
-											bHasWaterManager |= Cast<AWorldLandscapeBlueprintBrush>(Brush.GetBrush()) != nullptr;
-											if (bHasWaterManager)
-											{
-												// Stop iterating the moment we've found the brush manager : 
-												return false;
-											}
-										}
-
-										return true;
-									});
-
-
-								if (!bHasWaterManager)
-								{
-									//UActorFactory* WorldEditBrushActorFactory = GEditor->FindActorFactoryForActorClass(WorldEditBrushClassPtr);
-
-									// The manager is added from the BP brush tool only and is being spawned on a valid edit layer
-								//	FString BrushActorString = FString::Format(TEXT("{0}_{1}"), { FoundLandscape->GetActorLabel(), WorldEditBrushClassPtr->GetName() });
-								//	FName BrushActorName = MakeUniqueObjectName(FoundLandscape->GetOuter(), WorldEditBrushClassPtr, FName(BrushActorString));
-								//	FActorSpawnParameters SpawnParams;
-								//	SpawnParams.Name = BrushActorName;
-								//	SpawnParams.bAllowDuringConstructionScript = true; // This can be called by construction script if the actor being added to the world is part of a blueprint, for example : 
-								//	/*						AWorldLandscapeBlueprintBrush* NewBrush = (WorldEditBrushActorFactory != nullptr)
-								//								? Cast<AWorldLandscapeBlueprintBrush>(WorldEditBrushActorFactory->CreateActor(WorldEditBrushClassPtr, FoundLandscape->GetLevel(), FTransform(WaterZoneBounds.GetCenter()), SpawnParams))
-								//: */AWorldSceneManagement* NewBrush = ActorWorld->SpawnActor<AWorldSceneManagement>(WorldEditBrushClass, SpawnParams);
-
-								//if (NewBrush)
-								{
-									/*	if (!WaterBrushActorFactory)
-										{
-											UE_LOG(LogWaterEditor, Warning, TEXT("WaterManager Actor Factory could not be found! The newly spawned %s may have incorrect defaults!"), *NewBrush->GetActorLabel());
-										}*/
-
-									bHasWaterManager = true;
-									//NewBrush->SetActorLabel(BrushActorString);
-									//WorldEditBlueprintBrush->SetOwningLandscape(FoundLandscape);
-									WorldEditBlueprintBrush->SetTargetLandscape(FoundLandscape);
-
-								}
-								}
-							}
-
-						}
-
-					}
-
-				}
-
-				SceneManagement->SetFolderPath("Procedural_Scene");
-				ALandscape* OwningLandscape = SceneManagement->GetOwningLandscape();
-				if (OwningLandscape)
-				{
-					int32 Width = OwningLandscape->GetBoundingRect().Width();
-					//FIntRect RectLandscape = OwningLandscape->GetBoundingRect();
-					//UE_LOG(LogTemp,Warning,TEXT("Width==%i"), Width)
+					SceneManagement = *It;
+					break;
 				}
 			}
-
-
 		}
 	}
-
-
 }
 
 void UMetaLandRoadEditorMode::Exit()
@@ -455,10 +403,14 @@ void UMetaLandRoadEditorMode::CreateToolkit()
 }
 void UMetaLandRoadEditorMode::OnToolStarted(UInteractiveToolManager* Manager, UInteractiveTool* Tool)
 {
+	Super::OnToolStarted(Manager, Tool);
 
-	const FString* ToolName = FTextInspector::GetSourceString(Tool->GetToolInfo().ToolDisplayName);
-	//UE_LOG(LogTemp,Warning,TEXT("ToolName=%s"),**ToolName)
-
+	if (Tool
+		&& (Tool->IsA<UMetaLandRoadInteractiveTool>() || Tool->IsA<UShapesGenerationTool>())
+		&& FModuleManager::Get().IsModuleLoaded(TEXT("MetaLandRoad")))
+	{
+		FMetaLandRoadModule::Get().ExitEditorVisModesForInteractiveTool();
+	}
 }
 
 void UMetaLandRoadEditorMode::OnToolEnded(UInteractiveToolManager* Manager, UInteractiveTool* Tool)
@@ -468,10 +420,7 @@ void UMetaLandRoadEditorMode::OnToolEnded(UInteractiveToolManager* Manager, UInt
 	if (Tool && Tool->IsA<UMetaLandRoadInteractiveTool>())
 	{
 		ClearEditTarget();
-		if (FModuleManager::Get().IsModuleLoaded(TEXT("MetaLandRoad")))
-		{
-			FMetaLandRoadModule::Get().SetEditorVisMode(EMetaLandRoadEditorVisMode::Standard);
-		}
+		// Vis modes stay Standard while tool was active (cleared on start). Do not force again.
 		if (GEditor)
 		{
 			GEditor->RedrawLevelEditingViewports(false);
@@ -497,9 +446,32 @@ bool UMetaLandRoadEditorMode::InputKey(FEditorViewportClient* InViewportClient, 
 {
 	if((InEvent == IE_Pressed) && (InKey == EKeys::Escape))
 	{
+		if (UMetaLandRoadInteractiveTool* DrawTool =
+			Cast<UMetaLandRoadInteractiveTool>(GetToolManager()->GetActiveTool(EToolSide::Left)))
+		{
+			if (DrawTool->HasLaneDrawEndSnap())
+			{
+				DrawTool->ClearLaneDrawEndSnap(true);
+				if (GEditor)
+				{
+					GEditor->RedrawLevelEditingViewports(false);
+				}
+				return true;
+			}
+		}
 		GetToolManager()->DeactivateTool(EToolSide::Left, EToolShutdownType::Completed);
 		ActorSelectionChangeNotify();
 		return true;
+	}
+
+	if ((InEvent == IE_Pressed) && (InKey == EKeys::A))
+	{
+		if (UMetaLandRoadInteractiveTool* DrawTool =
+			Cast<UMetaLandRoadInteractiveTool>(GetToolManager()->GetActiveTool(EToolSide::Left)))
+		{
+			DrawTool->OnFinishedSplineEdit();
+			return true;
+		}
 	}
 
 	if ((InEvent == IE_Pressed) && (InKey == EKeys::P))
@@ -531,7 +503,14 @@ bool UMetaLandRoadEditorMode::InputDelta(
 	FRotator& InRot,
 	FVector& InScale)
 {
-	if (FModuleManager::Get().IsModuleLoaded(TEXT("MetaLandRoad")))
+	// WASD / RMB look must not move spline keys — only LMB drag on the gizmo axis.
+	const bool bLmbGizmoDrag = ViewportClient && Viewport
+		&& ViewportClient->IsTracking()
+		&& Viewport->KeyState(EKeys::LeftMouseButton)
+		&& !Viewport->KeyState(EKeys::RightMouseButton)
+		&& ViewportClient->GetCurrentWidgetAxis() != EAxisList::None;
+	if (bLmbGizmoDrag
+		&& FModuleManager::Get().IsModuleLoaded(TEXT("MetaLandRoad")))
 	{
 		const TSharedPtr<FMoKuEditSplinesComponentVisualizer> RoadVis =
 			FMetaLandRoadModule::Get().GetRoadComponentVisualizer();
@@ -683,17 +662,100 @@ void UMetaLandRoadEditorMode::RefreshGizmoVisual(AActor* InActor)
 	}
 }
 
+bool UMetaLandRoadEditorMode::UsesTransformWidget() const
+{
+	if (FModuleManager::Get().IsModuleLoaded(TEXT("MetaLandRoad")))
+	{
+		const FMetaLandRoadModule& Module = FMetaLandRoadModule::Get();
+		if (Module.ShouldShowNativeEditOverlay() || Module.IsSectionMode())
+		{
+			return true;
+		}
+		if (Module.IsLaneEditMode())
+		{
+			if (const TSharedPtr<FMoKuEditSplinesComponentVisualizer> RoadVis =
+				Module.GetRoadComponentVisualizer())
+			{
+				return RoadVis->HasSelectedLaneWidthKey();
+			}
+			return false;
+		}
+	}
+	return Super::UsesTransformWidget();
+}
+
+bool UMetaLandRoadEditorMode::UsesTransformWidget(UE::Widget::EWidgetMode CheckMode) const
+{
+	if (FModuleManager::Get().IsModuleLoaded(TEXT("MetaLandRoad")))
+	{
+		const FMetaLandRoadModule& Module = FMetaLandRoadModule::Get();
+		if (Module.ShouldShowNativeEditOverlay() || Module.IsSectionMode())
+		{
+			return CheckMode == UE::Widget::WM_Translate || CheckMode == UE::Widget::WM_None;
+		}
+		if (Module.IsLaneEditMode())
+		{
+			if (const TSharedPtr<FMoKuEditSplinesComponentVisualizer> RoadVis =
+				Module.GetRoadComponentVisualizer())
+			{
+				if (RoadVis->HasSelectedLaneWidthKey())
+				{
+					return CheckMode == UE::Widget::WM_Translate || CheckMode == UE::Widget::WM_None;
+				}
+			}
+			return false;
+		}
+	}
+	return Super::UsesTransformWidget(CheckMode);
+}
+
+FVector UMetaLandRoadEditorMode::GetWidgetLocation() const
+{
+	if (FModuleManager::Get().IsModuleLoaded(TEXT("MetaLandRoad"))
+		&& !FMetaLandRoadModule::Get().IsInteractiveSplineDrawToolActive())
+	{
+		const FMetaLandRoadModule& Module = FMetaLandRoadModule::Get();
+		if (Module.ShouldShowNativeEditOverlay()
+			|| Module.IsSectionMode()
+			|| Module.IsLaneEditMode())
+		{
+			if (const TSharedPtr<FMoKuEditSplinesComponentVisualizer> RoadVis =
+				Module.GetRoadComponentVisualizer())
+			{
+				FVector KeyLocation = FVector::ZeroVector;
+				if (RoadVis->GetWidgetLocation(GCurrentLevelEditingViewportClient, KeyLocation))
+				{
+					return KeyLocation;
+				}
+			}
+		}
+	}
+	return Super::GetWidgetLocation();
+}
+
 bool UMetaLandRoadEditorMode::ShouldDrawWidget() const
 {
-	// hide standard xform gizmo if we have an active tool
-	if (GetInteractiveToolsContext() != nullptr && GetToolManager()->HasAnyActiveTool())
+	// Alt+W/E/T: CompVis key/section location, not the actor pivot.
+	if (FModuleManager::Get().IsModuleLoaded(TEXT("MetaLandRoad")))
 	{
-		return false;
+		const FMetaLandRoadModule& Module = FMetaLandRoadModule::Get();
+		if (Module.ShouldShowNativeEditOverlay() || Module.IsSectionMode())
+		{
+			return true;
+		}
+		if (Module.IsLaneEditMode())
+		{
+			if (const TSharedPtr<FMoKuEditSplinesComponentVisualizer> RoadVis =
+				Module.GetRoadComponentVisualizer())
+			{
+				return RoadVis->HasSelectedLaneWidthKey();
+			}
+			return false;
+		}
 	}
 
-	// Alt+W spline key gizmo must not compete with the actor transform widget.
-	if (FModuleManager::Get().IsModuleLoaded(TEXT("MetaLandRoad"))
-		&& FMetaLandRoadModule::Get().ShouldShowNativeEditOverlay())
+	// Interactive Tool owns the viewport — hide actor xform gizmo.
+	if (GetInteractiveToolsContext() != nullptr && GetToolManager()->HasAnyActiveTool())
 	{
 		return false;
 	}
@@ -771,13 +833,14 @@ void UMetaLandRoadEditorMode::Render(const FSceneView* View, FViewport* Viewport
 		const bool bExtendMixHover =
 			DrawTool
 			&& DrawTool->IsLaneAnchorDrawSession()
-			&& !ModKeys.IsControlDown()
-			&& (ModKeys.IsAltDown() || ModKeys.IsShiftDown());
-		const bool bIdleShiftHover =
-			!EditTarget.bHasPendingAnchor
-			&& ModKeys.IsShiftDown()
 			&& !ModKeys.IsControlDown();
-		if (bExtendMixHover || bIdleShiftHover)
+		const bool bIdleShiftHover =
+			ModKeys.IsShiftDown()
+			&& !ModKeys.IsControlDown();
+		const bool bIdleTargetHover =
+			EditTarget.bHasPendingAnchor
+			&& !ModKeys.IsControlDown();
+		if (bExtendMixHover || bIdleShiftHover || bIdleTargetHover)
 		{
 			if (FEditorViewportClient* ViewportClient = GCurrentLevelEditingViewportClient)
 			{
@@ -798,7 +861,14 @@ void UMetaLandRoadEditorMode::Render(const FSceneView* View, FViewport* Viewport
 						HoverSpline)
 						&& ShiftMouthHoverAnchor.IsValid())
 					{
-						EndSnapHoverPtr = &ShiftMouthHoverAnchor;
+						const bool bHoverIsSourceMouth =
+							EditTarget.RoadActor.Get()
+							&& HoverSpline
+							&& HoverSpline->GetOwner() == EditTarget.RoadActor.Get();
+						if (!bHoverIsSourceMouth)
+						{
+							EndSnapHoverPtr = &ShiftMouthHoverAnchor;
+						}
 					}
 				}
 			}
@@ -811,7 +881,7 @@ void UMetaLandRoadEditorMode::Render(const FSceneView* View, FViewport* Viewport
 	{
 		if (UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr)
 		{
-			// Lane pick: mouth bars only (no lane-face fill / boundary spam).
+			// Lane pick: per-lane mouth bars only (no face fills).
 			MetaLandRoadLaneVisualization::DrawWorldBuilderMouthCrossSections(
 				World,
 				View,
@@ -2207,7 +2277,8 @@ namespace MetaLandRoadEditorModeJunctionPrivate
 	static void DetectCenterlineIntersections(
 		UWorld* World,
 		UMetaLandRoadSplineComponent* DrawnSpline,
-		TArray<FDetectedArmHit>& OutHits)
+		TArray<FDetectedArmHit>& OutHits,
+		float MaxHeightDeltaCm = 0.0f)
 	{
 		OutHits.Reset();
 		if (!World || !DrawnSpline || DrawnSpline->GetNumberOfSplinePoints() < 2)
@@ -2225,7 +2296,8 @@ namespace MetaLandRoadEditorModeJunctionPrivate
 			}
 
 			FVector IntersectWorld = FVector::ZeroVector;
-			if (!MoKuSplineEditorUtils::DoSplineIntersect(DrawnSpline, OtherSpline, IntersectWorld))
+			if (!MoKuSplineEditorUtils::DoSplineIntersect(
+					DrawnSpline, OtherSpline, IntersectWorld, MaxHeightDeltaCm))
 			{
 				continue;
 			}
@@ -2312,7 +2384,8 @@ namespace MetaLandRoadEditorModeJunctionPrivate
 		UWorld* World,
 		TArray<FMetaLandRoadJunctionNode>& Junctions,
 		double ForwardIndent,
-		double ClusterRadius)
+		double ClusterRadius,
+		float MaxHeightDeltaCm = 0.0f)
 	{
 		Junctions.Reset();
 		if (!World)
@@ -2346,7 +2419,8 @@ namespace MetaLandRoadEditorModeJunctionPrivate
 				}
 
 				FVector IntersectWorld = FVector::ZeroVector;
-				if (!MoKuSplineEditorUtils::DoSplineIntersect(SplineA, SplineB, IntersectWorld))
+				if (!MoKuSplineEditorUtils::DoSplineIntersect(
+						SplineA, SplineB, IntersectWorld, MaxHeightDeltaCm))
 				{
 					continue;
 				}
@@ -2833,7 +2907,8 @@ namespace MetaLandRoadEditorModeJunctionPrivate
 		UMetaLandRoadSplineComponent* DrawnSpline,
 		TArray<FMetaLandRoadJunctionNode>& Junctions,
 		double ForwardIndent,
-		double ClusterRadius)
+		double ClusterRadius,
+		float MaxHeightDeltaCm = 0.0f)
 	{
 		Junctions.Reset();
 		if (!World || !DrawnSpline || DrawnSpline->GetNumberOfSplinePoints() < 2)
@@ -2844,7 +2919,7 @@ namespace MetaLandRoadEditorModeJunctionPrivate
 		MetaLandRoadProfile::EnsureDefaultRoadProfile(DrawnSpline);
 
 		TArray<FDetectedArmHit> IntersectionHits;
-		DetectCenterlineIntersections(World, DrawnSpline, IntersectionHits);
+		DetectCenterlineIntersections(World, DrawnSpline, IntersectionHits, MaxHeightDeltaCm);
 
 		for (const FDetectedArmHit& OtherHit : IntersectionHits)
 		{
@@ -3067,7 +3142,7 @@ void UMetaLandRoadEditorMode::RecookJunctionActorStatic(
 	}
 
 	// Package/map load: actor has no World yet — Publish RegisterComponent ensure-crashes.
-	if (!JunctionActor->GetWorld() || GIsEditorLoadingPackage)
+	if (!JunctionActor->GetWorld() || UE::GetIsEditorLoadingPackage())
 	{
 		UE_LOG(
 			LogTemp,
@@ -3225,15 +3300,20 @@ void UMetaLandRoadEditorMode::RecookJunctionActorStatic(
 		}
 	}
 
-	if (bRefreshLinkedRoadMeshes)
+	// Do NOT RefreshArmMesh here — RefreshJunctionCoverMesh rebuilds linked roads once.
+	// Extra RefreshArmMesh + cover refresh was double/triple mesh rebuild (巨卡 on T cook).
+	(void)bRefreshLinkedRoadMeshes;
+
+	for (const FMetaLandRoadJunctionArmRef& Arm : Junction.Arms)
 	{
-		for (AMoKuEditSplineActor* LinkedRoad : JunctionActor->JunctionData->LinkedRoadActors)
-		{
-			if (LinkedRoad)
-			{
-				MetaLandRoadEditorModeJunctionPrivate::RefreshArmMesh(LinkedRoad->GetSplineComponent());
-			}
-		}
+		UE_LOG(
+			LogTemp,
+			Log,
+			TEXT("[Recook/CutAlign] arm CutS=%.1f DepartS=%.1f HubS=%.1f through=%d"),
+			Arm.CutDistanceS,
+			Arm.DepartCutS,
+			Arm.IntersectDistanceS,
+			Arm.bThroughArm ? 1 : 0);
 	}
 
 	// Mouth CS / ConnectEdge for debug viz — must follow lane-width changes on any arm.
@@ -3246,10 +3326,11 @@ void UMetaLandRoadEditorMode::RecookJunctionActorStatic(
 	UE_LOG(
 		LogTemp,
 		Log,
-		TEXT("[Recook] END junction=%s topology=%d tris=%d connectSides logged above"),
+		TEXT("[Recook] END junction=%s topology=%d tris=%d arms=%d"),
 		*JunctionActor->GetName(),
 		static_cast<int32>(Junction.Topology),
-		TriCount);
+		TriCount,
+		Junction.Arms.Num());
 	DrainDeferredJunctionRecooks();
 }
 
@@ -3266,7 +3347,8 @@ void UMetaLandRoadEditorMode::ResetInteractiveJunctionSession()
 
 void UMetaLandRoadEditorMode::ProcessInteractiveFinishedRoadDraw(
 	AMoKuEditSplineActor* DrawnRoad,
-	bool bFullWorldRebuild)
+	bool bFullWorldRebuild,
+	float MaxHeightDeltaCm)
 {
 	if (!DrawnRoad || !GEditor)
 	{
@@ -3297,7 +3379,8 @@ void UMetaLandRoadEditorMode::ProcessInteractiveFinishedRoadDraw(
 			World,
 			InteractiveJunctions,
 			InteractiveJunctionForwardIndent,
-			InteractiveJunctionClusterRadius);
+			InteractiveJunctionClusterRadius,
+			MaxHeightDeltaCm);
 	}
 	else
 	{
@@ -3306,7 +3389,8 @@ void UMetaLandRoadEditorMode::ProcessInteractiveFinishedRoadDraw(
 			DrawnRoadSpline,
 			InteractiveJunctions,
 			InteractiveJunctionForwardIndent,
-			InteractiveJunctionClusterRadius);
+			InteractiveJunctionClusterRadius,
+			MaxHeightDeltaCm);
 	}
 
 	if (InteractiveJunctions.IsEmpty())

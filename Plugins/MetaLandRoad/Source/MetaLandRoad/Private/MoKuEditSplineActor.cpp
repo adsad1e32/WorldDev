@@ -8,13 +8,14 @@
 #include "UObject/UnrealTypePrivate.h"
 #include "MoKuEditorUtils.h"
 #include "LevelEditor.h"
-#include "EdModeInteractiveToolsContext.h"
+#include "Tools/EdModeInteractiveToolsContext.h"
 #include "MoKuEditSplinesComponent.h"
 #include "MetaLandRoadProfile.h"
 #include "MetaLandRoadSplineComponent.h"
 #include "DynamicMesh/DynamicMesh3.h"
 #include "DynamicMesh/MeshNormals.h"
 #include "EditSplineRoadInfo.h"
+#include "WorldEditorSettings.h"
 #include "MoKuEditIntersectionActor.h"
 #include "Editor.h"
 #include "EngineUtils.h"
@@ -877,7 +878,7 @@ FVector2f AMoKuEditSplineActor::MakeAsphaltUVAtDistance(
 		return FVector2f::ZeroVector;
 	}
 
-	const float UvTileCm = FMath::Max(MetaLandRoad::DefaultAsphaltUvTileCm, 1.0f);
+	const float UvTileCm = FMath::Max(Spline->AsphaltUvTileCm, 50.0f);
 	const FVector LocalPos = Spline->GetComponentTransform().InverseTransformPosition(WorldPos);
 	const FVector Center = Spline->GetLocationAtDistanceAlongSpline(DistanceS, ESplineCoordinateSpace::Local);
 	const FVector Right = Spline->GetRightVectorAtDistanceAlongSpline(DistanceS, ESplineCoordinateSpace::Local);
@@ -1047,7 +1048,7 @@ void AMoKuEditSplineActor::RefreshDynamicRoadMesh()
 		&& JunctionTrimZones.Num() > 0
 		&& GEditor
 		&& GetWorld()
-		&& !GIsEditorLoadingPackage;
+		&& !UE::GetIsEditorLoadingPackage();
 	if (bCanRecookLinkedJunctions)
 	{
 		TSet<AMoKuEditIntersectionActor*> LinkedJunctions;
@@ -1125,6 +1126,35 @@ void AMoKuEditSplineActor::RefreshDynamicRoadMesh()
 	}
 
 	SplineComponent->RefreshLaneVisualization();
+
+	if (bAffectsLandscape && SplineComponent)
+	{
+		// Do NOT auto-rewrite FalloffWidth from road half-width — that locked Details knobs
+		// and made every road look like one giant fused bowl. Seed only when empty.
+		if (RoadHeightmapSettings.FalloffSettings.FalloffWidth <= KINDA_SMALL_NUMBER)
+		{
+			const double HalfWidthCm = FMath::Max(SplineComponent->GetRoadHalfWidthAtS(0.0), 1.0);
+			RoadHeightmapSettings.FalloffSettings.FalloffWidth =
+				static_cast<float>(FMath::Clamp(HalfWidthCm * 0.75, 400.0, 1500.0));
+		}
+		for (TPair<FName, FRoadBodyWeightmapSettings>& Pair : RoadBodyWeightmapSettings)
+		{
+			if (Pair.Value.FalloffWidth <= KINDA_SMALL_NUMBER)
+			{
+				Pair.Value.FalloffWidth = 400.f;
+			}
+		}
+
+		if (!UE::GetIsEditorLoadingPackage())
+		{
+			FOnRoadBodyChangedParams Params;
+			Params.bShapeOrPositionChanged = true;
+			Params.bUserTriggered = false;
+			Params.PropertyChangedEvent.ChangeType = EPropertyChangeType::ValueSet;
+			OnRoadBodyChanged(Params);
+		}
+	}
+
 	SplineComponent->bIsRefreshingRoadMesh = false;
 }
 

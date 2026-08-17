@@ -339,41 +339,12 @@ static void DrawFullCenterEditLine(
 	const FLinearColor& Color,
 	float LineThickness)
 {
-	if (!SplineComp || !PDI || SplineComp->GetNumberOfSplinePoints() < 2)
+	if (!SplineComp || !PDI)
 	{
 		return;
 	}
 
-	double StartS = 0.0;
-	double EndS = SplineComp->GetSplineLength();
-	if (!ClipSectionDrawRangeToMesh(SplineComp, StartS, EndS, StartS, EndS))
-	{
-		return;
-	}
-	if (EndS <= StartS + KINDA_SMALL_NUMBER)
-	{
-		return;
-	}
-
-	TArray<FMetaLandRoadSplinePositionLinearApproximation> Points;
-	SplineComp->BuildLinearApproximation(
-		Points,
-		[&](double /*S*/)
-		{
-			return 0.0;
-		},
-		StartS,
-		EndS,
-		MetaLandRoad::DefaultReparamStepsPerSegment,
-		MetaLandRoad::DefaultMinNumStepsPerSection,
-		ESplineCoordinateSpace::World);
-
-	for (int32 PointIndex = 1; PointIndex < Points.Num(); ++PointIndex)
-	{
-		const FVector A = RaiseSplineVisualPoint(SplineComp, Points[PointIndex - 1].Position);
-		const FVector B = RaiseSplineVisualPoint(SplineComp, Points[PointIndex].Position);
-		PDI->DrawLine(A, B, Color, SDPG_Foreground, LineThickness, 0.0f, true);
-	}
+	SplineComp->DrawMainCenterLinePDI(PDI, Color, LineThickness);
 }
 
 UMetaLandRoadSplineComponent* MetaLandRoadSectionEditVisualization::FindSelectedRoadSplineFromEditor()
@@ -743,19 +714,20 @@ void MetaLandRoadSectionEditVisualization::DrawSectionEditLines(
 		? SelectionState->GetSelectedSectionIndex()
 		: INDEX_NONE;
 
-	if (SplineComp->GetLaneSectionsNum() == 0)
+	const bool bHighlightMain =
+		HoveredSectionIndex != INDEX_NONE || SelectedSectionIndex != INDEX_NONE;
+	DrawFullCenterEditLine(
+		SplineComp,
+		PDI,
+		bHighlightMain ? Yellow : Pink,
+		bHighlightMain ? HighlightThickness : NormalThickness);
+
+	if (SplineComp->GetLaneSectionsNum() == 0 || !PDI->IsHitTesting())
 	{
-		const bool bHighlight = HoveredSectionIndex != INDEX_NONE || SelectedSectionIndex != INDEX_NONE;
-		DrawFullCenterEditLine(
-			SplineComp,
-			PDI,
-			bHighlight ? Yellow : Pink,
-			bHighlight ? HighlightThickness : NormalThickness);
 		return;
 	}
 
-	// Draw every Both span (not only the longest) so Add Section boundaries stay visible.
-	int32 DrawnBothCount = 0;
+	// Hit proxies only — no second visible stroke (that was the broken/kinked overlay).
 	for (int32 SectionIndex = 0; SectionIndex < SplineComp->GetLaneSectionsNum(); ++SectionIndex)
 	{
 		const FMetaLandRoadLaneSection& Section = SplineComp->GetLaneSection(SectionIndex);
@@ -763,38 +735,12 @@ void MetaLandRoadSectionEditVisualization::DrawSectionEditLines(
 		{
 			continue;
 		}
-
-		double StartS = Section.SOffset;
-		double EndS = MetaLandRoad::ResolveSectionEndS(SplineComp, SectionIndex);
-		if (!ClipSectionDrawRangeToMesh(SplineComp, StartS, EndS, StartS, EndS))
-		{
-			continue;
-		}
-		if (EndS <= StartS + KINDA_SMALL_NUMBER)
-		{
-			continue;
-		}
-
-		const bool bHighlight =
-			HoveredSectionIndex == SectionIndex || SelectedSectionIndex == SectionIndex;
 		DrawSectionCenterLineSpan(
 			SplineComp,
 			PDI,
 			SectionIndex,
-			bHighlight ? Yellow : Pink,
-			bHighlight ? HighlightThickness : NormalThickness,
+			FLinearColor::White,
+			FMath::Max(HighlightThickness * 2.5f, 48.0f),
 			true);
-		++DrawnBothCount;
-	}
-
-	if (DrawnBothCount == 0)
-	{
-		// Left|Right-only markers: still need a pickable geometric center for Add Section.
-		const bool bHighlight = HoveredSectionIndex != INDEX_NONE || SelectedSectionIndex != INDEX_NONE;
-		DrawFullCenterEditLine(
-			SplineComp,
-			PDI,
-			bHighlight ? Yellow : Pink,
-			bHighlight ? HighlightThickness : NormalThickness);
 	}
 }

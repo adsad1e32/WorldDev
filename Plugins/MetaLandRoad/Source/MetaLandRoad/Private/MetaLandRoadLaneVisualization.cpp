@@ -659,13 +659,13 @@ namespace MetaLandRoadLaneVisualization
 			if (LaneIndex > 0)
 			{
 				return bOuterLane
-					? FLinearColor(0.2f, 0.95f, 0.35f, 1.0f)
-					: FLinearColor(0.15f, 0.75f, 0.25f, 1.0f);
+					? FLinearColor(0.95f, 0.2f, 0.2f, 1.0f)
+					: FLinearColor(0.85f, 0.35f, 0.25f, 1.0f);
 			}
 
 			return bOuterLane
-				? FLinearColor(0.15f, 0.75f, 1.0f, 1.0f)
-				: FLinearColor(0.25f, 0.55f, 0.95f, 1.0f);
+				? FLinearColor(0.15f, 0.85f, 0.25f, 1.0f)
+				: FLinearColor(0.25f, 0.75f, 0.35f, 1.0f);
 		}
 
 		static void DrawAllLanes(
@@ -718,7 +718,7 @@ namespace MetaLandRoadLaneVisualization
 				Spline, SectionIndex, LaneIndex, Highlight);
 		}
 
-		/** Alt+T / anchor debug — unified yellow; selection stronger than hover. */
+		/** World Builder pick: yellow = selected bundle, green = hover candidate. */
 		static FLinearColor GetLaneFaceSelectionFillColor(int32 LaneIndex)
 		{
 			(void)LaneIndex;
@@ -728,7 +728,7 @@ namespace MetaLandRoadLaneVisualization
 		static FLinearColor GetLaneFaceHoverFillColor(int32 LaneIndex)
 		{
 			(void)LaneIndex;
-			return FLinearColor(1.00f, 0.92f, 0.10f, 0.38f);
+			return FLinearColor(0.20f, 1.00f, 0.35f, 0.42f);
 		}
 
 		static const FMaterialRenderProxy* GetLaneFaceFillMaterialParent()
@@ -1533,14 +1533,26 @@ namespace MetaLandRoadLaneVisualization
 						}
 						else if (bHovered)
 						{
-							DrawLaneFaceFillPDI(
-								PDI,
-								SplineComponent,
-								LaneSectionIndex,
-								LaneIndex,
-								ClipS0,
-								ClipS1,
-								GetLaneFaceHoverFillColor(LaneIndex));
+							double HoverS0 = ClipS0;
+							double HoverS1 = ClipS1;
+							if (Layout.Sections.IsValidIndex(Highlight.HoveredSectionIndex))
+							{
+								HoverS0 = FMath::Max(HoverS0, Layout.Sections[Highlight.HoveredSectionIndex].SOffset);
+								HoverS1 = FMath::Min(
+									HoverS1,
+									MetaLandRoad::ResolveSectionEndS(SplineComponent, Highlight.HoveredSectionIndex));
+							}
+							if (HoverS1 > HoverS0 + KINDA_SMALL_NUMBER)
+							{
+								DrawLaneFaceFillPDI(
+									PDI,
+									SplineComponent,
+									LaneSectionIndex,
+									LaneIndex,
+									HoverS0,
+									HoverS1,
+									GetLaneFaceHoverFillColor(LaneIndex));
+							}
 						}
 					}
 				}
@@ -1753,11 +1765,16 @@ namespace MetaLandRoadLaneVisualization
 					if (!PDI->IsHitTesting())
 					{
 						const bool bHoveredSectionBoundary =
-							Highlight.bHoveredLaneBoundaryLine
+							!Highlight.bHoveredWidthIsKey
 							&& Highlight.HoveredSectionIndex == SectionIndex
 							&& Highlight.HoveredLaneIndex == LaneIndex;
+						const bool bHoverElsewhere =
+							Highlight.HoveredSectionIndex != INDEX_NONE
+							&& (Highlight.HoveredSectionIndex != SectionIndex
+								|| Highlight.HoveredLaneIndex != LaneIndex);
 						const bool bSelectedWidthKey =
-							Highlight.SelectedWidthIndex != INDEX_NONE
+							!bHoverElsewhere
+							&& Highlight.SelectedWidthIndex != INDEX_NONE
 							&& Highlight.SelectedSectionIndex == SectionIndex
 							&& Highlight.SelectedLaneIndex == LaneIndex;
 						const bool bLineHighlighted = bHoveredSectionBoundary || bSelectedWidthKey;
@@ -2055,13 +2072,32 @@ namespace MetaLandRoadLaneVisualization
 		}
 	}
 
+	static void ApplyHoverAnchorToHighlight(
+		const UMetaLandRoadSplineComponent* SplineComp,
+		const FMetaLandRoadDrawAnchor* HoverAnchor,
+		FMetaLandRoadLaneEditHighlight& Highlight)
+	{
+		if (!SplineComp || !HoverAnchor || !HoverAnchor->IsValid()
+			|| HoverAnchor->SourceSpline.Get() != SplineComp)
+		{
+			return;
+		}
+		if (Highlight.HoveredLaneIndex != LANE_INDEX_NONE)
+		{
+			return;
+		}
+		Highlight.HoveredSectionIndex = HoverAnchor->SectionIndex;
+		Highlight.HoveredLaneIndex = HoverAnchor->LaneIndex;
+	}
+
 	void DrawAllWorldBuilderLaneHighlights(
 		UWorld* World,
 		const FSceneView* View,
 		FViewport* Viewport,
 		FPrimitiveDrawInterface* PDI,
 		const FMetaLandRoadEditTarget& EditTarget,
-		const FMetaLandRoadDrawAnchor* EndSnapMixAnchor)
+		const FMetaLandRoadDrawAnchor* EndSnapMixAnchor,
+		const FMetaLandRoadDrawAnchor* EndSnapHoverAnchor)
 	{
 		if (!World || !View || !Viewport || !PDI || PDI->IsHitTesting())
 		{
@@ -2095,10 +2131,9 @@ namespace MetaLandRoadLaneVisualization
 				continue;
 			}
 
-			const float Score = static_cast<float>(FacePick.SectionIndex * 1000 + FMath::Abs(FacePick.LaneIndex));
-			if (Score < BestScore)
+			if (FacePick.ScreenScore < BestScore)
 			{
-				BestScore = Score;
+				BestScore = FacePick.ScreenScore;
 				BestHover = FacePick;
 				HoveredSpline = SplineComp;
 			}
@@ -2124,36 +2159,11 @@ namespace MetaLandRoadLaneVisualization
 				Highlight.HoveredSectionIndex = BestHover.SectionIndex;
 				Highlight.HoveredLaneIndex = BestHover.LaneIndex;
 			}
-
+			ApplyHoverAnchorToHighlight(SplineComp, EndSnapHoverAnchor, Highlight);
 			AppendEditTargetLanesToHighlight(SplineComp, EditTarget, Highlight);
 			AppendEndSnapMixLanesToHighlight(SplineComp, EndSnapMixAnchor, Highlight);
 			DrawLaneFaceHighlightFills(SplineComp, PDI, Highlight);
 			DrawWorldBuilderLaneBoundaryHighlights(SplineComp, PDI, Highlight);
-
-			if (EditTarget.bHasPendingAnchor && EditTarget.Spline.Get() == SplineComp)
-			{
-				FVector MouthLeft;
-				FVector MouthRight;
-				FVector MouthCenter;
-				FVector MouthTangent;
-				if (MetaLandRoadLaneEditPick::ComputeAnchorMouthRailFrame(
-					SplineComp,
-					EditTarget.PendingAnchor,
-					MouthLeft,
-					MouthRight,
-					MouthCenter,
-					MouthTangent))
-				{
-					MouthLeft.Z += SplineComp->LaneVisualizationHeightOffset;
-					MouthRight.Z += SplineComp->LaneVisualizationHeightOffset;
-					Private::DrawSegmentPDI(
-						PDI,
-						MouthLeft,
-						MouthRight,
-						FLinearColor(1.0f, 0.92f, 0.10f, 1.0f),
-						8.0f);
-				}
-			}
 		}
 	}
 
@@ -2174,10 +2184,11 @@ namespace MetaLandRoadLaneVisualization
 
 		const FLinearColor SelectColor(1.0f, 0.92f, 0.10f, 1.0f);
 		const FLinearColor EndSnapMixColor(0.25f, 0.95f, 1.0f, 1.0f);
-		const FLinearColor EndSnapHoverColor(0.35f, 0.95f, 1.0f, 1.0f);
+		const FLinearColor EndSnapHoverColor(1.0f, 0.82f, 0.12f, 1.0f);
 		// Thin per-lane bars (not full-road yellow slabs).
 		constexpr float SelectThickness = 4.5f;
 		constexpr float EndSnapMixThickness = 6.0f;
+		constexpr float EndSnapHoverThickness = 7.0f;
 
 		auto DrawMouthLine = [&View, &PDI](
 			const UMetaLandRoadSplineComponent* SplineComp,
@@ -2287,21 +2298,57 @@ namespace MetaLandRoadLaneVisualization
 				EndSnapMixThickness);
 		}
 
-		if (!bSkipEditTargetAndHover
-			&& EndSnapHoverAnchor
+		if (EndSnapHoverAnchor
 			&& EndSnapHoverAnchor->IsValid()
 			&& EndSnapHoverAnchor->SourceSpline.IsValid())
 		{
-			FMetaLandRoadDrawAnchor HoverAnchor = *EndSnapHoverAnchor;
-			HoverAnchor.AnchorS = MetaLandRoadLaneEditPick::ClampMouthAnchorSToVisibleMesh(
-				EndSnapHoverAnchor->SourceSpline.Get(),
-				HoverAnchor.AnchorS,
-				HoverAnchor.MouthSide);
-			DrawAnchorMouthsPerLane(
-				EndSnapHoverAnchor->SourceSpline.Get(),
-				HoverAnchor,
-				EndSnapHoverColor,
-				SelectThickness);
+			bool bHoverAlreadySelected = false;
+			auto MarkHoverCoveredBy = [&](const FMetaLandRoadDrawAnchor& SelectedAnchor,
+				const UMetaLandRoadSplineComponent* SelectedSpline)
+			{
+				if (bHoverAlreadySelected || !SelectedSpline
+					|| SelectedSpline != EndSnapHoverAnchor->SourceSpline.Get())
+				{
+					return;
+				}
+				TArray<int32> SelectedLanes;
+				Private::CollectAnchorBundleLaneIndices(SelectedAnchor, SelectedLanes);
+				TArray<int32> HoverLanes;
+				Private::CollectAnchorBundleLaneIndices(*EndSnapHoverAnchor, HoverLanes);
+				if (HoverLanes.Num() == 0)
+				{
+					return;
+				}
+				for (int32 HoverLane : HoverLanes)
+				{
+					if (!SelectedLanes.Contains(HoverLane))
+					{
+						return;
+					}
+				}
+				bHoverAlreadySelected = true;
+			};
+			if (EditTarget.bHasPendingAnchor)
+			{
+				MarkHoverCoveredBy(EditTarget.PendingAnchor, EditTarget.Spline.Get());
+			}
+			if (EndSnapMixAnchor && EndSnapMixAnchor->IsValid())
+			{
+				MarkHoverCoveredBy(*EndSnapMixAnchor, EndSnapMixAnchor->SourceSpline.Get());
+			}
+			if (!bHoverAlreadySelected)
+			{
+				FMetaLandRoadDrawAnchor HoverAnchor = *EndSnapHoverAnchor;
+				HoverAnchor.AnchorS = MetaLandRoadLaneEditPick::ClampMouthAnchorSToVisibleMesh(
+					EndSnapHoverAnchor->SourceSpline.Get(),
+					HoverAnchor.AnchorS,
+					HoverAnchor.MouthSide);
+				DrawAnchorMouthsPerLane(
+					EndSnapHoverAnchor->SourceSpline.Get(),
+					HoverAnchor,
+					EndSnapHoverColor,
+					EndSnapHoverThickness);
+			}
 		}
 	}
 
@@ -2392,44 +2439,45 @@ namespace MetaLandRoadLaneVisualization
 		constexpr float MinHalfWidthPx = 18.0f;
 		constexpr float ExtraMarginPx = 4.0f;
 
-		// Right face → LaneIndex > 0 (red); Left face → LaneIndex < 0 (green). Same as mesh BuildFaceSpans.
-		for (bool bLeftFace : { false, true })
+		// Per-span strips so a narrow-section lane cannot "ghost" through a wider span
+		// and steal hover / Add Width Key (SMid of a long face break was the old host).
+		for (int32 SectionIndex = 0; SectionIndex < SplineComponent->GetLaneSectionsNum(); ++SectionIndex)
 		{
-			const int32 LaneSign = bLeftFace ? -1 : +1;
-			TArray<double> Breaks;
-			Private::CollectFaceBreaks(SplineComponent, bLeftFace, Breaks);
-
-			for (int32 BreakIdx = 0; BreakIdx + 1 < Breaks.Num(); ++BreakIdx)
+			const FMetaLandRoadLaneSection& SpanSection = Layout.Sections[SectionIndex];
+			const double SpanS0 = SpanSection.SOffset;
+			const double SpanS1 = MetaLandRoad::ResolveSectionEndS(SplineComponent, SectionIndex);
+			if ((SpanS1 - SpanS0) < KINDA_SMALL_NUMBER)
 			{
-				const double DrawS0 = Breaks[BreakIdx];
-				const double DrawS1 = Breaks[BreakIdx + 1];
-				if ((DrawS1 - DrawS0) < KINDA_SMALL_NUMBER)
-				{
-					continue;
-				}
+				continue;
+			}
 
-				const double SMid = 0.5 * (DrawS0 + DrawS1);
-				const int32 LaneSectionIndex = Private::ResolveLaneSectionForFace(Layout, SMid, bLeftFace);
-				if (LaneSectionIndex == INDEX_NONE || !Layout.Sections.IsValidIndex(LaneSectionIndex))
+			for (int32 AbsLane = 1; AbsLane <= MaxLaneCount; ++AbsLane)
+			{
+				const int32 LaneIndices[2] = { AbsLane, -AbsLane };
+				for (int32 LaneIndex : LaneIndices)
 				{
-					continue;
-				}
+					if (!Private::IsLaneBoundaryValidForSpanSection(Layout, SectionIndex, LaneIndex))
+					{
+						continue;
+					}
 
-				const FMetaLandRoadLaneSection& LaneSection = Layout.Sections[LaneSectionIndex];
+					const int32 LaneSectionIndex = Private::ResolveLaneSectionIndex(Layout, SectionIndex, LaneIndex);
+					if (LaneSectionIndex == INDEX_NONE || !Layout.Sections.IsValidIndex(LaneSectionIndex))
+					{
+						continue;
+					}
 
-				for (int32 AbsLane = 1; AbsLane <= MaxLaneCount; ++AbsLane)
-				{
-					const int32 LaneIndex = LaneSign * AbsLane;
+					const FMetaLandRoadLaneSection& LaneSection = Layout.Sections[LaneSectionIndex];
 					if (!LaneSection.CheckLaneIndex(LaneIndex))
 					{
 						continue;
 					}
 
 					const FMetaLandRoadLane& Lane = LaneSection.GetLaneByIndex(LaneIndex);
-					const double LaneStartS = Lane.GetStartOffset();
-					const double LaneEndS = Lane.GetEndOffset();
-					const double ClipS0 = FMath::Max(DrawS0, LaneStartS);
-					const double ClipS1 = FMath::Min(DrawS1, LaneEndS);
+					const UMetaLandRoadSplineComponent::FMetaLandRoadLaneRange LaneRange =
+						SplineComponent->GetLaneRange(SectionIndex, LaneIndex);
+					double ClipS0 = FMath::Max3(SpanS0, LaneRange.StartS, Lane.GetStartOffset());
+					double ClipS1 = FMath::Min3(SpanS1, LaneRange.EndS, Lane.GetEndOffset());
 					if (ClipS1 <= ClipS0 + KINDA_SMALL_NUMBER)
 					{
 						continue;
@@ -2442,9 +2490,6 @@ namespace MetaLandRoadLaneVisualization
 					{
 						continue;
 					}
-
-					const int32 SpanSectionIndex = Private::FindHighlightSpanSectionIndex(
-						Layout, SplineComponent, SMid, LaneIndex);
 
 					for (int32 StepIdx = 0; StepIdx < InnerPoints.Num() - 1; ++StepIdx)
 					{
@@ -2473,8 +2518,9 @@ namespace MetaLandRoadLaneVisualization
 							&& StripScore < BestScore)
 						{
 							BestScore = StripScore;
-							OutResult.SectionIndex = SpanSectionIndex;
+							OutResult.SectionIndex = SectionIndex;
 							OutResult.LaneIndex = LaneIndex;
+							OutResult.ScreenScore = StripScore;
 							bFound = true;
 						}
 					}
@@ -2497,51 +2543,9 @@ namespace MetaLandRoadLaneVisualization
 
 		const FMetaLandRoadLayout& Layout = SplineComponent->GetRoadLayout();
 		const FLinearColor Pink(1.0f, 0.25f, 0.75f, 1.0f);
-		// Alt+E: center 4px / split 20px → lane mode display-only: 1px / 2.5px.
-		constexpr float CenterThickness = 1.0f;
+		constexpr float CenterThickness = 4.0f;
 		constexpr float SplitThickness = 2.5f;
-
-		// Only Both spans own the longitudinal center — draw once on the longest visible span
-		// (junction trim + recook can leave several Both sections clipping to the same mesh range).
-		int32 BestBothSection = INDEX_NONE;
-		double BestBothLen = -1.0;
-		for (int32 SectionIndex = 0; SectionIndex < SplineComponent->GetLaneSectionsNum(); ++SectionIndex)
-		{
-			if (SplineComponent->GetLaneSection(SectionIndex).Side != EMetaLandRoadLaneSectionSide::Both)
-			{
-				continue;
-			}
-			double StartS = SplineComponent->GetLaneSection(SectionIndex).SOffset;
-			double EndS = MetaLandRoad::ResolveSectionEndS(SplineComponent, SectionIndex);
-			if (!Private::IntersectDrawRangeWithMeshSpans(SplineComponent, StartS, EndS, StartS, EndS))
-			{
-				continue;
-			}
-			const double Len = EndS - StartS;
-			if (Len > BestBothLen)
-			{
-				BestBothLen = Len;
-				BestBothSection = SectionIndex;
-			}
-		}
-		if (BestBothSection != INDEX_NONE)
-		{
-			Private::DrawLaneModeSectionCenterLinePDI(
-				PDI,
-				SplineComponent,
-				BestBothSection,
-				Pink,
-				CenterThickness);
-		}
-		else if (SplineComponent->GetLaneSectionsNum() > 0)
-		{
-			Private::DrawLaneModeSectionCenterLinePDI(
-				PDI,
-				SplineComponent,
-				0,
-				Pink,
-				CenterThickness);
-		}
+		SplineComponent->DrawMainCenterLinePDI(PDI, Pink, CenterThickness);
 
 		Private::AppendSectionSplitLinesPDI(
 			PDI,
@@ -2580,20 +2584,12 @@ namespace MetaLandRoadLaneVisualization
 				// after Left|Right face splits / ROffset changes (Fig2 misalignment).
 				for (int32 SectionIndex = 0; SectionIndex < SplineComponent->GetLaneSectionsNum(); ++SectionIndex)
 				{
-					const FMetaLandRoadLaneSection& SpanSection = SplineComponent->GetLaneSection(SectionIndex);
-					if (LaneIndex > 0 && !MetaLandRoad::HasRightSide(SpanSection.Side))
-					{
-						continue;
-					}
-					if (LaneIndex < 0 && !MetaLandRoad::HasLeftSide(SpanSection.Side))
-					{
-						continue;
-					}
 					if (!Private::IsLaneBoundaryValidForSpanSection(Layout, SectionIndex, LaneIndex))
 					{
 						continue;
 					}
 
+					const FMetaLandRoadLaneSection& SpanSection = SplineComponent->GetLaneSection(SectionIndex);
 					const double SpanS0 = SpanSection.SOffset;
 					const double SpanS1 = MetaLandRoad::ResolveSectionEndS(SplineComponent, SectionIndex);
 					if ((SpanS1 - SpanS0) < KINDA_SMALL_NUMBER)

@@ -11,6 +11,8 @@ namespace MetaLandRoadProfile
 	/** Default longitudinal lane-section count (each covers Both sides). */
 	static constexpr int32 DefaultLongitudinalSectionCount = 2;
 
+	static void RefreshRoadActorMesh(UMetaLandRoadSplineComponent* Spline);
+
 	static FMetaLandRoadLane CreateLane(const FMetaLandRoadLaneProfile& Src)
 	{
 		FMetaLandRoadLane NewLane;
@@ -42,7 +44,7 @@ namespace MetaLandRoadProfile
 		return NewSection;
 	}
 
-	static int32 ResolveInnermostLaneIndex(const TArray<int32>& Lanes)
+	static int32 ProfileResolveInnermostLaneIndex(const TArray<int32>& Lanes)
 	{
 		if (Lanes.Num() == 0)
 		{
@@ -64,7 +66,7 @@ namespace MetaLandRoadProfile
 		return Innermost;
 	}
 
-	static int32 ResolveOutermostLaneIndex(const TArray<int32>& Lanes)
+	static int32 ProfileResolveOutermostLaneIndex(const TArray<int32>& Lanes)
 	{
 		if (Lanes.Num() == 0)
 		{
@@ -131,8 +133,8 @@ namespace MetaLandRoadProfile
 		}
 		else
 		{
-			const int32 InnermostLane = ResolveInnermostLaneIndex(LaneIndices);
-			const int32 OutermostLane = ResolveOutermostLaneIndex(LaneIndices);
+			const int32 InnermostLane = ProfileResolveInnermostLaneIndex(LaneIndices);
+			const int32 OutermostLane = ProfileResolveOutermostLaneIndex(LaneIndices);
 			if (InnermostLane == LANE_INDEX_NONE || OutermostLane == LANE_INDEX_NONE)
 			{
 				return;
@@ -217,6 +219,117 @@ namespace MetaLandRoadProfile
 		{
 			SetRoadProfile(TargetSpline, GetDefaultRoadProfile());
 		}
+
+		EnsureBothFacesOnRoad(TargetSpline);
+	}
+
+	static void HalveLaneWidth(FMetaLandRoadLane& Lane)
+	{
+		if (Lane.Width.GetNumKeys() == 0)
+		{
+			Lane.Width.SetDefaultValue(FMath::Max(Lane.Width.GetDefaultValue() * 0.5f, 8.0f));
+			return;
+		}
+
+		for (FRichCurveKey& Key : Lane.Width.Keys)
+		{
+			Key.Value = FMath::Max(Key.Value * 0.5f, 8.0f);
+		}
+		MetaLandRoad::EnsureLaneWidthCurveCubic(Lane.Width);
+	}
+
+	// =============================================================================
+	// [KEY-ALGO] EnsureBothFacesOnRoad
+	// Alt+E 细分的前提：整条路必须同时有 Left 幅和 Right 幅。
+	// 单条 / 多条都一样 —— 只拆已有宽度，不增加总宽。
+	// 调用链: EnsureDefaultRoadProfile / Alt+E·T 进模式 / TrySplitSectionSide / SplitSection
+	// =============================================================================
+	void EnsureBothFacesOnRoad(UMetaLandRoadSplineComponent* TargetSpline)
+	{
+		if (!TargetSpline || TargetSpline->GetLaneSectionsNum() == 0)
+		{
+			return;
+		}
+
+		bool bRoadHasLeft = false;
+		bool bRoadHasRight = false;
+		for (const FMetaLandRoadLaneSection& Section : TargetSpline->GetLaneSections())
+		{
+			bRoadHasLeft |= Section.Left.Num() > 0;
+			bRoadHasRight |= Section.Right.Num() > 0;
+		}
+
+		bool bChanged = false;
+		TArray<FMetaLandRoadLaneSection>& Sections = TargetSpline->GetLaneSectionsMutable();
+
+		if (bRoadHasLeft && bRoadHasRight)
+		{
+			for (FMetaLandRoadLaneSection& Section : Sections)
+			{
+				if (Section.Left.Num() > 0 && Section.Right.Num() > 0
+					&& Section.Side != EMetaLandRoadLaneSectionSide::Both)
+				{
+					Section.Side = EMetaLandRoadLaneSectionSide::Both;
+					bChanged = true;
+				}
+			}
+		}
+		else if (bRoadHasLeft && !bRoadHasRight)
+		{
+			TargetSpline->Modify();
+			for (FMetaLandRoadLaneSection& Section : Sections)
+			{
+				if (Section.Left.Num() == 0)
+				{
+					continue;
+				}
+
+				HalveLaneWidth(Section.Left[0]);
+				Section.Right.Add(Section.Left[0]);
+				Section.Side = EMetaLandRoadLaneSectionSide::Both;
+				bChanged = true;
+			}
+		}
+		else if (bRoadHasRight && !bRoadHasLeft)
+		{
+			TargetSpline->Modify();
+			for (FMetaLandRoadLaneSection& Section : Sections)
+			{
+				if (Section.Right.Num() == 0)
+				{
+					continue;
+				}
+
+				HalveLaneWidth(Section.Right[0]);
+				Section.Left.Add(Section.Right[0]);
+				Section.Side = EMetaLandRoadLaneSectionSide::Both;
+				bChanged = true;
+			}
+		}
+
+		if (!bChanged)
+		{
+			return;
+		}
+
+		bool bJunctionLocked = false;
+		if (const AMoKuEditSplineActor* RoadActor = Cast<AMoKuEditSplineActor>(TargetSpline->GetOwner()))
+		{
+			bJunctionLocked = RoadActor->StartOfJunction.IsValid()
+				|| RoadActor->EndOfJunction.IsValid()
+				|| RoadActor->JunctionTrimZones.Num() > 0;
+		}
+
+		if (!bJunctionLocked)
+		{
+			FMetaLandRoadLayout& Layout = TargetSpline->GetRoadLayoutMutable();
+			Layout.ROffset.Reset();
+			Layout.ROffset.AddKey(0.0f, 0.0f);
+		}
+
+		TargetSpline->UpdateLaneSectionBounds();
+		TargetSpline->UpdateRoadLayout();
+		RefreshRoadActorMesh(TargetSpline);
 	}
 
 	void SyncRoadLayout(UMetaLandRoadSplineComponent* TargetSpline)
@@ -669,7 +782,7 @@ namespace MetaLandRoadProfile
 		}
 
 		AMoKuEditSplineActor* RoadActor = Cast<AMoKuEditSplineActor>(TargetSpline->GetOwner());
-		if (!RoadActor || !RoadActor->GetWorld() || GIsEditorLoadingPackage)
+		if (!RoadActor || !RoadActor->GetWorld() || UE::GetIsEditorLoadingPackage())
 		{
 			return;
 		}
@@ -784,40 +897,20 @@ namespace MetaLandRoadProfile
 		return NewLane;
 	}
 
-	static int32 InsertLaneIntoSection(
+	static int32 InsertLaneOntoFace(
 		FMetaLandRoadLaneSection& Section,
-		int32 LaneIndex,
 		bool bOnLeft,
 		const FMetaLandRoadLane& NewLane)
 	{
 		EnsureSectionSideForLaneAdd(Section, bOnLeft);
-
-		if (LaneIndex == LANE_INDEX_NONE)
+		if (bOnLeft)
 		{
-			if (bOnLeft)
-			{
-				Section.Left.Insert(NewLane, 0);
-				return Section.Left.Num() > 0 ? -Section.Left.Num() : -1;
-			}
-			Section.Right.Insert(NewLane, 0);
-			return Section.Right.Num();
+			Section.Left.Add(NewLane);
+			return -Section.Left.Num();
 		}
 
-		if (LaneIndex > 0)
-		{
-			Section.Right.Insert(NewLane, LaneIndex - 1 + (bOnLeft ? 0 : 1));
-			return LaneIndex + (bOnLeft ? 0 : 1);
-		}
-
-		Section.Left.Insert(NewLane, -LaneIndex - 1 + (bOnLeft ? 1 : 0));
-		return LaneIndex - (bOnLeft ? 1 : 0);
-	}
-
-	static bool SectionShouldReceiveLaneAdd(const FMetaLandRoadLaneSection& Section)
-	{
-		return Section.Left.Num() > 0
-			|| Section.Right.Num() > 0
-			|| Section.Side == EMetaLandRoadLaneSectionSide::Both;
+		Section.Right.Add(NewLane);
+		return Section.Right.Num();
 	}
 
 	FMetaLandRoadAddLaneResult AddLaneToRoadLayout(
@@ -832,71 +925,32 @@ namespace MetaLandRoadProfile
 			return Result;
 		}
 
-		const int32 ReferenceSectionIndex = ResolveLaneMutationSectionIndex(
-			TargetSpline, SpanSectionIndex, LaneIndex, bOnLeft);
-		if (!TargetSpline->GetLaneSections().IsValidIndex(ReferenceSectionIndex))
-		{
-			return Result;
-		}
-
-		const FMetaLandRoadLaneSection& ReferenceSection = TargetSpline->GetLaneSection(ReferenceSectionIndex);
-		int32 ReferenceLaneIndex = LaneIndex;
-		if (ReferenceLaneIndex != LANE_INDEX_NONE && !ReferenceSection.CheckLaneIndex(ReferenceLaneIndex))
-		{
-			ReferenceLaneIndex = LANE_INDEX_NONE;
-		}
-
-		const FMetaLandRoadLane NewLaneTemplate = MakeNewLaneFromSelection(ReferenceSection, ReferenceLaneIndex);
-		const double NewLaneWidthCm = NewLaneTemplate.Width.GetDefaultValue();
-
-		const bool bReferenceOuterAdd = (ReferenceLaneIndex == LANE_INDEX_NONE)
-			|| (bOnLeft && ReferenceLaneIndex < 0
-				&& FMath::Abs(ReferenceLaneIndex) == ReferenceSection.Left.Num())
-			|| (!bOnLeft && ReferenceLaneIndex > 0
-				&& ReferenceLaneIndex == ReferenceSection.Right.Num());
-
-		const bool bFirstOppositeSideAdd = !bOnLeft
-			&& ReferenceSection.Right.Num() == 0
-			&& ReferenceSection.Left.Num() > 0;
-		const bool bFirstLeftOnRightOnly = bOnLeft
-			&& ReferenceSection.Left.Num() == 0
-			&& ReferenceSection.Right.Num() > 0;
-
 		TArray<FMetaLandRoadLaneSection>& Sections = TargetSpline->GetLaneSectionsMutable();
-		int32 SectionsUpdated = 0;
-		for (int32 SectionIndex = 0; SectionIndex < Sections.Num(); ++SectionIndex)
+		FMetaLandRoadLaneSection& TargetSection = Sections[SpanSectionIndex];
+
+		int32 TemplateSectionIndex = SpanSectionIndex;
+		int32 TemplateLaneIndex = LaneIndex;
+		if (TemplateLaneIndex == LANE_INDEX_NONE || !TargetSection.CheckLaneIndex(TemplateLaneIndex))
 		{
-			FMetaLandRoadLaneSection& Section = Sections[SectionIndex];
-			if (!SectionShouldReceiveLaneAdd(Section))
+			const int32 Resolved = MetaLandRoadLaneVisualization::ResolveLaneSectionIndexForSpan(
+				TargetSpline, SpanSectionIndex, LaneIndex);
+			if (Resolved != INDEX_NONE
+				&& Sections.IsValidIndex(Resolved)
+				&& Sections[Resolved].CheckLaneIndex(LaneIndex))
 			{
-				continue;
+				TemplateSectionIndex = Resolved;
+				TemplateLaneIndex = LaneIndex;
 			}
-
-			int32 EffectiveLaneIndex = ReferenceLaneIndex;
-			if (EffectiveLaneIndex != LANE_INDEX_NONE && !Section.CheckLaneIndex(EffectiveLaneIndex))
+			else
 			{
-				EffectiveLaneIndex = LANE_INDEX_NONE;
-			}
-
-			const int32 NewLaneIndexOnSection = InsertLaneIntoSection(
-				Section,
-				EffectiveLaneIndex,
-				bOnLeft,
-				NewLaneTemplate);
-
-			++SectionsUpdated;
-			if (SectionIndex == ReferenceSectionIndex)
-			{
-				Result.NewSelectedLaneIndex = NewLaneIndexOnSection;
+				TemplateLaneIndex = LANE_INDEX_NONE;
 			}
 		}
 
-		if (bReferenceOuterAdd || bFirstOppositeSideAdd || bFirstLeftOnRightOnly)
-		{
-			ShiftROffsetForOuterLaneAdd(TargetSpline, bOnLeft, NewLaneWidthCm);
-		}
-
-		Result.bSuccess = SectionsUpdated > 0;
+		const FMetaLandRoadLane NewLaneTemplate = MakeNewLaneFromSelection(
+			Sections[TemplateSectionIndex], TemplateLaneIndex);
+		Result.NewSelectedLaneIndex = InsertLaneOntoFace(TargetSection, bOnLeft, NewLaneTemplate);
+		Result.bSuccess = true;
 		return Result;
 	}
 }

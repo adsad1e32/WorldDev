@@ -83,6 +83,7 @@ struct FMetaLandRoadLaneFacePickResult
 {
 	int32 SectionIndex = INDEX_NONE;
 	int32 LaneIndex = LANE_INDEX_NONE;
+	float ScreenScore = TNumericLimits<float>::Max();
 
 	bool IsValid() const
 	{
@@ -116,16 +117,17 @@ namespace MetaLandRoadLaneVisualization
 		FPrimitiveDrawInterface* PDI,
 		const FMetaLandRoadLaneEditHighlight& Highlight);
 
-	/** World Builder: mouth bars + lane-face fills for hover/selection (Shift bundle). */
+	/** World Builder: lane-face fills for hover + Shift bundle (all selected lanes). */
 	METALANDROAD_API void DrawAllWorldBuilderLaneHighlights(
 		UWorld* World,
 		const FSceneView* View,
 		FViewport* Viewport,
 		FPrimitiveDrawInterface* PDI,
 		const FMetaLandRoadEditTarget& EditTarget,
-		const FMetaLandRoadDrawAnchor* EndSnapMixAnchor = nullptr);
+		const FMetaLandRoadDrawAnchor* EndSnapMixAnchor = nullptr,
+		const FMetaLandRoadDrawAnchor* EndSnapHoverAnchor = nullptr);
 
-	/** World Builder: mouth cross-section lines for EditTarget (yellow); optional EndSnap hover (green). */
+	/** World Builder: mouth bars for EditTarget (yellow) and EndSnap mix/hover (cyan). */
 	METALANDROAD_API void DrawWorldBuilderMouthCrossSections(
 		UWorld* World,
 		const FSceneView* View,

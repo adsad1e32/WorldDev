@@ -288,6 +288,9 @@ public:
 	/** Prevents UpdateRoadLayout -> RefreshDynamicRoadMesh re-entry. */
 	bool bIsRefreshingRoadMesh = false;
 
+	/** Gizmo drag: skip mesh rebuild until mouse-up. */
+	bool bDeferRoadMeshRefresh = false;
+
 	UPROPERTY()
 	TArray<TObjectPtr<UStaticMeshComponent>> LocalMeshComponents;
 	UPROPERTY()

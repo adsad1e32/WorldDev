@@ -14,14 +14,10 @@ static FVector RaiseNativeEditPoint(const UMetaLandRoadSplineComponent* RoadSpli
 	return Raised;
 }
 
-static void GetNativeEditRingAxes(
-	const UMetaLandRoadSplineComponent* RoadSpline,
-	int32 KeyIdx,
-	FVector& OutAxisX,
-	FVector& OutAxisY)
+static void GetNativeEditRingGroundAxes(FVector& OutAxisX, FVector& OutAxisY)
 {
-	OutAxisX = RoadSpline->GetRightVectorAtSplinePoint(KeyIdx, ESplineCoordinateSpace::World).GetSafeNormal();
-	OutAxisY = RoadSpline->GetDirectionAtSplinePoint(KeyIdx, ESplineCoordinateSpace::World).GetSafeNormal();
+	OutAxisX = FVector(1.0f, 0.0f, 0.0f);
+	OutAxisY = FVector(0.0f, 1.0f, 0.0f);
 }
 
 static void DrawNativeEditControlPointRingPDI(
@@ -92,13 +88,13 @@ float MetaLandRoadNativeEditVisualization::GetNativeEditRingWorldRadius(
 {
 	if (!View || DesiredPixelRadius <= 0.0f)
 	{
-		return 18.0f;
+		return 60.0f;
 	}
 
 	FVector2D CenterPx;
 	if (!View->WorldToPixel(CenterWorld, CenterPx))
 	{
-		return 18.0f;
+		return 60.0f;
 	}
 
 	const float ProbeCm = 10.0f;
@@ -110,7 +106,9 @@ float MetaLandRoadNativeEditVisualization::GetNativeEditRingWorldRadius(
 	const float PixelsPerCmY = View->WorldToPixel(CenterWorld + AxisY * ProbeCm, ProbePx)
 		? FVector2D::Distance(CenterPx, ProbePx) / ProbeCm : 0.0f;
 	const float PixelsPerCm = FMath::Max(FMath::Max(PixelsPerCmX, PixelsPerCmY), KINDA_SMALL_NUMBER);
-	return DesiredPixelRadius / PixelsPerCm;
+	constexpr float MinWorldRadiusCm = 48.0f;
+	constexpr float MaxWorldRadiusCm = 144.0f;
+	return FMath::Clamp(DesiredPixelRadius / PixelsPerCm, MinWorldRadiusCm, MaxWorldRadiusCm);
 }
 
 int32 MetaLandRoadNativeEditVisualization::PickHoveredControlPointKey(
@@ -128,7 +126,10 @@ int32 MetaLandRoadNativeEditVisualization::PickHoveredControlPointKey(
 	float BestDistSq = TNumericLimits<float>::Max();
 	int32 BestKey = INDEX_NONE;
 	const FVector2D Mouse(static_cast<float>(MousePos.X), static_cast<float>(MousePos.Y));
-	const float HoverPixelRadius = FMath::Max(DesiredHoverPixelRadius, NativeEditKeyPickRadiusPx * 0.75f);
+	const float MinPixelRadius = FMath::Max(DesiredHoverPixelRadius, NativeEditKeyPickRadiusPx);
+	FVector RingAxisX = FVector::ZeroVector;
+	FVector RingAxisY = FVector::ZeroVector;
+	GetNativeEditRingGroundAxes(RingAxisX, RingAxisY);
 
 	for (int32 KeyIdx = 0; KeyIdx < NumPoints; ++KeyIdx)
 	{
@@ -140,6 +141,16 @@ int32 MetaLandRoadNativeEditVisualization::PickHoveredControlPointKey(
 		{
 			continue;
 		}
+
+		const float DesiredPx = 24.0f * NativeEditRingDisplayScale;
+		const float WorldRadius = GetNativeEditRingWorldRadius(
+			View, KeyWorld, RingAxisX, RingAxisY, DesiredPx);
+		FVector2D EdgePx;
+		const float RingPixelRadius = View->WorldToPixel(KeyWorld + RingAxisX * WorldRadius, EdgePx)
+			? FVector2D::Distance(Pixel, EdgePx)
+			: DesiredPx;
+		const float HoverPixelRadius = FMath::Max(MinPixelRadius, RingPixelRadius + 8.0f);
+
 		const float DistSq = FVector2D::DistSquared(Mouse, Pixel);
 		if (DistSq <= HoverPixelRadius * HoverPixelRadius && DistSq < BestDistSq)
 		{
@@ -175,15 +186,20 @@ int32 MetaLandRoadNativeEditVisualization::PickHoveredSplineSegment(
 
 	for (int32 SegIdx = 0; SegIdx < NumSegments; ++SegIdx)
 	{
+		const int32 I1 = SegIdx + 1;
+		const float Key0 = RoadSpline->GetSplinePointInputKey(SegIdx);
+		const float Key1 = RoadSpline->GetSplinePointInputKey(I1);
 		FVector PrevPos = RaiseNativeEditPoint(
 			RoadSpline,
-			RoadSpline->GetLocationAtSplineInputKey(static_cast<float>(SegIdx), ESplineCoordinateSpace::World));
+			RoadSpline->GetLocationAtSplinePoint(SegIdx, ESplineCoordinateSpace::World));
 		for (int32 Step = 1; Step <= NumSubdivisions; ++Step)
 		{
-			const float Key = static_cast<float>(SegIdx) + static_cast<float>(Step) / static_cast<float>(NumSubdivisions);
-			FVector CurPos = RaiseNativeEditPoint(
-				RoadSpline,
-				RoadSpline->GetLocationAtSplineInputKey(Key, ESplineCoordinateSpace::World));
+			const float Alpha = static_cast<float>(Step) / static_cast<float>(NumSubdivisions);
+			const FVector WorldPos = (Step == NumSubdivisions)
+				? RoadSpline->GetLocationAtSplinePoint(I1, ESplineCoordinateSpace::World)
+				: RoadSpline->GetLocationAtSplineInputKey(
+					FMath::Lerp(Key0, Key1, Alpha), ESplineCoordinateSpace::World);
+			FVector CurPos = RaiseNativeEditPoint(RoadSpline, WorldPos);
 
 			FVector2D ScreenA;
 			FVector2D ScreenB;
@@ -230,37 +246,48 @@ void MetaLandRoadNativeEditVisualization::DrawNativeEditSplineOverlay(
 	const FLinearColor Yellow = FLinearColor::Yellow;
 	const float NormalThickness = 4.0f;
 	const float HighlightThickness = 6.0f;
-	constexpr int32 NumSteps = 16;
+	// Center line highlights only on hover, so RMB Add Point has a clear target.
+	const bool bHighlightMain = HoveredSegment != INDEX_NONE;
+	(void)HoveredKey;
+	(void)SelectedKeys;
+	(void)SelectedSegment;
+	if (!PDI->IsHitTesting())
+	{
+		RoadSpline->DrawMainCenterLinePDI(
+			PDI,
+			bHighlightMain ? Yellow : Pink,
+			bHighlightMain ? HighlightThickness : NormalThickness);
+	}
 
 	for (int32 SegIdx = 0; SegIdx < NumSegments; ++SegIdx)
 	{
-		const bool bSegHovered = HoveredKey == INDEX_NONE && HoveredSegment == SegIdx;
-		const bool bSegSelected = SelectedSegment == SegIdx;
-		const bool bHighlight = bSegHovered || bSegSelected;
-		const FLinearColor SegColor = bHighlight ? Yellow : Pink;
-		const float SegThickness = bHighlight ? HighlightThickness : NormalThickness;
-
-		if (PDI->IsHitTesting())
+		if (!PDI->IsHitTesting())
 		{
-			PDI->SetHitProxy(new HMetaLandRoadSplineSegmentVisProxy(MutableSpline, SegIdx, HPP_Foreground));
+			continue;
 		}
 
-		FVector OldPos = RoadSpline->GetLocationAtSplineInputKey(static_cast<float>(SegIdx), ESplineCoordinateSpace::World);
-		for (int32 StepIdx = 1; StepIdx <= NumSteps; ++StepIdx)
+		PDI->SetHitProxy(new HMetaLandRoadSplineSegmentVisProxy(MutableSpline, SegIdx, HPP_Foreground));
+		const int32 I1 = SegIdx + 1;
+		const float Key0 = RoadSpline->GetSplinePointInputKey(SegIdx);
+		const float Key1 = RoadSpline->GetSplinePointInputKey(I1);
+		const FVector Raise(0.0f, 0.0f, RoadSpline->GetMainCenterLineHeightOffset());
+		FVector OldPos = RoadSpline->GetLocationAtSplinePoint(SegIdx, ESplineCoordinateSpace::World) + Raise;
+		constexpr int32 HitSteps = 16;
+		for (int32 StepIdx = 1; StepIdx <= HitSteps; ++StepIdx)
 		{
-			const float Key = static_cast<float>(SegIdx) + static_cast<float>(StepIdx) / static_cast<float>(NumSteps);
-			const FVector NewPos = RoadSpline->GetLocationAtSplineInputKey(Key, ESplineCoordinateSpace::World);
-			PDI->DrawLine(OldPos, NewPos, SegColor, SDPG_Foreground, SegThickness, 0.0f, true);
+			const float Alpha = static_cast<float>(StepIdx) / static_cast<float>(HitSteps);
+			const FVector NewPos = ((StepIdx == HitSteps)
+				? RoadSpline->GetLocationAtSplinePoint(I1, ESplineCoordinateSpace::World)
+				: RoadSpline->GetLocationAtSplineInputKey(
+					FMath::Lerp(Key0, Key1, Alpha), ESplineCoordinateSpace::World))
+				+ Raise;
+			PDI->DrawLine(OldPos, NewPos, FLinearColor::White, SDPG_Foreground, 48.0f, 0.0f, true);
 			OldPos = NewPos;
 		}
-
-		if (PDI->IsHitTesting())
-		{
-			PDI->SetHitProxy(nullptr);
-		}
+		PDI->SetHitProxy(nullptr);
 	}
 
-	const float KeyHitSize = 36.0f + GetDefault<ULevelEditorViewportSettings>()->SelectedSplinePointSizeAdjustment;
+	const float KeyHitSize = 72.0f + GetDefault<ULevelEditorViewportSettings>()->SelectedSplinePointSizeAdjustment;
 	for (int32 KeyIdx = 0; KeyIdx < NumPoints; ++KeyIdx)
 	{
 		const FVector KeyPos = RaiseNativeEditPoint(
@@ -299,14 +326,15 @@ void MetaLandRoadNativeEditVisualization::DrawNativeEditRingOverlay(
 			RoadSpline,
 			RoadSpline->GetLocationAtSplinePoint(KeyIdx, ESplineCoordinateSpace::World));
 
-		FVector RingAxisX = FVector::ForwardVector;
-		FVector RingAxisY = FVector::RightVector;
-		GetNativeEditRingAxes(RoadSpline, KeyIdx, RingAxisX, RingAxisY);
+		FVector RingAxisX = FVector::RightVector;
+		FVector RingAxisY = FVector::ForwardVector;
+		GetNativeEditRingGroundAxes(RingAxisX, RingAxisY);
 
-		const float DesiredPx = bSelected ? 24.0f : (bHovered ? 22.0f : 18.0f);
+		const float DesiredPx = (bSelected ? 32.0f : (bHovered ? 28.0f : 24.0f))
+			* NativeEditRingDisplayScale;
 		const float RingRadius = View
 			? GetNativeEditRingWorldRadius(View, KeyPos, RingAxisX, RingAxisY, DesiredPx)
-			: 24.0f;
+			: 60.0f;
 		DrawNativeEditControlPointRingPDI(PDI, KeyPos, RingAxisX, RingAxisY, RingRadius, bSelected, bHovered);
 	}
 }
@@ -385,14 +413,15 @@ void MetaLandRoadNativeEditVisualization::DrawLaneWidthKeyRingOverlay(
 			LaneSectionIndex, LaneIndex, KeyS, 1.0, ESplineCoordinateSpace::World);
 		KeyPos.Z += RoadSpline->LaneVisualizationHeightOffset;
 
-		const float InputKey = RoadSpline->GetInputKeyValueAtDistanceAlongSpline(KeyS);
-		const FVector RingAxisX = RoadSpline->GetRightVectorAtSplineInputKey(InputKey, ESplineCoordinateSpace::World).GetSafeNormal();
-		const FVector RingAxisY = RoadSpline->GetDirectionAtSplineInputKey(InputKey, ESplineCoordinateSpace::World).GetSafeNormal();
+		FVector RingAxisX = FVector::RightVector;
+		FVector RingAxisY = FVector::ForwardVector;
+		GetNativeEditRingGroundAxes(RingAxisX, RingAxisY);
 
-		const float DesiredPx = bSelected ? 24.0f : (bHovered ? 22.0f : 18.0f);
+		const float DesiredPx = (bSelected ? 32.0f : (bHovered ? 28.0f : 24.0f))
+			* NativeEditRingDisplayScale;
 		const float RingRadius = View
 			? GetNativeEditRingWorldRadius(View, KeyPos, RingAxisX, RingAxisY, DesiredPx)
-			: 12.0f;
+			: 60.0f;
 
 		DrawNativeEditControlPointRingPDI(PDI, KeyPos, RingAxisX, RingAxisY, RingRadius, bSelected, bHovered);
 	};

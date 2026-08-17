@@ -13,8 +13,11 @@ namespace MetaLandRoad
 {
 	constexpr double DefaultRoadLaneWidth = 512.0;
 
-	/** World-cm per asphalt UV tile (T_Asphalt_D). Continuous along/across spline — not MetaRoad lane-mark UVs. */
-	constexpr float DefaultAsphaltUvTileCm = 400.0f;
+	/**
+	 * World-cm per asphalt UV tile (T_Asphalt_D). Continuous along/across spline — not MetaRoad lane-mark UVs.
+	 * Was 400 (repeats every 4m → barcode stripes on thin road edges); 1500 ≈ 15m per tile.
+	 */
+	constexpr float DefaultAsphaltUvTileCm = 1500.0f;
 
 	/**
 	 * MetaRoad mesh subdivision (UMetaRoadSettings defaults):

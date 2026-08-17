@@ -443,6 +443,11 @@ void FMetaLandRoadLaneSection::Trim(bool bFitWidth)
 	}
 }
 
+// =============================================================================
+// [KEY-ALGO] EvalLaneROffset
+// LaneIndex<0 = 左幅（负 R），>0 = 右幅（正 R）。Alpha 0=内侧(中线) 1=外侧。
+// 左右 section 的世界位置都从这里算，对不齐先查这里和 ROffset。
+// =============================================================================
 double FMetaLandRoadLaneSection::EvalLaneROffset(int LaneIndex, double InSOffset, double Alpha) const
 {
 	const TArray<FMetaLandRoadLane>* LanesInfo = nullptr;
@@ -743,14 +748,21 @@ void FMetaLandRoadLayout::UpdateBounds(double SplineLength)
 			StartWidth,
 			static_cast<float>(MetaLandRoad::DefaultRoadLaneWidth));
 
-		if (Lane.Width.GetNumKeys() == 1 || StartWidth <= KINDA_SMALL_NUMBER || EndWidth < FallbackWidth * 0.25f)
+		if (Lane.Width.GetNumKeys() == 1 || StartWidth <= KINDA_SMALL_NUMBER)
 		{
 			ResetToConstant(FallbackWidth);
+			return;
 		}
-		else
+		// Only wipe a collapsed cubic (end ≈ 0). N→1 tapers (2→1 ≈ 50%/lane) must stay.
+		if (EndWidth < 8.0f && EndWidth < FallbackWidth * 0.05f)
 		{
-			MetaLandRoad::EnsureLaneWidthCurveCubic(Lane.Width);
+			ResetToConstant(FallbackWidth);
+			return;
 		}
+
+		// Width keys stay cubic so Add/drag Width Key keeps a smooth boundary
+		// (Linear here made every corner a polyline after UpdateRoadLayout).
+		MetaLandRoad::EnsureLaneWidthCurveCubic(Lane.Width);
 	};
 
 	for (FMetaLandRoadLaneSection& Section : Sections)
@@ -830,6 +842,11 @@ double FMetaLandRoadLayout::EvalROffset(double S) const
 	return ROffset.Eval(S);
 }
 
+// =============================================================================
+// [KEY-ALGO] FindSideSection
+// 从 SpanSection 往回找真正拥有 Left 或 Right 车道数组的 section。
+// Add Left/Right Section、口条、显示线都靠它取对面幅；找不到就对不齐。
+// =============================================================================
 int FMetaLandRoadLayout::FindSideSection(int SectionIndex, EMetaLandRoadLaneSectionSide Side) const
 {
 	if (Sections.Num() == 0)

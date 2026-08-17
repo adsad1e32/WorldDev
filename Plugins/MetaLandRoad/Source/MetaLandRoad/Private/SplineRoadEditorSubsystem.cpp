@@ -23,8 +23,19 @@ void USplineRoadEditorSubsystem::Initialize(FSubsystemCollectionBase& Collection
 {
 	Super::Initialize(Collection);
 
+	static const FSoftObjectPath OfficialMPCPath(TEXT("/Landmass/Landscape/BlueprintBrushes/MPC/MPC_Landscape.MPC_Landscape"));
+	static const FSoftObjectPath LocalMPCPath(TEXT("/MetaLandRoad/Landscape/BlueprintBrushes/MPC/MPC_Landscape.MPC_Landscape"));
 
-	LandscapeMaterialParameterCollection = GetDefault<UWorldEditorSettings>()->LandscapeMaterialParameterCollection.LoadSynchronous();
+	// Official Landmass MPC first — local MetaLandRoad MPC may still be a broken TestMode fork.
+	LandscapeMaterialParameterCollection = Cast<UMaterialParameterCollection>(OfficialMPCPath.TryLoad());
+	if (LandscapeMaterialParameterCollection == nullptr)
+	{
+		LandscapeMaterialParameterCollection = Cast<UMaterialParameterCollection>(LocalMPCPath.TryLoad());
+	}
+	if (LandscapeMaterialParameterCollection == nullptr)
+	{
+		LandscapeMaterialParameterCollection = GetDefault<UWorldEditorSettings>()->LandscapeMaterialParameterCollection.LoadSynchronous();
+	}
 
 	//IWaterModuleInterface& WaterModule = FModuleManager::GetModuleChecked<IWaterModuleInterface>("Water");
 	//WaterModule.SetWaterEditorServices(this);

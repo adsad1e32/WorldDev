@@ -71,10 +71,7 @@ public:
 	void SetLaneFacePrimSelected(bool bInSelected) { bLaneFacePrimSelected = bInSelected; }
 
 	/** Boundary / width-key context — enables Width items in Alt+T RMB menu. */
-	bool HasLaneWidthMenuContext() const
-	{
-		return bLaneWidthMenuContext || GetStateVerified() >= EMetaLandRoadSectionSelectionState::Key;
-	}
+	bool HasLaneWidthMenuContext() const;
 	void SetLaneWidthMenuContext(bool bInContext) { bLaneWidthMenuContext = bInContext; }
 
 	const FComponentPropertyPath GetSplinePropertyPath() const;
@@ -201,6 +198,8 @@ public:
 	mutable bool CachedLaneHoveredWidthIsKey = false;
 	mutable bool CachedLaneHoveredBoundaryLine = false;
 	mutable int32 CachedLaneHoveredSectionBoundaryIndex = INDEX_NONE;
+	/** Spline input key at the current Alt+T hover (mouse S on that span). */
+	mutable float CachedLaneHoveredSplineKey = -1.0f;
 
 	/**
 	 * Section-line mode is owned by FMetaLandRoadModule (Alt+E).
@@ -214,12 +213,18 @@ public:
 	static void StopEditorViewportTick();
 
 	void SetActiveForSpline(UMetaLandRoadSplineComponent* SplineComp);
+	bool EnsureLaneEditMenuSelection();
+	bool CanAddLaneInCurrentMode() const;
+	bool CanDeleteLaneInCurrentMode() const;
 
 	void SyncEngineSelectionStateForSpline(const UMetaLandRoadSplineComponent* SplineComp);
 
 	void ClearNativeKeySelection();
+	void SelectNativeEditKey(int32 KeyIndex, FEditorViewportClient* ViewportClient = nullptr);
+	bool TryHandleNativeEditMousePress(FEditorViewportClient* ViewportClient, FViewport* Viewport);
 
 	static void EnsureNativeEditTranslateWidget(FEditorViewportClient* ViewportClient = nullptr);
+	bool HasSelectedLaneWidthKey() const;
 
 	/** Alt+E: true when main center line or selected lane strips allow Add Section. */
 	bool HasMainLineSectionMenuContext() const;
@@ -282,6 +287,8 @@ public:
 
 	/** Move selected/dragged section boundary to world point projected onto the center spline. */
 	bool ApplySectionBoundaryWorldDrag(int32 SectionIndex, const FVector& WorldPoint);
+	/** After a section-boundary drag: layout + mesh (not per mouse tick). */
+	void FinishSectionBoundaryDrag();
 
 	/**
 	 * Main split entry point (set breakpoint here for menu/console/debug).
@@ -293,7 +300,8 @@ public:
 	static FString GetReferencerNameStatic();
 
 protected:
-	virtual void GenerateContextMenuSections(FMenuBuilder& InMenuBuilder) const;
+	virtual void GenerateContextMenuSections(FMenuBuilder& InMenuBuilder) const override;
+	void AppendMetaLandRoadCurveMenu(FMenuBuilder& MenuBuilder) const;
 	const UMetaLandRoadSplineComponent* UpdateSelectedComponentAndSectionAndLane(HComponentVisProxy* VisProxy);
 	bool VisProxyHandleNativeEditClick(FEditorViewportClient* InViewportClient, HComponentVisProxy* VisProxy, const FViewportClick& Click);
 	bool VisProxyHandleEngineSplineEditClick(FEditorViewportClient* InViewportClient, HComponentVisProxy* VisProxy, const FViewportClick& Click);
@@ -303,16 +311,24 @@ protected:
 		HComponentVisProxy* VisProxy,
 		FEditorViewportClient* InViewportClient,
 		const USplineComponent* SplineComp);
-	bool TryHandleNativeEditMousePress(FEditorViewportClient* ViewportClient, FViewport* Viewport);
 	void RefreshRoadMeshForSpline(UMetaLandRoadSplineComponent* SplineComp) const;
 	void RefreshRoadMeshAndRedraw(UMetaLandRoadSplineComponent* SplineComp, bool bForceRedraw = true) const;
 	void EnsureDefaultProfileIfNeeded(UMetaLandRoadSplineComponent* SplineComp) const;
 	void OnSplitSectionSide(EMetaLandRoadLaneSectionSide Side);
 	void OnDeleteSection();
+	void OnDeleteSectionSide(EMetaLandRoadLaneSectionSide Side);
+	bool CanDeleteSectionSide(EMetaLandRoadLaneSectionSide Side) const;
 	void OnAddLane(bool bLeft);
 	void OnDeleteLane();
 	void OnAddWidthKey();
 	void OnDeleteWidthKey();
+	/** Fill segment + click position for add-point. Does not select a key. */
+	bool EnsureKeySelectionForSegmentSplit();
+	void OnSafeAddKeyToSegment();
+	bool CanAddSplinePointOnCurve() const;
+	USplineComponent* ResolveSplineForAddPoint() const;
+	/** Insert on the existing cubic (De Casteljau) so lane-extend Bezier shape is kept. */
+	bool TryInsertSplinePointPreservingCurve();
 
 	void OnSetRoadSplinePointType(EMetaLandRoadSplinePointType Mode);
 	bool IsRoadSplinePointTypeSet(EMetaLandRoadSplinePointType Mode) const;

@@ -47,6 +47,12 @@ namespace MetaLandRoadProfile
 	/** Apply default lanes when the spline has no sections yet. */
 	METALANDROAD_API void EnsureDefaultRoadProfile(UMetaLandRoadSplineComponent* TargetSpline);
 
+	/**
+	 * [KEY-ALGO] Auto-write Left + Right faces on every road (1 lane or N lanes).
+	 * Total width is preserved (split existing width). Required before Add Left/Right Section.
+	 */
+	METALANDROAD_API void EnsureBothFacesOnRoad(UMetaLandRoadSplineComponent* TargetSpline);
+
 	/** Refresh layout bounds after spline edits. */
 	METALANDROAD_API void SyncRoadLayout(UMetaLandRoadSplineComponent* TargetSpline);
 
@@ -92,7 +98,7 @@ namespace MetaLandRoadProfile
 	/** Re-cut + rebuild cover for junction hubs linked to this road only (not full-world scan). */
 	METALANDROAD_API void RecookLocalJunctionsForSpline(UMetaLandRoadSplineComponent* TargetSpline);
 
-	/** Add lane on left/right; promotes Left/Right-only sections to Both and syncs all longitudinal sections. */
+	/** Add one left/right lane on the selected span section only (not the whole road). */
 	struct FMetaLandRoadAddLaneResult
 	{
 		bool bSuccess = false;

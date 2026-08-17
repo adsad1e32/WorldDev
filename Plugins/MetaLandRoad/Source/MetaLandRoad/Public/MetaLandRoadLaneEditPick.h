@@ -25,7 +25,7 @@ namespace MetaLandRoadLaneEditPick
 	inline constexpr int32 LaneWidthSegmentHoverRadiusPx = 2;
 	inline constexpr int32 LaneFaceClickRadiusPx = 10;
 	inline constexpr int32 LaneWidthSegmentClickRadiusPx = 4;
-	inline constexpr int32 LaneBoundarySegmentHoverRadiusPx = 2;
+	inline constexpr int32 LaneBoundarySegmentHoverRadiusPx = 18;
 	inline constexpr int32 SectionBoundaryHoverRadiusPx = 22;
 
 	METALANDROAD_API bool ShouldDeferInputToTranslateWidget(

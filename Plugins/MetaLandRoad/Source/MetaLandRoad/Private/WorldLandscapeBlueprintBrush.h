@@ -7,6 +7,7 @@
 
 class ALandscape;
 class AMoKuEditBaseActor;
+class AWorldSceneManagement;
 
 UCLASS(Blueprintable, Abstract, hidecategories = (Collision, Replication, Input, LOD, Actor, Cooking, Rendering))
 class AWorldLandscapeBlueprintBrush : public ALandscapeBlueprintBrush
@@ -28,6 +29,22 @@ public:
     virtual void PostRegisterAllComponents() override;
     void SetTargetLandscape(ALandscape* InTargetLandscape);
 
+    /**
+     * Ensures a WorldSceneManagement brush + edit layer "WorldEditor" exist on the landscape.
+     * Spawns a new manager when another landscape already owns the only existing one.
+     */
+    static AWorldSceneManagement* EnsureWorldEditorManagerForLandscape(ALandscape* Landscape);
+
+    /** Picks landscapes under/near the road actor and ensures WorldEditor on each. */
+    static AWorldSceneManagement* EnsureWorldEditorManagerForRoadActor(AActor* RoadActor);
+    /** Drop a deleted road/junction from the brush list and rebuild landscape once. */
+    void HandleRoadActorRemoved(AActor* Actor);
+
+    /** Removes stale null (None) brush slots left by duplicate AddBrushToLayer calls. */
+    static int32 CompactNullBlueprintBrushesOnEditLayer(ALandscape* Landscape, FName LayerName = FName(TEXT("WorldEditor")));
+
+    UFUNCTION(CallInEditor, Category = "MetaLandRoad|Debug", meta = (DisplayName = "Compact Stale Landscape Brushes"))
+    void DebugCompactStaleLandscapeBrushes();
 
     const TArray<TWeakInterfacePtr<IRoadBrushActorInterface>>& GetActorsAffectingLandscape() const { return ActorsAffectingLandscape; }
 
@@ -71,11 +88,13 @@ private:
     void OnLevelActorAdded(AActor* InActor);
     void OnLevelActorRemoved(AActor* InActor);
     void RegisterDelegates();
-    void UpdateActors(bool bTriggerEvents = true);
-    void UpdateAffectedWeightmaps();
     void ClearActors();
     bool IsActorAffectingLandscape(AActor* Actor) const;
     void OnRoadBrushActorChanged(const IRoadBrushActorInterface::FRoadBrushActorChangedEventParams& InParams);
+
+protected:
+    void UpdateActors(bool bTriggerEvents = true);
+    void UpdateAffectedWeightmaps();
 
 
 

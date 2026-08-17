@@ -6,6 +6,8 @@
 #include "MetaLandRoadTypes.h"
 #include "MetaLandRoadSplineComponent.generated.h"
 
+class FPrimitiveDrawInterface;
+
 namespace UE::Geometry
 {
 	class FDynamicMesh3;
@@ -39,6 +41,10 @@ public:
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Road, meta = (DisplayName = "Lane Viz Height Offset (cm)"))
 	float LaneVisualizationHeightOffset = 15.0f;
+
+	/** World cm per asphalt UV tile along/across the road. Larger = less repetition on top and thin side edges. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Road, meta = (ClampMin = "50.0", ClampMax = "10000.0", UIMin = "200.0", UIMax = "4000.0", DisplayName = "Asphalt UV Tile (cm)"))
+	float AsphaltUvTileCm = MetaLandRoad::DefaultAsphaltUvTileCm;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Road, meta = (DisplayName = "Auto Maintain 2-Section Midpoint"))
 	bool bAutoMaintainMidpointSectionSplit = false;
@@ -326,6 +332,12 @@ public:
 	UFUNCTION(BlueprintCallable, Category = Road)
 	void RefreshLaneVisualization();
 
+	/** Center-line polyline through every spline point (per-segment InputKey, not index-as-key). */
+	void BuildCenterLineWorldPolyline(TArray<FVector>& OutPoints, int32 StepsPerSegment = 32) const;
+	float GetSplinePointInputKey(int32 PointIndex) const;
+	float GetMainCenterLineHeightOffset() const;
+	void DrawMainCenterLinePDI(FPrimitiveDrawInterface* PDI, const FLinearColor& Color, float Thickness) const;
+
 	bool EvalMouthTransform(const FMetaLandRoadDrawAnchor& Anchor, FTransform& OutTransform) const;
 
 	bool BuildDrawAnchorForLaneMouth(
@@ -348,8 +360,8 @@ public:
 	bool ConnectRoadToDrawAnchor(const FMetaLandRoadDrawAnchor& SourceAnchor, bool bAttachAtSplineStart);
 
 	/**
-	 * EndConnection width mix toward the snapped target lane mouth.
-	 * SpanMode: last 2 / last 3 spline spans, or entire road. Width lerps Current→Target along the window.
+	 * [KEY-ALGO] Mouth-to-mouth blend. Min(N,M)==1 → Left[0]+Right[0] width mix, ROffset=0.
+	 * Center line stays in the mesh middle; head/tail align to both mouths.
 	 */
 	bool BlendEndWidthToTargetMouth(
 		const FMetaLandRoadDrawAnchor& TargetAnchor,

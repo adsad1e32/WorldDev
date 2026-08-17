@@ -832,10 +832,15 @@ struct FMetaLandRoadSectionHover
 
 		if (bLMBReleased)
 		{
+			const bool bDidBoundaryDrag = GetActiveDragSection() > 0 && RoadVis.IsValid();
 			if (GetDragTransactionOpen())
 			{
 				GEditor->EndTransaction();
 				GetDragTransactionOpen() = false;
+			}
+			if (bDidBoundaryDrag)
+			{
+				RoadVis->FinishSectionBoundaryDrag();
 			}
 			GetActiveDragSection() = INDEX_NONE;
 		}

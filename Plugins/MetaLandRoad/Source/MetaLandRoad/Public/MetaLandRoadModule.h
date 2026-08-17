@@ -48,10 +48,14 @@ public:
 	void SetEditorVisMode(EMetaLandRoadEditorVisMode NewMode);
 	void SetRoadComponentVisMode(bool bShowEditSpline);
 	void ToggleRoadComponentVisMode();
-	/** True when Alt+E / Alt+W / Alt+T hotkeys may run (interactive draw tool must be inactive). */
+	/** True when Alt+E / Alt+W / Alt+T may run — false while Interactive Tool is active. */
 	bool CanUseEditorVisModeHotkeys() const;
 	/** True while MetaLandRoad spline draw / lane-extend interactive tool owns input. */
 	bool IsInteractiveSplineDrawToolActive() const;
+	/** True only while the draw tool is actively placing points (not idle after A). */
+	bool IsLiveSplineDrawSession() const;
+	/** Interactive Tool started: force-exit Alt+W/E/T (Mode vs Tool mutually exclusive). */
+	void ExitEditorVisModesForInteractiveTool();
 	/** Stop viewport drag tracking + end spline visualizer before draw tool clears selection. */
 	void AbortSplineVisualizerTracking();
 	/** Clear EditTarget + interactive draw leftovers when leaving editor vis modes. */

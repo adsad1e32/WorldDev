@@ -10,7 +10,9 @@ class UMetaLandRoadSplineComponent;
 namespace MetaLandRoadNativeEditVisualization
 {
 	/** Screen pick radius for control-point rings (click + hover). */
-	inline constexpr float NativeEditKeyPickRadiusPx = 36.0f;
+	inline constexpr float NativeEditKeyPickRadiusPx = 54.0f;
+	/** Display scale for Alt+W / Alt+T control-point rings. */
+	inline constexpr float NativeEditRingDisplayScale = 1.5f;
 
 	METALANDROAD_API float GetNativeEditHeightOffset(const UMetaLandRoadSplineComponent* RoadSpline);
 
@@ -19,7 +21,7 @@ namespace MetaLandRoadNativeEditVisualization
 		const FVector& CenterWorld,
 		const FVector& RingAxisX,
 		const FVector& RingAxisY,
-		float DesiredPixelRadius = 18.0f);
+		float DesiredPixelRadius = 48.0f);
 
 	METALANDROAD_API int32 PickHoveredControlPointKey(
 		const UMetaLandRoadSplineComponent* RoadSpline,

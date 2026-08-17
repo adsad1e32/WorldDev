@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include "CoreMinimal.h"
 #include "UObject/Object.h"
@@ -97,8 +97,10 @@ class AMoKuEditBaseActor : public AActor, public IRoadBrushActorInterface
 	GENERATED_BODY()
 
 public:
-	//~ Begin IWaterBrushActorInterface interface
-	virtual bool AffectsLandscape() const override { return true; }
+	AMoKuEditBaseActor(const FObjectInitializer& ObjectInitializer = FObjectInitializer::Get());
+
+	//~ Begin IRoadBrushActorInterface interface
+	virtual bool AffectsLandscape() const override;
 #if WITH_EDITOR
 	virtual void PostActorCreated() override;
 	virtual void OnPostEditChangeProperty(FOnRoadBodyChangedParams& InOutOnWaterBodyChangedParams);
@@ -119,6 +121,7 @@ public:
 	TObjectPtr<UDynamicMeshComponent> DynamicMeshComponent = nullptr;
 
 	virtual void OnConstruction(const FTransform& Transform)override;
+	virtual void PostLoad() override;
 	virtual void PostEditChangeChainProperty(FPropertyChangedChainEvent& PropertyChangedEvent)override;
 	virtual void PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent) override;
 	virtual void PostEditUndo()override;
@@ -157,6 +160,21 @@ public:
 
 
 	void OnRoadBodyChanged(const FOnRoadBodyChangedParams& InParams);
+
+	/** Ensures default height/weightmap terrain settings when influence is enabled. @return true if DF-affecting params changed. */
+	bool EnsureDefaultTerrainInfluenceSettings();
+
+	/**
+	 * Seed Road/Dirty weight layers if missing, then broadcast brush change so WorldEditor
+	 * rebuilds height + weight (roads AND junctions that inherit this base).
+	 */
+	void NotifyLandscapeBrushChanged(bool bShapeOrPositionChanged = true, bool bWeightmapSettingsChanged = true, bool bUserTriggered = false);
+
+	/**
+	 * When true, OnRoadBodyChanged / NotifyLandscapeBrushChanged do not broadcast.
+	 * Use during junction cook while refreshing linked roads — one notify at the end.
+	 */
+	static bool bSuppressLandscapeBrushNotify;
 
 protected:
 

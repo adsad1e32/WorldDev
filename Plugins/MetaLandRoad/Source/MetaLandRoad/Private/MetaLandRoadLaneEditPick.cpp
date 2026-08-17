@@ -436,11 +436,26 @@ bool MetaLandRoadLaneEditPick::PickLaneWidthKeyAtMouse(
 		LanesForKeys.Add({ SectionIndex, LaneIndex });
 	};
 
-	if (LanesForKeys.Num() == 0 && PrimarySectionIndex != INDEX_NONE && PrimaryLaneIndex != LANE_INDEX_NONE)
-	{
-		AddLaneForKeys(PrimarySectionIndex, PrimaryLaneIndex);
-	}
+	AddLaneForKeys(PrimarySectionIndex, PrimaryLaneIndex);
 	AddLaneForKeys(HoveredSectionIndex, HoveredLaneIndex);
+
+	// Every visible ring is pickable — do not require a prior lane selection.
+	for (int32 SectionIndex = 0; SectionIndex < SplineComp->GetLaneSectionsNum(); ++SectionIndex)
+	{
+		const FMetaLandRoadLaneSection& Section = SplineComp->GetLaneSection(SectionIndex);
+		const int32 MaxAbsLane = FMath::Max(Section.Left.Num(), Section.Right.Num());
+		for (int32 AbsLane = 1; AbsLane <= MaxAbsLane; ++AbsLane)
+		{
+			if (IsLaneValidOnSpanSection(SplineComp, SectionIndex, AbsLane))
+			{
+				AddLaneForKeys(SectionIndex, AbsLane);
+			}
+			if (IsLaneValidOnSpanSection(SplineComp, SectionIndex, -AbsLane))
+			{
+				AddLaneForKeys(SectionIndex, -AbsLane);
+			}
+		}
+	}
 
 	const FVector2D Mouse(MousePos.X, MousePos.Y);
 	const float MaxDistSq = MaxScreenDistance * MaxScreenDistance;
@@ -492,7 +507,33 @@ bool MetaLandRoadLaneEditPick::PickLaneWidthKeyAtMouse(
 			if (DistSq < BestDistSq)
 			{
 				BestDistSq = DistSq;
-				OutResult.SectionIndex = SpanSectionIndex;
+				int32 KeySpanSection = SpanSectionIndex;
+				const int32 HostAtKeyS = SplineComp->GetRoadLayout().FindSectionAtSOffset(KeyS);
+				if (HostAtKeyS != INDEX_NONE
+					&& IsLaneValidOnSpanSection(SplineComp, HostAtKeyS, LaneIndex))
+				{
+					KeySpanSection = HostAtKeyS;
+				}
+				else
+				{
+					for (int32 SectionIndex = 0; SectionIndex < SplineComp->GetLaneSectionsNum(); ++SectionIndex)
+					{
+						if (!IsLaneValidOnSpanSection(SplineComp, SectionIndex, LaneIndex))
+						{
+							continue;
+						}
+
+						const double SpanS0 = SplineComp->GetLaneSection(SectionIndex).SOffset;
+						const double SpanS1 = MetaLandRoad::ResolveSectionEndS(SplineComp, SectionIndex);
+						if (KeyS >= SpanS0 - KINDA_SMALL_NUMBER && KeyS <= SpanS1 + KINDA_SMALL_NUMBER)
+						{
+							KeySpanSection = SectionIndex;
+							break;
+						}
+					}
+				}
+
+				OutResult.SectionIndex = KeySpanSection;
 				OutResult.LaneIndex = LaneIndex;
 				OutResult.WidthIndex = KeyIndex;
 			}

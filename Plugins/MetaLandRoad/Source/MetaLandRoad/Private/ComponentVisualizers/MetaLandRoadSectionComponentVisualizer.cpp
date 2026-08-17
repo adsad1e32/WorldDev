@@ -27,6 +27,8 @@
 #include "Settings/LevelEditorViewportSettings.h"
 #include "Styling/StyleColors.h"
 #include "UnrealWidget.h"
+#include "EditorModeManager.h"
+#include "EditorViewportClient.h"
 
 #define LOCTEXT_NAMESPACE "FMoKuEditSplinesComponentVisualizer"
 
@@ -36,6 +38,88 @@ bool CanSafelyUseEngineSplineVisualizer(const USplineComponent* SplineComp)
 {
 	return IsValid(SplineComp) && IsValid(SplineComp->GetOwner());
 }
+}
+
+static bool IsViewportNavigationKey(const FKey& Key)
+{
+	return Key == EKeys::W || Key == EKeys::A || Key == EKeys::S || Key == EKeys::D
+		|| Key == EKeys::Q || Key == EKeys::E
+		|| Key == EKeys::Up || Key == EKeys::Down
+		|| Key == EKeys::Left || Key == EKeys::Right;
+}
+
+static bool IsMouseGizmoDrag(const FEditorViewportClient* ViewportClient, const FViewport* Viewport)
+{
+	if (!ViewportClient || !Viewport || !ViewportClient->IsTracking())
+	{
+		return false;
+	}
+	if (Viewport->KeyState(EKeys::RightMouseButton) || Viewport->KeyState(EKeys::MiddleMouseButton))
+	{
+		return false;
+	}
+	if (!Viewport->KeyState(EKeys::LeftMouseButton))
+	{
+		return false;
+	}
+	return ViewportClient->GetCurrentWidgetAxis() != EAxisList::None;
+}
+
+static FVector CaptureSplineAddClickWorld(USplineComponent* SplineComp, int32 Seg, const FVector& Fallback)
+{
+	if (!SplineComp || !GCurrentLevelEditingViewportClient || !GCurrentLevelEditingViewportClient->Viewport)
+	{
+		return Fallback;
+	}
+
+	FIntPoint MousePos;
+	GCurrentLevelEditingViewportClient->Viewport->GetMousePos(MousePos);
+	FSceneViewFamilyContext ViewFamily(FSceneViewFamily::ConstructionValues(
+		GCurrentLevelEditingViewportClient->Viewport,
+		GCurrentLevelEditingViewportClient->GetScene(),
+		GCurrentLevelEditingViewportClient->EngineShowFlags));
+	FSceneView* View = GCurrentLevelEditingViewportClient->CalcSceneView(&ViewFamily);
+	if (!View)
+	{
+		return Fallback;
+	}
+
+	const FViewportClick Click(
+		View,
+		GCurrentLevelEditingViewportClient,
+		EKeys::RightMouseButton,
+		IE_Pressed,
+		MousePos.X,
+		MousePos.Y);
+	constexpr int32 NumSubdivisions = 24;
+	FVector SubStart = SplineComp->GetLocationAtSplineInputKey(
+		static_cast<float>(Seg), ESplineCoordinateSpace::World);
+	double BestDist = TNumericLimits<double>::Max();
+	FVector BestLoc = Fallback;
+	for (int32 Step = 1; Step <= NumSubdivisions; ++Step)
+	{
+		const float KeyParam = static_cast<float>(Seg)
+			+ static_cast<float>(Step) / static_cast<float>(NumSubdivisions);
+		const FVector SubEnd = SplineComp->GetLocationAtSplineInputKey(
+			KeyParam, ESplineCoordinateSpace::World);
+		FVector SplineClosest;
+		FVector RayClosest;
+		FMath::SegmentDistToSegmentSafe(
+			SubStart,
+			SubEnd,
+			Click.GetOrigin(),
+			Click.GetOrigin() + Click.GetDirection() * 50000.0f,
+			SplineClosest,
+			RayClosest);
+		const double Dist = FVector::DistSquared(SplineClosest, RayClosest);
+		if (Dist < BestDist)
+		{
+			BestDist = Dist;
+			BestLoc = SplineClosest;
+		}
+		SubStart = SubEnd;
+	}
+	return BestLoc;
 }
 
 static void UpdateLaneFaceHoverFromViewportMouse(
@@ -88,6 +172,10 @@ public:
 		UI_COMMAND(AddLaneToLeft, "Add Lane to Left", "Add a new road lane to the left side of the currently selected lane.", EUserInterfaceActionType::Button, FInputChord());
 		UI_COMMAND(AddLaneToRight, "Add Lane to Right", "Add a new road lane to the right side of the currently selected lane.", EUserInterfaceActionType::Button, FInputChord());
 		UI_COMMAND(DeleteLane, "Delete Lane", "Delete selected lane.", EUserInterfaceActionType::Button, FInputChord());
+		UI_COMMAND(AddLeftSection, "Add Left Section", "Split a Left face section at the pick.", EUserInterfaceActionType::Button, FInputChord());
+		UI_COMMAND(AddRightSection, "Add Right Section", "Split a Right face section at the pick.", EUserInterfaceActionType::Button, FInputChord());
+		UI_COMMAND(DeleteLeftSection, "Delete Left", "Delete the Left face of the selected section.", EUserInterfaceActionType::Button, FInputChord());
+		UI_COMMAND(DeleteRightSection, "Delete Right", "Delete the Right face of the selected section.", EUserInterfaceActionType::Button, FInputChord());
 		UI_COMMAND(AddWidthKey, "Add Width Key", "Add a width key on the selected lane boundary (Alt+T).", EUserInterfaceActionType::Button, FInputChord());
 		UI_COMMAND(DeleteWidthKey, "Delete Width Key", "Delete the selected width key.", EUserInterfaceActionType::Button, FInputChord());
 		UI_COMMAND(SetKeyToCurve, "Curve", "Set spline point to Curve type.", EUserInterfaceActionType::RadioButton, FInputChord());
@@ -102,6 +190,10 @@ public:
 	TSharedPtr<FUICommandInfo> AddLaneToLeft;
 	TSharedPtr<FUICommandInfo> AddLaneToRight;
 	TSharedPtr<FUICommandInfo> DeleteLane;
+	TSharedPtr<FUICommandInfo> AddLeftSection;
+	TSharedPtr<FUICommandInfo> AddRightSection;
+	TSharedPtr<FUICommandInfo> DeleteLeftSection;
+	TSharedPtr<FUICommandInfo> DeleteRightSection;
 	TSharedPtr<FUICommandInfo> AddWidthKey;
 	TSharedPtr<FUICommandInfo> DeleteWidthKey;
 	TSharedPtr<FUICommandInfo> SetKeyToCurve;
@@ -186,6 +278,8 @@ void FMoKuEditSplinesComponentVisualizer::ClearSectionHighlight()
 	CachedLaneHoveredWidthIndex = INDEX_NONE;
 	CachedLaneHoveredWidthIsKey = false;
 	CachedLaneHoveredSectionBoundaryIndex = INDEX_NONE;
+	CachedLaneHoveredBoundaryLine = false;
+	CachedLaneHoveredSplineKey = -1.0f;
 }
 
 void FMoKuEditSplinesComponentVisualizer::SyncSectionLineEditModeFlag(bool bEnabled)
@@ -439,13 +533,6 @@ bool FMoKuEditSplinesComponentVisualizer::ApplySectionBoundaryWorldDrag(int32 Se
 
 	SplineComp->bAutoMaintainMidpointSectionSplit = false;
 	SplineComp->UpdateLaneSectionBounds();
-	for (FMetaLandRoadLaneSection& LaneSection : SplineComp->GetLaneSectionsMutable())
-	{
-		LaneSection.Trim(true);
-	}
-	SplineComp->UpdateRoadLayout();
-	RefreshRoadMeshForSpline(SplineComp);
-	SplineComp->MarkRenderStateDirty();
 
 	if (RoadSectionSelectionState)
 	{
@@ -459,11 +546,33 @@ bool FMoKuEditSplinesComponentVisualizer::ApplySectionBoundaryWorldDrag(int32 Se
 		RoadSectionSelectionState->SetSectionBoundarySelected(true);
 	}
 
+	// Overlay only while dragging — mesh / layout / hit-proxy rebuild is FinishSectionBoundaryDrag.
 	if (GEditor)
 	{
-		GEditor->RedrawLevelEditingViewports(true);
+		GEditor->RedrawLevelEditingViewports(false);
 	}
 	return true;
+}
+
+void FMoKuEditSplinesComponentVisualizer::FinishSectionBoundaryDrag()
+{
+	UMetaLandRoadSplineComponent* SplineComp = GetEditedMetaLandRoadSpline();
+	if (!SplineComp && RoadSectionSelectionState)
+	{
+		SplineComp = RoadSectionSelectionState->GetSelectedSpline();
+	}
+	if (!SplineComp)
+	{
+		return;
+	}
+
+	for (FMetaLandRoadLaneSection& LaneSection : SplineComp->GetLaneSectionsMutable())
+	{
+		LaneSection.Trim(true);
+	}
+	SplineComp->UpdateRoadLayout();
+	RefreshRoadMeshAndRedraw(SplineComp);
+	SplineComp->MarkRenderStateDirty();
 }
 
 FString FMoKuEditSplinesComponentVisualizer::GetReferencerNameStatic()
@@ -498,6 +607,20 @@ void FMoKuEditSplinesComponentVisualizer::OnRegister()
 {
 	FSplineComponentVisualizer::OnRegister();
 
+	if (SplineComponentVisualizerActions.IsValid())
+	{
+		if (const TSharedPtr<FUICommandInfo> AddKeyCmd = FInputBindingManager::Get().FindCommandInContext(
+			FName(TEXT("SplineComponentVisualizer")),
+			FName(TEXT("AddKey"))))
+		{
+			SplineComponentVisualizerActions->UnmapAction(AddKeyCmd.ToSharedRef());
+			SplineComponentVisualizerActions->MapAction(
+				AddKeyCmd.ToSharedRef(),
+				FExecuteAction::CreateSP(this, &FMoKuEditSplinesComponentVisualizer::OnSafeAddKeyToSegment),
+				FCanExecuteAction::CreateSP(this, &FMoKuEditSplinesComponentVisualizer::CanAddSplinePointOnCurve));
+		}
+	}
+
 	const FMetaLandRoadSectionComponentVisualizerCommands& Commands = FMetaLandRoadSectionComponentVisualizerCommands::Get();
 
 	// Alt+E toggle: LevelEditor global action only (mapping here caused double-toggle with ProcessCommandBindings).
@@ -505,43 +628,60 @@ void FMoKuEditSplinesComponentVisualizer::OnRegister()
 	SectionComponentVisualizerActions->MapAction(
 		Commands.AddLaneToLeft,
 		FExecuteAction::CreateSP(this, &FMoKuEditSplinesComponentVisualizer::OnAddLane, true),
-		FCanExecuteAction::CreateLambda([this]()
-		{
-			return (bSectionLineEditMode || FMetaLandRoadModule::Get().IsLaneEditMode())
-				&& RoadSectionSelectionState->GetStateVerified() >= EMetaLandRoadSectionSelectionState::Section;
-		}));
+		FCanExecuteAction::CreateSP(this, &FMoKuEditSplinesComponentVisualizer::CanAddLaneInCurrentMode));
 
 	SectionComponentVisualizerActions->MapAction(
 		Commands.AddLaneToRight,
 		FExecuteAction::CreateSP(this, &FMoKuEditSplinesComponentVisualizer::OnAddLane, false),
-		FCanExecuteAction::CreateLambda([this]()
-		{
-			return (bSectionLineEditMode || FMetaLandRoadModule::Get().IsLaneEditMode())
-				&& RoadSectionSelectionState->GetStateVerified() >= EMetaLandRoadSectionSelectionState::Section;
-		}));
+		FCanExecuteAction::CreateSP(this, &FMoKuEditSplinesComponentVisualizer::CanAddLaneInCurrentMode));
 
 	SectionComponentVisualizerActions->MapAction(
 		Commands.DeleteLane,
 		FExecuteAction::CreateSP(this, &FMoKuEditSplinesComponentVisualizer::OnDeleteLane),
+		FCanExecuteAction::CreateSP(this, &FMoKuEditSplinesComponentVisualizer::CanDeleteLaneInCurrentMode));
+
+	SectionComponentVisualizerActions->MapAction(
+		Commands.AddLeftSection,
+		FExecuteAction::CreateSP(this, &FMoKuEditSplinesComponentVisualizer::OnSplitSectionSide, EMetaLandRoadLaneSectionSide::Left),
 		FCanExecuteAction::CreateLambda([this]()
 		{
-			return (bSectionLineEditMode || FMetaLandRoadModule::Get().IsLaneEditMode())
-				&& (RoadSectionSelectionState->GetStateVerified() >= EMetaLandRoadSectionSelectionState::Lane
-					|| RoadSectionSelectionState->GetMultiSelectedLanes().Num() > 0);
+			return bSectionLineEditMode && HasMainLineSectionMenuContext();
 		}));
+
+	SectionComponentVisualizerActions->MapAction(
+		Commands.AddRightSection,
+		FExecuteAction::CreateSP(this, &FMoKuEditSplinesComponentVisualizer::OnSplitSectionSide, EMetaLandRoadLaneSectionSide::Right),
+		FCanExecuteAction::CreateLambda([this]()
+		{
+			return bSectionLineEditMode && HasMainLineSectionMenuContext();
+		}));
+
+	SectionComponentVisualizerActions->MapAction(
+		Commands.DeleteLeftSection,
+		FExecuteAction::CreateSP(this, &FMoKuEditSplinesComponentVisualizer::OnDeleteSectionSide, EMetaLandRoadLaneSectionSide::Left),
+		FCanExecuteAction::CreateSP(this, &FMoKuEditSplinesComponentVisualizer::CanDeleteSectionSide, EMetaLandRoadLaneSectionSide::Left));
+
+	SectionComponentVisualizerActions->MapAction(
+		Commands.DeleteRightSection,
+		FExecuteAction::CreateSP(this, &FMoKuEditSplinesComponentVisualizer::OnDeleteSectionSide, EMetaLandRoadLaneSectionSide::Right),
+		FCanExecuteAction::CreateSP(this, &FMoKuEditSplinesComponentVisualizer::CanDeleteSectionSide, EMetaLandRoadLaneSectionSide::Right));
 
 	SectionComponentVisualizerActions->MapAction(
 		Commands.AddWidthKey,
 		FExecuteAction::CreateSP(this, &FMoKuEditSplinesComponentVisualizer::OnAddWidthKey),
 		FCanExecuteAction::CreateLambda([this]()
 		{
-			if (!FMetaLandRoadModule::Get().IsLaneEditMode()
-				|| RoadSectionSelectionState->GetStateVerified() < EMetaLandRoadSectionSelectionState::Section)
+			if (!FMetaLandRoadModule::Get().IsLaneEditMode())
 			{
 				return false;
 			}
-
-			return RoadSectionSelectionState->HasLaneWidthMenuContext();
+			if (CachedLaneHoveredLaneIndex != LANE_INDEX_NONE)
+			{
+				return true;
+			}
+			return RoadSectionSelectionState
+				&& (RoadSectionSelectionState->HasLaneWidthMenuContext()
+					|| RoadSectionSelectionState->GetStateVerified() >= EMetaLandRoadSectionSelectionState::Lane);
 		}));
 
 	SectionComponentVisualizerActions->MapAction(
@@ -643,7 +783,7 @@ void FMoKuEditSplinesComponentVisualizer::DrawVisualization(const UActorComponen
 		return;
 	}
 
-	// Spline draw / lane-extend owns the viewport — Alt+E/T/W overlays conflict with guidance + mouth pick.
+	// Interactive Tool owns the viewport — W/E/T overlays stay off.
 	if (FMetaLandRoadModule::Get().IsInteractiveSplineDrawToolActive())
 	{
 		HoveredSectionIndex = INDEX_NONE;
@@ -717,7 +857,9 @@ void FMoKuEditSplinesComponentVisualizer::DrawVisualization(const UActorComponen
 		}
 
 		const int32 SelectedSegmentIndex = SelectionState ? SelectionState->GetSelectedSegmentIndex() : INDEX_NONE;
-		const TSet<int32>& SelectedKeys = GetSelectedKeys();
+		const TSet<int32>& SelectedKeys = SelectionState
+			? SelectionState->GetSelectedKeys()
+			: GetSelectedKeys();
 		// Point and segment selection are mutually exclusive in Alt+W.
 		const int32 EffectiveSelectedSegment =
 			SelectedKeys.Num() > 0 ? INDEX_NONE : SelectedSegmentIndex;
@@ -757,26 +899,8 @@ void FMoKuEditSplinesComponentVisualizer::DrawVisualization(const UActorComponen
 			CachedLaneHoveredWidthIsKey = false;
 			CachedLaneHoveredSectionBoundaryIndex = INDEX_NONE;
 			CachedLaneHoveredBoundaryLine = false;
+			CachedLaneHoveredSplineKey = -1.0f;
 			return;
-		}
-
-		// Keep Ctrl+face hover in sync with this draw frame (tick can lag one frame behind).
-		const bool bWidthKeyGizmoActive =
-			RoadSectionSelectionState
-			&& RoadSectionSelectionState->GetStateVerified() >= EMetaLandRoadSectionSelectionState::Key;
-		if (!PDI->IsHitTesting() && View && !bWidthKeyGizmoActive
-			&& GCurrentLevelEditingViewportClient && GCurrentLevelEditingViewportClient->Viewport)
-		{
-			FIntPoint MousePos;
-			GCurrentLevelEditingViewportClient->Viewport->GetMousePos(MousePos);
-			FMetaLandRoadLaneFacePickResult FacePick;
-			if (MetaLandRoadLaneVisualization::PickLaneFaceAtMouse(SplineComp, *View, MousePos, FacePick))
-			{
-				CachedLaneHoveredSectionIndex = FacePick.SectionIndex;
-				CachedLaneHoveredLaneIndex = FacePick.LaneIndex;
-				CachedLaneHoveredWidthIndex = INDEX_NONE;
-				CachedLaneHoveredWidthIsKey = false;
-			}
 		}
 
 		FMetaLandRoadLaneEditHighlight Highlight;
@@ -1115,6 +1239,10 @@ bool FMoKuEditSplinesComponentVisualizer::TryHandleNativeEditMousePress(
 	UMetaLandRoadSplineComponent* MetaSpline = FMetaLandRoadModule::Get().GetActiveNativeEditSpline();
 	if (!MetaSpline)
 	{
+		MetaSpline = GetEditedMetaLandRoadSpline();
+	}
+	if (!MetaSpline)
+	{
 		return false;
 	}
 
@@ -1128,11 +1256,15 @@ bool FMoKuEditSplinesComponentVisualizer::TryHandleNativeEditMousePress(
 		return false;
 	}
 
-	const int32 KeyAtMouse = MetaLandRoadNativeEditVisualization::PickHoveredControlPointKey(
-		MetaSpline,
-		View,
-		MousePos,
-		MetaLandRoadNativeEditVisualization::NativeEditKeyPickRadiusPx);
+	int32 KeyAtMouse = CachedNativeHoveredKey;
+	if (KeyAtMouse == INDEX_NONE)
+	{
+		KeyAtMouse = MetaLandRoadNativeEditVisualization::PickHoveredControlPointKey(
+			MetaSpline,
+			View,
+			MousePos,
+			MetaLandRoadNativeEditVisualization::NativeEditKeyPickRadiusPx);
+	}
 	if (KeyAtMouse == INDEX_NONE)
 	{
 		return false;
@@ -1141,6 +1273,9 @@ bool FMoKuEditSplinesComponentVisualizer::TryHandleNativeEditMousePress(
 	const TSet<int32>& SelectedKeys = SelectionState->GetSelectedKeys();
 	if (SelectedKeys.Num() == 1 && SelectedKeys.Contains(KeyAtMouse))
 	{
+		SetActiveForSpline(MetaSpline);
+		ActivateRoadVisualization();
+		EnsureNativeEditTranslateWidget(ViewportClient);
 		return false;
 	}
 
@@ -1175,48 +1310,63 @@ bool FMoKuEditSplinesComponentVisualizer::VisProxyHandleNativeEditClick(
 		return false;
 	}
 
-	if (Click.GetKey() == EKeys::LeftMouseButton)
+	int32 KeyAtMouse = CachedNativeHoveredKey;
+	if (KeyAtMouse == INDEX_NONE
+		&& InViewportClient
+		&& InViewportClient->Viewport)
 	{
 		if (UMetaLandRoadSplineComponent* MetaSpline = Cast<UMetaLandRoadSplineComponent>(
 				const_cast<UActorComponent*>(VisProxy->Component.Get())))
 		{
-			if (InViewportClient && InViewportClient->Viewport)
+			FIntPoint MousePos;
+			InViewportClient->Viewport->GetMousePos(MousePos);
+			FSceneViewFamilyContext ViewFamily(FSceneViewFamily::ConstructionValues(
+				InViewportClient->Viewport,
+				InViewportClient->GetScene(),
+				InViewportClient->EngineShowFlags));
+			if (FSceneView* View = InViewportClient->CalcSceneView(&ViewFamily))
 			{
-				FIntPoint MousePos;
-				InViewportClient->Viewport->GetMousePos(MousePos);
-				FSceneViewFamilyContext ViewFamily(FSceneViewFamily::ConstructionValues(
-					InViewportClient->Viewport,
-					InViewportClient->GetScene(),
-					InViewportClient->EngineShowFlags));
-				if (FSceneView* View = InViewportClient->CalcSceneView(&ViewFamily))
-				{
-					const int32 KeyAtMouse = MetaLandRoadNativeEditVisualization::PickHoveredControlPointKey(
-						MetaSpline,
-						View,
-						MousePos,
-						MetaLandRoadNativeEditVisualization::NativeEditKeyPickRadiusPx);
-					if (KeyAtMouse != INDEX_NONE)
-					{
-						const TSet<int32>& SelectedKeys = SelectionState->GetSelectedKeys();
-						if (SelectedKeys.Num() == 1 && SelectedKeys.Contains(KeyAtMouse))
-						{
-							return false;
-						}
-
-						const FScopedTransaction Transaction(LOCTEXT("SelectSplinePointNative", "Select Spline Point"));
-						SelectionState->Modify();
-						if (const USplineComponent* SplineComp = UpdateSelectedSplineComponent(VisProxy))
-						{
-							ChangeSelectionState(KeyAtMouse, InViewportClient->IsCtrlPressed());
-							SelectionState->ClearSelectedSegmentIndex();
-							SelectionState->ClearSelectedTangentHandle();
-							return TryCompleteNativeEditPointSelection(VisProxy, InViewportClient, SplineComp);
-						}
-						return false;
-					}
-				}
+				KeyAtMouse = MetaLandRoadNativeEditVisualization::PickHoveredControlPointKey(
+					MetaSpline,
+					View,
+					MousePos,
+					MetaLandRoadNativeEditVisualization::NativeEditKeyPickRadiusPx);
 			}
 		}
+	}
+
+	if (KeyAtMouse != INDEX_NONE)
+	{
+		if (Click.GetKey() == EKeys::LeftMouseButton)
+		{
+			const TSet<int32>& SelectedKeys = SelectionState->GetSelectedKeys();
+			if (SelectedKeys.Num() == 1 && SelectedKeys.Contains(KeyAtMouse))
+			{
+				if (UMetaLandRoadSplineComponent* MetaSpline = Cast<UMetaLandRoadSplineComponent>(
+						const_cast<UActorComponent*>(VisProxy->Component.Get())))
+				{
+					SetActiveForSpline(MetaSpline);
+					ActivateRoadVisualization();
+					EnsureNativeEditTranslateWidget(InViewportClient);
+				}
+				return false;
+			}
+		}
+
+		const FScopedTransaction Transaction(LOCTEXT("SelectSplinePointNative", "Select Spline Point"));
+		SelectionState->Modify();
+		if (const USplineComponent* SplineComp = UpdateSelectedSplineComponent(VisProxy))
+		{
+			const TSet<int32>& SelectedKeys = SelectionState->GetSelectedKeys();
+			if (Click.GetKey() != EKeys::RightMouseButton || !SelectedKeys.Contains(KeyAtMouse))
+			{
+				ChangeSelectionState(KeyAtMouse, InViewportClient && InViewportClient->IsCtrlPressed());
+			}
+			SelectionState->ClearSelectedSegmentIndex();
+			SelectionState->ClearSelectedTangentHandle();
+			return TryCompleteNativeEditPointSelection(VisProxy, InViewportClient, SplineComp);
+		}
+		return false;
 	}
 
 	if (VisProxy->IsA(HMetaLandRoadSplineKeyVisProxy::StaticGetType()))
@@ -1230,6 +1380,21 @@ bool FMoKuEditSplinesComponentVisualizer::VisProxyHandleNativeEditClick(
 
 		if (Click.GetKey() == EKeys::LeftMouseButton)
 		{
+			const TSet<int32>& SelectedKeys = SelectionState->GetSelectedKeys();
+			if (SelectedKeys.Num() == 1 && SelectedKeys.Contains(KeyProxy->KeyIndex))
+			{
+				return false;
+			}
+
+			const FScopedTransaction Transaction(LOCTEXT("SelectSplinePointNative", "Select Spline Point"));
+			SelectionState->Modify();
+			if (const USplineComponent* SplineComp = UpdateSelectedSplineComponent(VisProxy))
+			{
+				ChangeSelectionState(KeyProxy->KeyIndex, InViewportClient && InViewportClient->IsCtrlPressed());
+				SelectionState->ClearSelectedSegmentIndex();
+				SelectionState->ClearSelectedTangentHandle();
+				return TryCompleteNativeEditPointSelection(VisProxy, InViewportClient, SplineComp);
+			}
 			return false;
 		}
 
@@ -1513,6 +1678,7 @@ bool FMoKuEditSplinesComponentVisualizer::ClearLaneEditSelection()
 	CachedLaneHoveredWidthIsKey = false;
 	CachedLaneHoveredSectionBoundaryIndex = INDEX_NONE;
 	CachedLaneHoveredBoundaryLine = false;
+	CachedLaneHoveredSplineKey = -1.0f;
 	ActivateRoadVisualization();
 	GEditor->RedrawLevelEditingViewports(true);
 	return true;
@@ -2014,6 +2180,7 @@ bool FMoKuEditSplinesComponentVisualizer::VisProxyHandleLaneWidthClick(
 		CachedLaneHoveredWidthIsKey = false;
 		CachedLaneHoveredSectionBoundaryIndex = INDEX_NONE;
 		CachedLaneHoveredBoundaryLine = false;
+		CachedLaneHoveredSplineKey = -1.0f;
 
 		const double LaneStartS = Lane.GetStartOffset();
 		const double LaneEndS = Lane.GetEndOffset();
@@ -2138,21 +2305,18 @@ bool FMoKuEditSplinesComponentVisualizer::VisProxyHandleClick(
 		return true;
 	}
 
-	// Alt+T: Ctrl+RMB only for lane menu (plain RMB must not select / open menu).
+	// Alt+T: RMB opens lane menu. Ctrl+RMB also picks the hovered face first.
 	if (FMetaLandRoadModule::Get().IsLaneEditMode() && Click.GetKey() == EKeys::RightMouseButton)
 	{
 		const bool bCtrlDown =
 			FSlateApplication::IsInitialized()
 			&& FSlateApplication::Get().GetModifierKeys().IsControlDown();
-		if (!bCtrlDown)
-		{
-			return false;
-		}
-		if (TryHandleLaneEditPickClick(InViewportClient, VisProxy, Click, false))
+		if (bCtrlDown && TryHandleLaneEditPickClick(InViewportClient, VisProxy, Click, true))
 		{
 			return true;
 		}
-		return false;
+		EnsureLaneEditMenuSelection();
+		return FinishPickContextMenu(InViewportClient, true);
 	}
 
 	return FSplineComponentVisualizer::VisProxyHandleClick(InViewportClient, VisProxy, Click);
@@ -2224,7 +2388,30 @@ bool FMoKuEditSplinesComponentVisualizer::GetWidgetLocation(const FEditorViewpor
 {
 	if (FMetaLandRoadModule::Get().ShouldShowNativeEditOverlay())
 	{
-		return FSplineComponentVisualizer::GetWidgetLocation(ViewportClient, OutLocation);
+		if (!SelectionState
+			|| SelectionState->GetLastKeyIndexSelected() == INDEX_NONE
+			|| SelectionState->GetSelectedKeys().Num() == 0)
+		{
+			return false;
+		}
+
+		const int32 KeyIndex = SelectionState->GetLastKeyIndexSelected();
+		const USplineComponent* SplineComp = FMetaLandRoadModule::Get().GetActiveNativeEditSpline();
+		if (!SplineComp)
+		{
+			SplineComp = GetEditedMetaLandRoadSpline();
+		}
+		if (!SplineComp)
+		{
+			SplineComp = GetEditedSplineComponent();
+		}
+		if (!SplineComp || KeyIndex < 0 || KeyIndex >= SplineComp->GetNumberOfSplinePoints())
+		{
+			return false;
+		}
+
+		OutLocation = SplineComp->GetLocationAtSplinePoint(KeyIndex, ESplineCoordinateSpace::World);
+		return true;
 	}
 
 	// Boundary cross 鈫?SOffset gizmo (Alt+E only).
@@ -2258,7 +2445,7 @@ bool FMoKuEditSplinesComponentVisualizer::GetWidgetLocation(const FEditorViewpor
 
 	if (FMetaLandRoadModule::Get().IsLaneEditMode()
 		&& RoadSectionSelectionState
-		&& RoadSectionSelectionState->GetStateVerified() == EMetaLandRoadSectionSelectionState::Key)
+		&& RoadSectionSelectionState->GetStateVerified() >= EMetaLandRoadSectionSelectionState::Key)
 	{
 		OutLocation = RoadSectionSelectionState->GetCachedPosition();
 		return true;
@@ -2285,7 +2472,7 @@ bool FMoKuEditSplinesComponentVisualizer::GetCustomInputCoordinateSystem(const F
 
 	if (FMetaLandRoadModule::Get().IsLaneEditMode()
 		&& RoadSectionSelectionState
-		&& RoadSectionSelectionState->GetStateVerified() == EMetaLandRoadSectionSelectionState::Key)
+		&& RoadSectionSelectionState->GetStateVerified() >= EMetaLandRoadSectionSelectionState::Key)
 	{
 		OutMatrix = FRotationMatrix::Make(RoadSectionSelectionState->GetCachedRotation());
 		return true;
@@ -2348,6 +2535,11 @@ bool FMoKuEditSplinesComponentVisualizer::HandleInputDelta(
 {
 	check(RoadSectionSelectionState);
 
+	if (!IsMouseGizmoDrag(ViewportClient, Viewport))
+	{
+		return false;
+	}
+
 	// Alt+W: engine spline key/segment move + road mesh refresh after drag.
 	if (FMetaLandRoadModule::Get().IsNativeEditMode()
 		&& !IsSectionLineEditMode()
@@ -2383,25 +2575,14 @@ bool FMoKuEditSplinesComponentVisualizer::HandleInputDelta(
 			return false;
 		}
 
-		const bool bHandled = FSplineComponentVisualizer::HandleInputDelta(
+		return FSplineComponentVisualizer::HandleInputDelta(
 			ViewportClient, Viewport, DeltaTranslate, DeltaRotate, DeltaScale);
-		if (bHandled)
-		{
-			if (UMetaLandRoadSplineComponent* RoadSpline = GetEditedMetaLandRoadSpline())
-			{
-				RoadSpline->EnsureAllCurvePointTypesForSmoothCorners();
-				RoadSpline->UpdateRoadLayout();
-				RefreshRoadMeshForSpline(RoadSpline);
-				MetaLandRoadLaneVisualization::RefreshLaneVisualization(RoadSpline);
-			}
-		}
-		return bHandled;
 	}
 
 	const EMetaLandRoadSectionSelectionState State = RoadSectionSelectionState->GetStateVerified();
 
 	if (FMetaLandRoadModule::Get().IsLaneEditMode()
-		&& State == EMetaLandRoadSectionSelectionState::Key)
+		&& State >= EMetaLandRoadSectionSelectionState::Key)
 	{
 		if (!ViewportClient || !ViewportClient->IsTracking())
 		{
@@ -2469,9 +2650,10 @@ bool FMoKuEditSplinesComponentVisualizer::HandleInputDelta(
 			LaneStartS + Lane.Width.Keys[NewKeyIndex].Time,
 			1.0);
 
-		SplineComp->UpdateRoadLayout();
-		RefreshRoadMeshForSpline(SplineComp);
-		GEditor->RedrawLevelEditingViewports(true);
+		if (GEditor)
+		{
+			GEditor->RedrawLevelEditingViewports(false);
+		}
 		return true;
 	}
 
@@ -2502,10 +2684,6 @@ bool FMoKuEditSplinesComponentVisualizer::HandleInputDelta(
 
 		if (ApplySectionBoundaryWorldDrag(SectionIndex, WidgetLocationWorld))
 		{
-			if (UMetaLandRoadSplineComponent* SplineComp = GetEditedMetaLandRoadSpline())
-			{
-				RefreshRoadMeshForSpline(SplineComp);
-			}
 			return true;
 		}
 		return false;
@@ -2514,20 +2692,8 @@ bool FMoKuEditSplinesComponentVisualizer::HandleInputDelta(
 	// Alt+E main-line path drag / native key drag.
 	if (GetSelectedKeys().Num() > 0 && SelectionState && SelectionState->GetLastKeyIndexSelected() != INDEX_NONE)
 	{
-		const bool bHandled = FSplineComponentVisualizer::HandleInputDelta(
+		return FSplineComponentVisualizer::HandleInputDelta(
 			ViewportClient, Viewport, DeltaTranslate, DeltaRotate, DeltaScale);
-		if (bHandled)
-		{
-			if (UMetaLandRoadSplineComponent* RoadSpline = GetEditedMetaLandRoadSpline())
-			{
-				RefreshRoadMeshForSpline(RoadSpline);
-				if (IsSectionLineEditMode())
-				{
-					MetaLandRoadLaneVisualization::RefreshLaneVisualization(RoadSpline);
-				}
-			}
-		}
-		return bHandled;
 	}
 
 	return false;
@@ -2535,6 +2701,11 @@ bool FMoKuEditSplinesComponentVisualizer::HandleInputDelta(
 
 void FMoKuEditSplinesComponentVisualizer::TrackingStarted(FEditorViewportClient* InViewportClient)
 {
+	if (UMoKuEditSplinesComponent* MoKuSpline = Cast<UMoKuEditSplinesComponent>(GetEditedMetaLandRoadSpline()))
+	{
+		MoKuSpline->bDeferRoadMeshRefresh = true;
+	}
+
 	if (FMetaLandRoadModule::Get().IsNativeEditMode()
 		&& SelectionState
 		&& SelectionState->GetLastKeyIndexSelected() != INDEX_NONE)
@@ -2544,7 +2715,7 @@ void FMoKuEditSplinesComponentVisualizer::TrackingStarted(FEditorViewportClient*
 
 	if (FMetaLandRoadModule::Get().IsLaneEditMode()
 		&& RoadSectionSelectionState
-		&& RoadSectionSelectionState->GetStateVerified() == EMetaLandRoadSectionSelectionState::Key)
+		&& RoadSectionSelectionState->GetStateVerified() >= EMetaLandRoadSectionSelectionState::Key)
 	{
 		if (UMetaLandRoadSplineComponent* SplineComp = GetEditedMetaLandRoadSpline())
 		{
@@ -2574,6 +2745,18 @@ void FMoKuEditSplinesComponentVisualizer::TrackingStarted(FEditorViewportClient*
 
 bool FMoKuEditSplinesComponentVisualizer::HandleInputKey(FEditorViewportClient* ViewportClient, FViewport* Viewport, FKey Key, EInputEvent Event)
 {
+	// Engine FSplineComponentVisualizer RMB builds Snap/Align / Closed Loop. Use our menu only.
+	if (Key == EKeys::RightMouseButton)
+	{
+		return false;
+	}
+
+	// WASD / QE / arrows fly the viewport — do not select or nudge spline keys.
+	if (IsViewportNavigationKey(Key))
+	{
+		return false;
+	}
+
 	// Alt+W / Alt+E mode toggles are owned by LevelEditor global actions only (avoid double-toggle).
 
 	if (FMetaLandRoadModule::Get().ShouldShowNativeEditOverlay() && !IsSectionLineEditMode())
@@ -2588,6 +2771,22 @@ bool FMoKuEditSplinesComponentVisualizer::HandleInputKey(FEditorViewportClient* 
 					SyncEngineSelectionStateForSpline(SplineComp);
 				}
 			}
+		}
+
+		if (Key == EKeys::LeftMouseButton && Event == IE_Pressed && Viewport && ViewportClient)
+		{
+			if (TryHandleNativeEditMousePress(ViewportClient, Viewport))
+			{
+				return true;
+			}
+		}
+
+		const bool bHasKeySelection = SelectionState
+			&& SelectionState->GetLastKeyIndexSelected() != INDEX_NONE
+			&& SelectionState->GetSelectedKeys().Num() > 0;
+		if (!bHasKeySelection)
+		{
+			return false;
 		}
 
 		return FSplineComponentVisualizer::HandleInputKey(ViewportClient, Viewport, Key, Event);
@@ -2991,7 +3190,6 @@ bool FMoKuEditSplinesComponentVisualizer::TryHandleLaneEditPickClick(
 	}
 
 	if (!bCtrlDown
-		&& CachedLaneHoveredBoundaryLine
 		&& CachedLaneHoveredSectionIndex != INDEX_NONE
 		&& CachedLaneHoveredLaneIndex != LANE_INDEX_NONE)
 	{
@@ -3002,6 +3200,10 @@ bool FMoKuEditSplinesComponentVisualizer::TryHandleLaneEditPickClick(
 		RoadSectionSelectionState->SetPrimaryLaneSelection(
 			CachedLaneHoveredSectionIndex, CachedLaneHoveredLaneIndex, false);
 		RoadSectionSelectionState->SetLaneWidthMenuContext(true);
+		if (CachedLaneHoveredSplineKey >= 0.0f)
+		{
+			RoadSectionSelectionState->SetLastPickSplineKey(CachedLaneHoveredSplineKey);
+		}
 		return FinishAfterPick();
 	}
 
@@ -3314,62 +3516,79 @@ bool FMoKuEditSplinesComponentVisualizer::HandleSnapTo(
 
 void FMoKuEditSplinesComponentVisualizer::TrackingStopped(FEditorViewportClient* InViewportClient, bool bInDidMove)
 {
-	if (bInDidMove)
+	UMetaLandRoadSplineComponent* SplineComp = GetEditedMetaLandRoadSpline();
+	UMoKuEditSplinesComponent* MoKuSpline = Cast<UMoKuEditSplinesComponent>(SplineComp);
+	if (!MoKuSpline)
 	{
-		UMetaLandRoadSplineComponent* SplineComp = GetEditedMetaLandRoadSpline();
-		if (SplineComp
-			&& SelectionState
-			&& SelectionState->GetSelectedKeys().Num() > 0
-			&& RoadSectionSelectionState
-			&& !RoadSectionSelectionState->IsSectionBoundarySelected())
-		{
-			// Finished Alt+E main-line path drag 鈥?keep mesh/lines in sync.
-			RefreshRoadMeshForSpline(SplineComp);
-			MetaLandRoadLaneVisualization::RefreshLaneVisualization(SplineComp);
-		}
-		else if (SplineComp)
-		{
-			if (GetSelectionState()->GetState() == EMetaLandRoadSectionSelectionState::Section)
-			{
-				const EMetaLandRoadSectionSelectionState StateVerified = RoadSectionSelectionState->GetStateVerified();
-				double SOffset = 0.0;
-				bool bValid = false;
-				if (StateVerified >= EMetaLandRoadSectionSelectionState::Section)
-				{
-					SOffset = SplineComp->GetLaneSection(RoadSectionSelectionState->GetSelectedSectionIndex()).SOffset;
-					bValid = true;
-				}
-
-				SplineComp->TrimLaneSections();
-				RoadSectionSelectionState->FixState();
-
-				if (bValid)
-				{
-					const int32 BestSectionIndex = CompVisUtils::FindBestFit(SplineComp->GetLaneSections(), [SOffset](const FMetaLandRoadLaneSection& It)
-					{
-						return FMath::Abs(SOffset - It.SOffset);
-					});
-					RoadSectionSelectionState->SetSelectedSection(BestSectionIndex);
-					RoadSectionSelectionState->SetCachedDataAtSectionStart(BestSectionIndex);
-				}
-			}
-			else
-			{
-				SplineComp->TrimLaneSections();
-			}
-
-			SplineComp->GetRoadLayoutMutable().UpdateLayoutVersion();
-			SplineComp->UpdateRoadLayout();
-			RefreshRoadMeshAndRedraw(SplineComp);
-			SplineComp->MarkRenderStateDirty();
-		}
+		MoKuSpline = Cast<UMoKuEditSplinesComponent>(GetEditedSplineComponent());
 	}
 
-	// Parent dereferences GetEditedSplineComponent()->GetOwner(); lane draw can clear selection before mouse-up.
+	// Parent may NotifyPropertyModified(ValueSet) — keep defer on so mesh waits for this function.
 	if (CanSafelyUseEngineSplineVisualizer(GetEditedSplineComponent())
 		&& !FMetaLandRoadModule::Get().IsInteractiveSplineDrawToolActive())
 	{
 		FSplineComponentVisualizer::TrackingStopped(InViewportClient, bInDidMove);
+	}
+
+	if (MoKuSpline)
+	{
+		MoKuSpline->bDeferRoadMeshRefresh = false;
+	}
+
+	if (!bInDidMove || !SplineComp)
+	{
+		return;
+	}
+
+	if (RoadSectionSelectionState && RoadSectionSelectionState->IsSectionBoundarySelected())
+	{
+		FinishSectionBoundaryDrag();
+		return;
+	}
+
+	if (FMetaLandRoadModule::Get().IsNativeEditMode() && !IsSectionLineEditMode())
+	{
+		SplineComp->EnsureAllCurvePointTypesForSmoothCorners();
+	}
+
+	if (RoadSectionSelectionState
+		&& RoadSectionSelectionState->GetState() == EMetaLandRoadSectionSelectionState::Section)
+	{
+		const EMetaLandRoadSectionSelectionState StateVerified = RoadSectionSelectionState->GetStateVerified();
+		double SOffset = 0.0;
+		bool bValid = false;
+		if (StateVerified >= EMetaLandRoadSectionSelectionState::Section)
+		{
+			SOffset = SplineComp->GetLaneSection(RoadSectionSelectionState->GetSelectedSectionIndex()).SOffset;
+			bValid = true;
+		}
+
+		SplineComp->TrimLaneSections();
+		RoadSectionSelectionState->FixState();
+		if (bValid)
+		{
+			const int32 BestSectionIndex = CompVisUtils::FindBestFit(
+				SplineComp->GetLaneSections(),
+				[SOffset](const FMetaLandRoadLaneSection& It)
+				{
+					return FMath::Abs(SOffset - It.SOffset);
+				});
+			RoadSectionSelectionState->SetSelectedSection(BestSectionIndex);
+			RoadSectionSelectionState->SetCachedDataAtSectionStart(BestSectionIndex);
+		}
+	}
+
+	SplineComp->GetRoadLayoutMutable().UpdateLayoutVersion();
+	SplineComp->UpdateRoadLayout();
+	RefreshRoadMeshAndRedraw(SplineComp);
+	SplineComp->MarkRenderStateDirty();
+
+	if (FMetaLandRoadModule::Get().IsNativeEditMode() && !IsSectionLineEditMode())
+	{
+		if (AMoKuEditSplineActor* RoadActor = Cast<AMoKuEditSplineActor>(SplineComp->GetOwner()))
+		{
+			RoadActor->NotifyLandscapeBrushChanged(true, false, true);
+		}
 	}
 }
 
@@ -3437,6 +3656,11 @@ int32 FMoKuEditSplinesComponentVisualizer::TryAddSectionFromLaneSelection(float 
 	return TrySplitSectionSide(ResolveAddSectionSideFromLaneSelection(), OverrideSplitKey);
 }
 
+// =============================================================================
+// [KEY-ALGO] TrySplitSectionSide
+// 菜单 Add Left Section / Add Right Section / Add Section → SplitSection。
+// 先 EnsureBothFacesOnRoad，再按粉线 hover 的 SplineKey 切面。
+// =============================================================================
 int32 FMoKuEditSplinesComponentVisualizer::TrySplitSectionSide(EMetaLandRoadLaneSectionSide Side, float OverrideSplitKey)
 {
 	if (!bSectionLineEditMode)
@@ -3459,6 +3683,7 @@ int32 FMoKuEditSplinesComponentVisualizer::TrySplitSectionSide(EMetaLandRoadLane
 	}
 
 	EnsureDefaultProfileIfNeeded(SplineComp);
+	MetaLandRoadProfile::EnsureBothFacesOnRoad(SplineComp);
 
 	// Ensure a section is selected so the new span can highlight after split.
 	if (RoadSectionSelectionState->GetStateVerified() < EMetaLandRoadSectionSelectionState::Section)
@@ -3571,10 +3796,146 @@ void FMoKuEditSplinesComponentVisualizer::OnDeleteSection()
 	}
 }
 
+bool FMoKuEditSplinesComponentVisualizer::CanDeleteSectionSide(EMetaLandRoadLaneSectionSide Side) const
+{
+	if (!bSectionLineEditMode || !HasMainLineSectionMenuContext() || !RoadSectionSelectionState)
+	{
+		return false;
+	}
+
+	const UMetaLandRoadSplineComponent* SplineComp = GetEditedMetaLandRoadSpline();
+	if (!SplineComp)
+	{
+		return false;
+	}
+
+	int32 SectionIndex = RoadSectionSelectionState->GetSelectedSectionIndex();
+	if (SectionIndex == INDEX_NONE)
+	{
+		SectionIndex = HoveredSectionIndex;
+	}
+	if (!SplineComp->GetLaneSections().IsValidIndex(SectionIndex))
+	{
+		return false;
+	}
+
+	const FMetaLandRoadLaneSection& Section = SplineComp->GetLaneSection(SectionIndex);
+	if (Section.Side == Side)
+	{
+		return true;
+	}
+	if (Section.Side != EMetaLandRoadLaneSectionSide::Both)
+	{
+		return false;
+	}
+	return Side == EMetaLandRoadLaneSectionSide::Left
+		? !Section.Left.IsEmpty()
+		: !Section.Right.IsEmpty();
+}
+
+void FMoKuEditSplinesComponentVisualizer::OnDeleteSectionSide(EMetaLandRoadLaneSectionSide Side)
+{
+	if (Side != EMetaLandRoadLaneSectionSide::Left && Side != EMetaLandRoadLaneSectionSide::Right)
+	{
+		return;
+	}
+	if (!CanDeleteSectionSide(Side))
+	{
+		return;
+	}
+
+	UMetaLandRoadSplineComponent* SplineComp = GetEditedMetaLandRoadSpline();
+	if (!SplineComp || !RoadSectionSelectionState)
+	{
+		return;
+	}
+
+	int32 SectionIndex = RoadSectionSelectionState->GetSelectedSectionIndex();
+	if (SectionIndex == INDEX_NONE)
+	{
+		SectionIndex = HoveredSectionIndex;
+	}
+	if (!SplineComp->GetLaneSections().IsValidIndex(SectionIndex))
+	{
+		return;
+	}
+
+	const FScopedTransaction Transaction(LOCTEXT("DeleteSectionSide", "Delete Section Side"));
+	SplineComp->Modify();
+
+	TArray<FMetaLandRoadLaneSection>& Sections = SplineComp->GetLaneSectionsMutable();
+	const double SelectedS = Sections[SectionIndex].SOffset;
+	for (int32 Index = Sections.Num() - 1; Index >= 0; --Index)
+	{
+		if (!FMath::IsNearlyEqual(Sections[Index].SOffset, SelectedS, 0.1))
+		{
+			continue;
+		}
+
+		FMetaLandRoadLaneSection& Section = Sections[Index];
+		if (Section.Side == Side)
+		{
+			Sections.RemoveAt(Index);
+			continue;
+		}
+		if (Section.Side != EMetaLandRoadLaneSectionSide::Both)
+		{
+			continue;
+		}
+
+		if (Side == EMetaLandRoadLaneSectionSide::Left)
+		{
+			Section.Left.Reset();
+			Section.Side = EMetaLandRoadLaneSectionSide::Right;
+			if (Section.Right.IsEmpty())
+			{
+				Sections.RemoveAt(Index);
+			}
+		}
+		else
+		{
+			Section.Right.Reset();
+			Section.Side = EMetaLandRoadLaneSectionSide::Left;
+			if (Section.Left.IsEmpty())
+			{
+				Sections.RemoveAt(Index);
+			}
+		}
+	}
+
+	if (Sections.Num() == 0)
+	{
+		MetaLandRoadProfile::EnsureDefaultRoadProfile(SplineComp);
+	}
+
+	SplineComp->UpdateRoadLayout();
+	SplineComp->UpdateLaneSectionBounds();
+	SplineComp->TrimLaneSections();
+	RefreshRoadMeshAndRedraw(SplineComp);
+	SplineComp->MarkRenderStateDirty();
+
+	RoadSectionSelectionState->Modify();
+	RoadSectionSelectionState->SetSelectedLane(LANE_INDEX_NONE);
+	if (Sections.Num() > 0)
+	{
+		const int32 KeepIndex = FMath::Clamp(SectionIndex, 0, Sections.Num() - 1);
+		RoadSectionSelectionState->SetSelectedSection(KeepIndex);
+	}
+}
+
 void FMoKuEditSplinesComponentVisualizer::OnAddLane(bool bOnLeft)
 {
-	if (RoadSectionSelectionState->GetStateVerified() < EMetaLandRoadSectionSelectionState::Section)
+	if (!EnsureLaneEditMenuSelection()
+		|| RoadSectionSelectionState->GetStateVerified() < EMetaLandRoadSectionSelectionState::Section)
 	{
+		if (GEngine)
+		{
+			GEngine->AddOnScreenDebugMessage(
+				991210,
+				3.0f,
+				FColor::Orange,
+				TEXT("[MetaLandRoad] Add Lane failed: select the road first"));
+		}
 		return;
 	}
 
@@ -3654,6 +4015,19 @@ void FMoKuEditSplinesComponentVisualizer::OnAddLane(bool bOnLeft)
 
 void FMoKuEditSplinesComponentVisualizer::OnDeleteLane()
 {
+	if (RoadSectionSelectionState->GetStateVerified() < EMetaLandRoadSectionSelectionState::Lane
+		&& RoadSectionSelectionState->GetMultiSelectedLanes().Num() == 0)
+	{
+		if (CachedLaneHoveredLaneIndex != LANE_INDEX_NONE
+			&& CachedLaneHoveredSectionIndex != INDEX_NONE)
+		{
+			EnsureLaneEditMenuSelection();
+			RoadSectionSelectionState->SetPrimaryLaneSelection(
+				CachedLaneHoveredSectionIndex,
+				CachedLaneHoveredLaneIndex,
+				false);
+		}
+	}
 	if (RoadSectionSelectionState->GetStateVerified() < EMetaLandRoadSectionSelectionState::Lane
 		&& RoadSectionSelectionState->GetMultiSelectedLanes().Num() == 0)
 	{
@@ -3739,13 +4113,7 @@ void FMoKuEditSplinesComponentVisualizer::OnDeleteLane()
 
 void FMoKuEditSplinesComponentVisualizer::OnAddWidthKey()
 {
-	if (FSlateApplication::IsInitialized()
-		&& FSlateApplication::Get().GetModifierKeys().IsControlDown())
-	{
-		// Ctrl+LMB is reserved for lane face select / width-key deselect.
-		return;
-	}
-
+	EnsureLaneEditMenuSelection();
 	if (RoadSectionSelectionState->GetStateVerified() < EMetaLandRoadSectionSelectionState::Section)
 	{
 		return;
@@ -3757,33 +4125,45 @@ void FMoKuEditSplinesComponentVisualizer::OnAddWidthKey()
 		return;
 	}
 
+	int32 SectionIndex = RoadSectionSelectionState->GetSelectedSectionIndex();
+	int32 LaneIndex = RoadSectionSelectionState->GetSelectedLaneIndex();
+	if (CachedLaneHoveredLaneIndex != LANE_INDEX_NONE && CachedLaneHoveredSectionIndex != INDEX_NONE)
+	{
+		RoadSectionSelectionState->Modify();
+		RoadSectionSelectionState->SetSelectedSection(CachedLaneHoveredSectionIndex);
+		RoadSectionSelectionState->SetSelectedLane(CachedLaneHoveredLaneIndex);
+		SectionIndex = CachedLaneHoveredSectionIndex;
+		LaneIndex = CachedLaneHoveredLaneIndex;
+		if (CachedLaneHoveredSplineKey >= 0.0f)
+		{
+			RoadSectionSelectionState->SetLastPickSplineKey(CachedLaneHoveredSplineKey);
+		}
+	}
+	if (LaneIndex == LANE_INDEX_NONE || SectionIndex == INDEX_NONE
+		|| !SplineComp->GetLaneSections().IsValidIndex(SectionIndex))
+	{
+		if (GEngine)
+		{
+			GEngine->AddOnScreenDebugMessage(
+				991220, 3.0f, FColor::Orange,
+				TEXT("[MetaLandRoad] Add Width Key failed: select a lane in the section first"));
+		}
+		return;
+	}
+
+	const int32 LaneSectionIndex = MetaLandRoadLaneVisualization::ResolveLaneSectionIndexForSpan(
+		SplineComp, SectionIndex, LaneIndex);
+	if (LaneSectionIndex == INDEX_NONE
+		|| !SplineComp->GetLaneSections().IsValidIndex(LaneSectionIndex)
+		|| !SplineComp->GetLaneSection(LaneSectionIndex).CheckLaneIndex(LaneIndex))
+	{
+		return;
+	}
+
 	const FScopedTransaction Transaction(LOCTEXT("AddWidthKey", "Add Width Key"));
 	SplineComp->Modify();
 
-	int32 SectionIndex = RoadSectionSelectionState->GetSelectedSectionIndex();
-	int32 LaneIndex = RoadSectionSelectionState->GetSelectedLaneIndex();
-	if (LaneIndex == LANE_INDEX_NONE && CachedLaneHoveredLaneIndex != LANE_INDEX_NONE)
-	{
-		RoadSectionSelectionState->Modify();
-		if (CachedLaneHoveredSectionIndex != INDEX_NONE)
-		{
-			RoadSectionSelectionState->SetSelectedSection(CachedLaneHoveredSectionIndex);
-			SectionIndex = CachedLaneHoveredSectionIndex;
-		}
-		RoadSectionSelectionState->SetSelectedLane(CachedLaneHoveredLaneIndex);
-		LaneIndex = CachedLaneHoveredLaneIndex;
-	}
-	if (LaneIndex == LANE_INDEX_NONE || SectionIndex == INDEX_NONE)
-	{
-		return;
-	}
-
-	FMetaLandRoadLaneSection& SelectedSection = SplineComp->GetLaneSection(
-		MetaLandRoadLaneVisualization::ResolveLaneSectionIndexForSpan(SplineComp, SectionIndex, LaneIndex));
-	if (!SelectedSection.CheckLaneIndex(LaneIndex))
-	{
-		return;
-	}
+	FMetaLandRoadLaneSection& SelectedSection = SplineComp->GetLaneSection(LaneSectionIndex);
 	FMetaLandRoadLane& SelectedLane = SelectedSection.GetLaneByIndex(LaneIndex);
 
 	if (SelectedLane.Width.GetNumKeys() == 0)
@@ -3793,23 +4173,62 @@ void FMoKuEditSplinesComponentVisualizer::OnAddWidthKey()
 		SelectedLane.Width.GetKey(StartHandle).TangentMode = ERichCurveTangentMode::RCTM_Auto;
 	}
 
-	float SplineInputKey = RoadSectionSelectionState->GetCachedSplineKey();
-	if (RoadSectionSelectionState->GetLastPickSplineKey() >= 0.0f)
+	const double SpanS0 = SplineComp->GetLaneSection(SectionIndex).SOffset;
+	const double SpanS1 = MetaLandRoad::ResolveSectionEndS(SplineComp, SectionIndex);
+	const UMetaLandRoadSplineComponent::FMetaLandRoadLaneRange Range =
+		SplineComp->GetLaneRange(SectionIndex, LaneIndex);
+	const double RangeS0 = Range.EndS > Range.StartS + KINDA_SMALL_NUMBER ? Range.StartS : SpanS0;
+	const double RangeS1 = Range.EndS > Range.StartS + KINDA_SMALL_NUMBER ? Range.EndS : SpanS1;
+	const double ClipS0 = FMath::Max(SpanS0, RangeS0);
+	const double ClipS1 = FMath::Min(SpanS1, RangeS1);
+	if (ClipS1 <= ClipS0 + KINDA_SMALL_NUMBER)
+	{
+		return;
+	}
+
+	double S0 = -1.0;
+	float SplineInputKey = CachedLaneHoveredSplineKey;
+	if (SplineInputKey < 0.0f)
 	{
 		SplineInputKey = RoadSectionSelectionState->GetLastPickSplineKey();
 	}
-	const double S0 = SplineComp->GetDistanceAlongSplineAtSplineInputKey(SplineInputKey);
-	const UMetaLandRoadSplineComponent::FMetaLandRoadLaneRange Range = SplineComp->GetLaneRange(SectionIndex, LaneIndex);
-	const double S = S0 - Range.StartS;
-
-	if (S0 < Range.StartS || S0 > Range.EndS)
+	if (SplineInputKey < 0.0f)
 	{
-		return;
+		SplineInputKey = RoadSectionSelectionState->GetCachedSplineKey();
+	}
+	if (SplineInputKey >= 0.0f)
+	{
+		S0 = SplineComp->GetDistanceAlongSplineAtSplineInputKey(SplineInputKey);
+	}
+	if (S0 < ClipS0 || S0 > ClipS1)
+	{
+		S0 = 0.5 * (ClipS0 + ClipS1);
 	}
 
+	double S = S0 - RangeS0;
 	if (LaneWidthCurveContainsKeyAtS(SelectedLane.Width, S))
 	{
-		return;
+		bool bFoundSlot = false;
+		for (int32 Step = 1; Step <= 8; ++Step)
+		{
+			const double CandidateS = FMath::Lerp(ClipS0, ClipS1, static_cast<double>(Step) / 9.0) - RangeS0;
+			if (!LaneWidthCurveContainsKeyAtS(SelectedLane.Width, CandidateS))
+			{
+				S = CandidateS;
+				bFoundSlot = true;
+				break;
+			}
+		}
+		if (!bFoundSlot)
+		{
+			if (GEngine)
+			{
+				GEngine->AddOnScreenDebugMessage(
+					991221, 3.0f, FColor::Orange,
+					TEXT("[MetaLandRoad] Add Width Key failed: no free slot on this section"));
+			}
+			return;
+		}
 	}
 
 	int32 KeyIndex = 0;
@@ -3833,13 +4252,14 @@ void FMoKuEditSplinesComponentVisualizer::OnAddWidthKey()
 	SelectedLane.Width.Keys.Insert(NewKey, KeyIndex + 1);
 	MetaLandRoad::EnsureLaneWidthCurveCubic(SelectedLane.Width);
 
-	RoadSectionSelectionState->Modify();
-	RoadSectionSelectionState->SetPrimaryLaneSelection(SectionIndex, LaneIndex, false);
-	RoadSectionSelectionState->SetSelectedKeyIndex(KeyIndex + 1);
-	const double KeyS = SelectedLane.GetStartOffset() + SelectedLane.Width.Keys[KeyIndex + 1].Time;
-	RoadSectionSelectionState->SetCachedDataAtLane(SectionIndex, LaneIndex, KeyS, 1.0);
-
+	const int32 NewKeyIndex = KeyIndex + 1;
+	const double NewKeyS = SelectedLane.GetStartOffset() + SelectedLane.Width.Keys[NewKeyIndex].Time;
 	SplineComp->UpdateRoadLayout();
+
+	RoadSectionSelectionState->Modify();
+	RoadSectionSelectionState->SetWidthKeySelection(SectionIndex, LaneIndex, NewKeyIndex);
+	RoadSectionSelectionState->SetCachedDataAtLane(SectionIndex, LaneIndex, NewKeyS, 1.0);
+	EnsureNativeEditTranslateWidget();
 	RefreshRoadMeshAndRedraw(SplineComp);
 }
 
@@ -3900,7 +4320,9 @@ void FMoKuEditSplinesComponentVisualizer::GenerateLaneWidthContextMenuSections(F
 	const FMetaLandRoadSectionComponentVisualizerCommands& Commands = FMetaLandRoadSectionComponentVisualizerCommands::Get();
 	const bool bWidthKeySelected =
 		RoadSectionSelectionState->GetStateVerified() >= EMetaLandRoadSectionSelectionState::Key;
-	const bool bShowWidthMenu = RoadSectionSelectionState->HasLaneWidthMenuContext();
+	const bool bShowWidthMenu = RoadSectionSelectionState->HasLaneWidthMenuContext()
+		|| CachedLaneHoveredLaneIndex != LANE_INDEX_NONE
+		|| RoadSectionSelectionState->GetStateVerified() >= EMetaLandRoadSectionSelectionState::Section;
 
 	InMenuBuilder.BeginSection("MetaLandRoadLaneEdit", LOCTEXT("ContextMenuRoadLane", "Lane"));
 	InMenuBuilder.AddMenuEntry(Commands.AddLaneToLeft);
@@ -3952,6 +4374,23 @@ bool FMoKuEditSplinesComponentVisualizer::HasMainLineSectionMenuContext() const
 	return false;
 }
 
+void FMoKuEditSplinesComponentVisualizer::AppendMetaLandRoadCurveMenu(FMenuBuilder& MenuBuilder) const
+{
+	MenuBuilder.BeginSection("MetaLandRoadCurve", LOCTEXT("MetaLandRoadCurve", "MetaLandRoad Curve"));
+	MenuBuilder.AddMenuEntry(
+		LOCTEXT("AddSplinePointHere", "Add Spline Point Here"),
+		LOCTEXT("AddSplinePointHereTooltip", "Insert a point on the Bezier at the cursor."),
+		FSlateIcon(),
+		FUIAction(
+			FExecuteAction::CreateSP(
+				const_cast<FMoKuEditSplinesComponentVisualizer*>(this),
+				&FMoKuEditSplinesComponentVisualizer::OnSafeAddKeyToSegment),
+			FCanExecuteAction::CreateSP(
+				const_cast<FMoKuEditSplinesComponentVisualizer*>(this),
+				&FMoKuEditSplinesComponentVisualizer::CanAddSplinePointOnCurve)));
+	MenuBuilder.EndSection();
+}
+
 TSharedPtr<SWidget> FMoKuEditSplinesComponentVisualizer::GenerateContextMenu() const
 {
 	if (FMetaLandRoadModule::Get().IsLaneEditMode())
@@ -3973,16 +4412,17 @@ TSharedPtr<SWidget> FMoKuEditSplinesComponentVisualizer::GenerateContextMenu() c
 		return SectionMenu.MakeWidget();
 	}
 
-	// Alt+W: identical to engine FSplineComponentVisualizer (Add/Delete/Duplicate Point鈥?.
-	return FSplineComponentVisualizer::GenerateContextMenu();
+	FMenuBuilder MenuBuilder(true, nullptr);
+	AppendMetaLandRoadCurveMenu(MenuBuilder);
+	return MenuBuilder.MakeWidget();
 }
 
 void FMoKuEditSplinesComponentVisualizer::GenerateContextMenuSections(FMenuBuilder& InMenuBuilder) const
 {
 	if (!bSectionLineEditMode)
 	{
-		// Must forward 鈥?FSplineComponentVisualizer::GenerateContextMenu() calls this virtually.
-		FSplineComponentVisualizer::GenerateContextMenuSections(InMenuBuilder);
+		// Never forward to FSplineComponentVisualizer — that is the default Snap/Align menu.
+		AppendMetaLandRoadCurveMenu(InMenuBuilder);
 		return;
 	}
 
@@ -4014,6 +4454,9 @@ void FMoKuEditSplinesComponentVisualizer::GenerateContextMenuSections(FMenuBuild
 		return this->bSectionLineEditMode && this->HasMainLineSectionMenuContext();
 	};
 
+	const FMetaLandRoadSectionComponentVisualizerCommands& Commands =
+		FMetaLandRoadSectionComponentVisualizerCommands::Get();
+
 	InMenuBuilder.BeginSection("MetaLandRoadSection", LOCTEXT("ContextMenuRoadSection", "Road Section"));
 	InMenuBuilder.AddMenuEntry(
 		LOCTEXT("AddSectionFromSelection", "Add Section"),
@@ -4027,6 +4470,8 @@ void FMoKuEditSplinesComponentVisualizer::GenerateContextMenuSections(FMenuBuild
 				const_cast<FMoKuEditSplinesComponentVisualizer*>(this)->TryAddSectionFromLaneSelection();
 			},
 			CanEditSection));
+	InMenuBuilder.AddMenuEntry(Commands.AddLeftSection);
+	InMenuBuilder.AddMenuEntry(Commands.AddRightSection);
 	InMenuBuilder.AddMenuEntry(
 		LOCTEXT("DeleteSection", "Delete Section"),
 		LOCTEXT("DeleteSectionTooltip", "Delete current road section."),
@@ -4034,8 +4479,9 @@ void FMoKuEditSplinesComponentVisualizer::GenerateContextMenuSections(FMenuBuild
 		MakeSectionAction(
 			[this]() { const_cast<FMoKuEditSplinesComponentVisualizer*>(this)->OnDeleteSection(); },
 			CanEditSection));
+	InMenuBuilder.AddMenuEntry(Commands.DeleteLeftSection);
+	InMenuBuilder.AddMenuEntry(Commands.DeleteRightSection);
 	InMenuBuilder.EndSection();
-	// Alt+E: selection-driven Add Section (no Left/Right menu). Points = Alt+W.
 }
 
 void FMoKuEditSplinesComponentVisualizer::OnSetRoadSplinePointType(EMetaLandRoadSplinePointType Mode)
@@ -4117,7 +4563,18 @@ void FMoKuEditSplinesComponentVisualizer::EnsureNativeEditTranslateWidget(FEdito
 	if (Client)
 	{
 		Client->SetWidgetMode(UE::Widget::WM_Translate);
+		Client->ShowWidget(true);
 	}
+	GLevelEditorModeTools().SetWidgetMode(UE::Widget::WM_Translate);
+	GLevelEditorModeTools().SetShowWidget(true);
+}
+
+bool FMoKuEditSplinesComponentVisualizer::HasSelectedLaneWidthKey() const
+{
+	return FMetaLandRoadModule::Get().IsLaneEditMode()
+		&& RoadSectionSelectionState
+		&& RoadSectionSelectionState->GetStateVerified() >= EMetaLandRoadSectionSelectionState::Key
+		&& RoadSectionSelectionState->GetSelectedKeyIndex() != INDEX_NONE;
 }
 
 bool FMoKuEditSplinesComponentVisualizer::FinishPickContextMenu(
@@ -4237,6 +4694,15 @@ void FMoKuEditSplinesComponentVisualizer::TickLaneEditHover()
 	const int32 PrevBoundary = CachedLaneHoveredSectionBoundaryIndex;
 	const bool PrevWidthIsKey = CachedLaneHoveredWidthIsKey;
 	const bool PrevBoundaryLine = CachedLaneHoveredBoundaryLine;
+	const float PrevSplineKey = CachedLaneHoveredSplineKey;
+
+	// Freeze a valid hover only while a context menu is actually open.
+	if (PrevSection != INDEX_NONE
+		&& FSlateApplication::IsInitialized()
+		&& FSlateApplication::Get().AnyMenusVisible())
+	{
+		return;
+	}
 
 	CachedLaneHoveredSectionIndex = INDEX_NONE;
 	CachedLaneHoveredLaneIndex = LANE_INDEX_NONE;
@@ -4244,6 +4710,7 @@ void FMoKuEditSplinesComponentVisualizer::TickLaneEditHover()
 	CachedLaneHoveredWidthIsKey = false;
 	CachedLaneHoveredSectionBoundaryIndex = INDEX_NONE;
 	CachedLaneHoveredBoundaryLine = false;
+	CachedLaneHoveredSplineKey = -1.0f;
 
 	if (!GCurrentLevelEditingViewportClient || !GCurrentLevelEditingViewportClient->Viewport)
 	{
@@ -4280,7 +4747,7 @@ void FMoKuEditSplinesComponentVisualizer::TickLaneEditHover()
 		return;
 	}
 
-	// Screen-space picks only 鈥?GetHitProxy re-enters DrawVisualization.
+	// Screen-space picks only — GetHitProxy re-enters DrawVisualization.
 	int32 PrimarySectionIndex = INDEX_NONE;
 	int32 PrimaryLaneIndex = LANE_INDEX_NONE;
 	int32 PrimaryWidthIndex = INDEX_NONE;
@@ -4300,9 +4767,32 @@ void FMoKuEditSplinesComponentVisualizer::TickLaneEditHover()
 	const bool bCtrlDown =
 		FSlateApplication::IsInitialized()
 		&& FSlateApplication::Get().GetModifierKeys().IsControlDown();
-	const bool bWidthKeyGizmoActive =
-		RoadSectionSelectionState
-		&& RoadSectionSelectionState->GetStateVerified() >= EMetaLandRoadSectionSelectionState::Key;
+	const bool bDraggingGizmo = IsMouseGizmoDrag(GCurrentLevelEditingViewportClient, Viewport);
+
+	auto RecordHoveredSplineKey = [&](int32 SectionIndex)
+	{
+		CachedLaneHoveredSplineKey = -1.0f;
+		if (!SplineComp->GetLaneSections().IsValidIndex(SectionIndex) || !View
+			|| !GCurrentLevelEditingViewportClient)
+		{
+			return;
+		}
+
+		const FViewportClick Click(
+			View,
+			GCurrentLevelEditingViewportClient,
+			EKeys::LeftMouseButton,
+			IE_Pressed,
+			MousePos.X,
+			MousePos.Y);
+		const double S0 = SplineComp->GetLaneSection(SectionIndex).SOffset;
+		const double S1 = MetaLandRoad::ResolveSectionEndS(SplineComp, SectionIndex);
+		CachedLaneHoveredSplineKey = SplineComp->ClosestKeyToSegment2(
+			static_cast<float>(S0),
+			static_cast<float>(S1),
+			Click.GetOrigin(),
+			Click.GetOrigin() + Click.GetDirection() * 50000.0f);
+	};
 
 	auto ApplyWidthKeyHover = [&]()
 	{
@@ -4311,6 +4801,7 @@ void FMoKuEditSplinesComponentVisualizer::TickLaneEditHover()
 		CachedLaneHoveredWidthIndex = WidthPick.WidthIndex;
 		CachedLaneHoveredWidthIsKey = true;
 		CachedLaneHoveredBoundaryLine = false;
+		RecordHoveredSplineKey(WidthPick.SectionIndex);
 	};
 
 	auto ApplySectionBoundaryHover = [&]()
@@ -4320,28 +4811,36 @@ void FMoKuEditSplinesComponentVisualizer::TickLaneEditHover()
 		CachedLaneHoveredWidthIndex = INDEX_NONE;
 		CachedLaneHoveredWidthIsKey = false;
 		CachedLaneHoveredBoundaryLine = true;
+		RecordHoveredSplineKey(WidthPick.SectionIndex);
 	};
 
-	// While width-key gizmo is active: suppress hover so it cannot compete with gizmo drag.
-	if (bWidthKeyGizmoActive)
+	auto ApplyFaceHover = [&](const FMetaLandRoadLaneFacePickResult& FacePick)
 	{
-		CachedLaneHoveredSectionIndex = INDEX_NONE;
-		CachedLaneHoveredLaneIndex = LANE_INDEX_NONE;
+		CachedLaneHoveredSectionIndex = FacePick.SectionIndex;
+		CachedLaneHoveredLaneIndex = FacePick.LaneIndex;
 		CachedLaneHoveredWidthIndex = INDEX_NONE;
 		CachedLaneHoveredWidthIsKey = false;
-		CachedLaneHoveredSectionBoundaryIndex = INDEX_NONE;
-		CachedLaneHoveredBoundaryLine = false;
+		CachedLaneHoveredBoundaryLine = true;
+		RecordHoveredSplineKey(FacePick.SectionIndex);
+	};
+
+	// Only freeze hover while the width-key widget is being dragged.
+	if (bDraggingGizmo)
+	{
+		CachedLaneHoveredSectionIndex = PrevSection;
+		CachedLaneHoveredLaneIndex = PrevLane;
+		CachedLaneHoveredWidthIndex = PrevWidth;
+		CachedLaneHoveredWidthIsKey = PrevWidthIsKey;
+		CachedLaneHoveredSectionBoundaryIndex = PrevBoundary;
+		CachedLaneHoveredBoundaryLine = PrevBoundaryLine;
+		CachedLaneHoveredSplineKey = PrevSplineKey;
 	}
 	else if (bCtrlDown)
 	{
 		FMetaLandRoadLaneFacePickResult FacePick;
 		if (MetaLandRoadLaneVisualization::PickLaneFaceAtMouse(SplineComp, *View, MousePos, FacePick))
 		{
-			CachedLaneHoveredSectionIndex = FacePick.SectionIndex;
-			CachedLaneHoveredLaneIndex = FacePick.LaneIndex;
-			CachedLaneHoveredWidthIndex = INDEX_NONE;
-			CachedLaneHoveredWidthIsKey = false;
-			CachedLaneHoveredBoundaryLine = false;
+			ApplyFaceHover(FacePick);
 		}
 	}
 	else if (MetaLandRoadLaneEditPick::PickLaneWidthKeyAtMouse(
@@ -4352,8 +4851,8 @@ void FMoKuEditSplinesComponentVisualizer::TickLaneEditHover()
 		PrimaryLaneIndex,
 		PrimaryWidthIndex,
 		MultiSelectedLanes,
-		CachedLaneHoveredSectionIndex,
-		CachedLaneHoveredLaneIndex,
+		INDEX_NONE,
+		LANE_INDEX_NONE,
 		static_cast<float>(MetaLandRoadLaneEditPick::LaneWidthKeyHoverRadiusPx),
 		WidthPick))
 	{
@@ -4367,6 +4866,14 @@ void FMoKuEditSplinesComponentVisualizer::TickLaneEditHover()
 		WidthPick))
 	{
 		ApplySectionBoundaryHover();
+	}
+	else
+	{
+		FMetaLandRoadLaneFacePickResult FacePick;
+		if (MetaLandRoadLaneVisualization::PickLaneFaceAtMouse(SplineComp, *View, MousePos, FacePick))
+		{
+			ApplyFaceHover(FacePick);
+		}
 	}
 
 	if (GEditor && (PrevSection != CachedLaneHoveredSectionIndex
@@ -4431,9 +4938,92 @@ void FMoKuEditSplinesComponentVisualizer::TickNativeEditHover()
 	}
 }
 
+bool FMoKuEditSplinesComponentVisualizer::EnsureLaneEditMenuSelection()
+{
+	UMetaLandRoadSplineComponent* SplineComp = nullptr;
+	if (RoadSectionSelectionState)
+	{
+		SplineComp = RoadSectionSelectionState->GetSelectedSpline();
+	}
+	if (!SplineComp)
+	{
+		SplineComp = GetEditedMetaLandRoadSpline();
+	}
+	if (!SplineComp)
+	{
+		SplineComp = FMetaLandRoadModule::Get().GetActiveNativeEditSpline();
+	}
+	if (!SplineComp)
+	{
+		return false;
+	}
+
+	SetActiveForSpline(SplineComp);
+	FComponentPropertyPath Path(SplineComp);
+	if (Path.IsValid() && RoadSectionSelectionState)
+	{
+		if (RoadSectionSelectionState->GetSelectedSpline() != SplineComp)
+		{
+			RoadSectionSelectionState->SetSelectedSpline(Path);
+		}
+		if (RoadSectionSelectionState->GetSelectedSectionIndex() == INDEX_NONE
+			&& SplineComp->GetLaneSectionsNum() > 0)
+		{
+			RoadSectionSelectionState->SetSelectedSection(0);
+		}
+	}
+
+	if (CachedLaneHoveredLaneIndex != LANE_INDEX_NONE
+		&& CachedLaneHoveredSectionIndex != INDEX_NONE
+		&& RoadSectionSelectionState
+		&& RoadSectionSelectionState->GetSelectedLaneIndex() == LANE_INDEX_NONE)
+	{
+		RoadSectionSelectionState->SetPrimaryLaneSelection(
+			CachedLaneHoveredSectionIndex,
+			CachedLaneHoveredLaneIndex,
+			false);
+	}
+
+	return RoadSectionSelectionState
+		&& RoadSectionSelectionState->GetStateVerified() >= EMetaLandRoadSectionSelectionState::Section;
+}
+
+bool FMoKuEditSplinesComponentVisualizer::CanAddLaneInCurrentMode() const
+{
+	if (!RoadSectionSelectionState)
+	{
+		return false;
+	}
+	if (FMetaLandRoadModule::Get().IsLaneEditMode())
+	{
+		return GetEditedMetaLandRoadSpline() != nullptr
+			|| RoadSectionSelectionState->GetSelectedSpline() != nullptr
+			|| FMetaLandRoadModule::Get().GetActiveNativeEditSpline() != nullptr;
+	}
+	return bSectionLineEditMode
+		&& RoadSectionSelectionState->GetStateVerified() >= EMetaLandRoadSectionSelectionState::Section;
+}
+
+bool FMoKuEditSplinesComponentVisualizer::CanDeleteLaneInCurrentMode() const
+{
+	if (!RoadSectionSelectionState)
+	{
+		return false;
+	}
+	if (FMetaLandRoadModule::Get().IsLaneEditMode())
+	{
+		return RoadSectionSelectionState->GetStateVerified() >= EMetaLandRoadSectionSelectionState::Lane
+			|| RoadSectionSelectionState->GetMultiSelectedLanes().Num() > 0
+			|| CachedLaneHoveredLaneIndex != LANE_INDEX_NONE;
+	}
+	return bSectionLineEditMode
+		&& (RoadSectionSelectionState->GetStateVerified() >= EMetaLandRoadSectionSelectionState::Lane
+			|| RoadSectionSelectionState->GetMultiSelectedLanes().Num() > 0);
+}
+
 void FMoKuEditSplinesComponentVisualizer::SetActiveForSpline(UMetaLandRoadSplineComponent* SplineComp)
 {
-	if (!SplineComp || !GUnrealEd || !GCurrentLevelEditingViewportClient)
+	if (!SplineComp)
 	{
 		return;
 	}
@@ -4448,7 +5038,339 @@ void FMoKuEditSplinesComponentVisualizer::SetActiveForSpline(UMetaLandRoadSpline
 		RoadSectionSelectionState->SetSelectedSpline(Path);
 	}
 
-	ActivateRoadVisualization();
+	if (GUnrealEd && GCurrentLevelEditingViewportClient)
+	{
+		ActivateRoadVisualization();
+	}
+}
+
+bool FMoKuEditSplinesComponentVisualizer::EnsureKeySelectionForSegmentSplit()
+{
+	USplineComponent* SplineComp = ResolveSplineForAddPoint();
+	if (!SplineComp)
+	{
+		UE_LOG(LogTemp, Error, TEXT("[MetaLandRoad] Add point aborted: no edited spline"));
+		if (GEngine)
+		{
+			GEngine->AddOnScreenDebugMessage(
+				991140, 3.0f, FColor::Red,
+				TEXT("[MetaLandRoad] Add point failed: no spline selection"));
+		}
+		return false;
+	}
+
+	if (SelectionState)
+	{
+		FComponentPropertyPath Path(SplineComp);
+		if (Path.IsValid())
+		{
+			SelectionState->SetSplinePropertyPath(Path);
+		}
+	}
+
+	const int32 NumPts = SplineComp->GetNumberOfSplinePoints();
+	if (NumPts < 2)
+	{
+		return false;
+	}
+
+	SplineComp->UpdateSpline();
+	int32 NumSegs = SplineComp->GetNumberOfSplineSegments();
+	if (NumSegs < 1)
+	{
+		NumSegs = SplineComp->IsClosedLoop() ? NumPts : (NumPts - 1);
+	}
+
+	int32 Seg = SelectionState ? SelectionState->GetSelectedSegmentIndex() : INDEX_NONE;
+	if (Seg == INDEX_NONE || Seg < 0 || Seg >= NumSegs)
+	{
+		Seg = CachedNativeHoveredSegment;
+	}
+	if (Seg == INDEX_NONE || Seg < 0 || Seg >= NumSegs)
+	{
+		if (CachedNativeHoveredKey != INDEX_NONE && CachedNativeHoveredKey >= 0)
+		{
+			Seg = FMath::Clamp(CachedNativeHoveredKey, 0, NumSegs - 1);
+		}
+		else
+		{
+			Seg = 0;
+		}
+	}
+
+	const int32 EndPt = SplineComp->IsClosedLoop()
+		? ((Seg + 1) % NumPts)
+		: FMath::Min(Seg + 1, NumPts - 1);
+	const FVector SegA = SplineComp->GetLocationAtSplinePoint(Seg, ESplineCoordinateSpace::World);
+	const FVector SegB = SplineComp->GetLocationAtSplinePoint(EndPt, ESplineCoordinateSpace::World);
+	FVector ClickWorld = SelectionState ? SelectionState->GetSelectedSplinePosition() : FVector::ZeroVector;
+	const bool bClickOnSegment = !ClickWorld.IsNearlyZero()
+		&& FVector::DistSquared(ClickWorld, SegA) + FVector::DistSquared(ClickWorld, SegB)
+			< FMath::Square(FVector::Dist(SegA, SegB) + 4000.0);
+	if (!bClickOnSegment)
+	{
+		ClickWorld = CaptureSplineAddClickWorld(SplineComp, Seg, (SegA + SegB) * 0.5);
+	}
+	if (ClickWorld.IsNearlyZero())
+	{
+		ClickWorld = (SegA + SegB) * 0.5;
+	}
+
+	if (SelectionState)
+	{
+		SelectionState->Modify();
+		SelectionState->SetSelectedSegmentIndex(Seg);
+		SelectionState->SetSelectedSplinePosition(ClickWorld);
+	}
+
+	UE_LOG(
+		LogTemp,
+		Log,
+		TEXT("[MetaLandRoad] Add point ready: seg=%d pts=%d pos=%s (no key auto-select)"),
+		Seg,
+		NumPts,
+		*ClickWorld.ToCompactString());
+	return true;
+}
+
+bool FMoKuEditSplinesComponentVisualizer::TryInsertSplinePointPreservingCurve()
+{
+	USplineComponent* SplineComp = ResolveSplineForAddPoint();
+	if (!SplineComp)
+	{
+		return false;
+	}
+	if (SelectionState)
+	{
+		FComponentPropertyPath Path(SplineComp);
+		if (Path.IsValid())
+		{
+			SelectionState->SetSplinePropertyPath(Path);
+		}
+	}
+
+	const int32 NumPts = SplineComp->GetNumberOfSplinePoints();
+	if (NumPts < 2)
+	{
+		UE_LOG(LogTemp, Error, TEXT("[MetaLandRoad] Add point: need at least 2 spline points"));
+		return false;
+	}
+
+	SplineComp->UpdateSpline();
+	int32 NumSegs = SplineComp->GetNumberOfSplineSegments();
+	if (NumSegs < 1)
+	{
+		NumSegs = SplineComp->IsClosedLoop() ? NumPts : (NumPts - 1);
+	}
+	int32 Seg = SelectionState ? SelectionState->GetSelectedSegmentIndex() : INDEX_NONE;
+	if (Seg == INDEX_NONE || Seg < 0 || Seg >= NumSegs)
+	{
+		Seg = CachedNativeHoveredSegment;
+	}
+	if (Seg == INDEX_NONE || Seg < 0 || Seg >= NumSegs)
+	{
+		Seg = 0;
+	}
+	if (Seg + 1 >= NumPts && !SplineComp->IsClosedLoop())
+	{
+		UE_LOG(LogTemp, Error, TEXT("[MetaLandRoad] Add point: invalid segment %d (pts=%d segs=%d)"), Seg, NumPts, NumSegs);
+		return false;
+	}
+
+	const int32 I0 = Seg;
+	const int32 I1 = (Seg + 1 < NumPts) ? (Seg + 1) : 0;
+	const int32 InsertIndex = Seg + 1;
+	const FVector P0 = SplineComp->GetLocationAtSplinePoint(I0, ESplineCoordinateSpace::World);
+	const FVector P1 = SplineComp->GetLocationAtSplinePoint(I1, ESplineCoordinateSpace::World);
+	FVector ClickWorld = SelectionState ? SelectionState->GetSelectedSplinePosition() : FVector::ZeroVector;
+	if (ClickWorld.IsNearlyZero())
+	{
+		ClickWorld = CaptureSplineAddClickWorld(SplineComp, Seg, (P0 + P1) * 0.5);
+	}
+	const FVector Leave0 = SplineComp->GetLeaveTangentAtSplinePoint(I0, ESplineCoordinateSpace::World);
+	const FVector Arrive1 = SplineComp->GetArriveTangentAtSplinePoint(I1, ESplineCoordinateSpace::World);
+	const FVector C1 = P0 + Leave0 / 3.0;
+	const FVector C2 = P1 - Arrive1 / 3.0;
+
+	auto EvalBez = [](const FVector& A, const FVector& B, const FVector& C, const FVector& D, double T)
+	{
+		const double U = 1.0 - T;
+		return (U * U * U) * A + (3.0 * U * U * T) * B + (3.0 * U * T * T) * C + (T * T * T) * D;
+	};
+
+	double BestT = 0.5;
+	double BestDistSq = TNumericLimits<double>::Max();
+	FVector InsertWorld = EvalBez(P0, C1, C2, P1, 0.5);
+	for (int32 Step = 1; Step < 32; ++Step)
+	{
+		const double T = static_cast<double>(Step) / 32.0;
+		const FVector P = EvalBez(P0, C1, C2, P1, T);
+		const double DistSq = FVector::DistSquared(P, ClickWorld);
+		if (DistSq < BestDistSq)
+		{
+			BestDistSq = DistSq;
+			BestT = T;
+			InsertWorld = P;
+		}
+	}
+	BestT = FMath::Clamp(BestT, 0.08, 0.92);
+
+	const FVector A = FMath::Lerp(P0, C1, BestT);
+	const FVector B = FMath::Lerp(C1, C2, BestT);
+	const FVector C = FMath::Lerp(C2, P1, BestT);
+	const FVector D = FMath::Lerp(A, B, BestT);
+	const FVector E = FMath::Lerp(B, C, BestT);
+	InsertWorld = FMath::Lerp(D, E, BestT);
+
+	const FScopedTransaction Transaction(NSLOCTEXT("MetaLandRoad", "AddSplinePointOnCurve", "Add Spline Point On Curve"));
+	SplineComp->Modify();
+	if (AActor* Owner = SplineComp->GetOwner())
+	{
+		Owner->Modify();
+	}
+
+	const int32 NewIndex = InsertIndex;
+	const int32 EndIndexAfter = (I1 == 0) ? 0 : (I1 + 1);
+	SplineComp->AddSplinePointAtIndex(InsertWorld, NewIndex, ESplineCoordinateSpace::World, false);
+	if (SplineComp->GetNumberOfSplinePoints() <= NumPts)
+	{
+		UE_LOG(LogTemp, Error, TEXT("[MetaLandRoad] AddSplinePointAtIndex failed at %d (pts=%d)"), NewIndex, NumPts);
+		return false;
+	}
+	SplineComp->SetSplinePointType(I0, ESplinePointType::CurveCustomTangent, false);
+	SplineComp->SetSplinePointType(NewIndex, ESplinePointType::CurveCustomTangent, false);
+	SplineComp->SetSplinePointType(EndIndexAfter, ESplinePointType::CurveCustomTangent, false);
+
+	const FVector NewLeave0 = 3.0 * (A - P0);
+	const FVector NewArriveMid = 3.0 * (InsertWorld - D);
+	const FVector NewLeaveMid = 3.0 * (E - InsertWorld);
+	const FVector NewArrive1 = 3.0 * (P1 - C);
+	const FVector KeepArrive0 = SplineComp->GetArriveTangentAtSplinePoint(I0, ESplineCoordinateSpace::World);
+	const FVector KeepLeave1 = SplineComp->GetLeaveTangentAtSplinePoint(EndIndexAfter, ESplineCoordinateSpace::World);
+	SplineComp->SetTangentsAtSplinePoint(I0, KeepArrive0, NewLeave0, ESplineCoordinateSpace::World, false);
+	SplineComp->SetTangentsAtSplinePoint(NewIndex, NewArriveMid, NewLeaveMid, ESplineCoordinateSpace::World, false);
+	SplineComp->SetTangentsAtSplinePoint(EndIndexAfter, NewArrive1, KeepLeave1, ESplineCoordinateSpace::World, false);
+	SplineComp->UpdateSpline();
+	SplineComp->bSplineHasBeenEdited = true;
+
+	SelectNativeEditKey(NewIndex);
+
+	if (FProperty* CurvesProp = SplineCurvesProperty)
+	{
+		NotifyPropertyModified(SplineComp, CurvesProp);
+	}
+	if (UMetaLandRoadSplineComponent* RoadSpline = Cast<UMetaLandRoadSplineComponent>(SplineComp))
+	{
+		RoadSpline->GetRoadLayoutMutable().UpdateBounds(RoadSpline->GetSplineLength());
+		RoadSpline->UpdateLaneSectionBounds();
+		RoadSpline->GetRoadLayoutMutable().UpdateLayout(RoadSpline);
+		RefreshRoadMeshAndRedraw(RoadSpline, true);
+	}
+	else if (AActor* Owner = SplineComp->GetOwner())
+	{
+		Owner->PostEditMove(true);
+	}
+
+	UE_LOG(
+		LogTemp,
+		Warning,
+		TEXT("[MetaLandRoad] Inserted curve point %d on seg %d t=%.2f at %s"),
+		NewIndex,
+		Seg,
+		BestT,
+		*InsertWorld.ToCompactString());
+	if (GEngine)
+	{
+		GEngine->AddOnScreenDebugMessage(
+			991142,
+			3.0f,
+			FColor::Green,
+			FString::Printf(TEXT("[MetaLandRoad] Added spline point %d on curve"), NewIndex));
+	}
+	return true;
+}
+
+USplineComponent* FMoKuEditSplinesComponentVisualizer::ResolveSplineForAddPoint() const
+{
+	if (FMetaLandRoadModule::Get().IsNativeEditMode())
+	{
+		if (UMetaLandRoadSplineComponent* Active = FMetaLandRoadModule::Get().GetActiveNativeEditSpline())
+		{
+			return Active;
+		}
+	}
+	if (USplineComponent* Edited = GetEditedSplineComponent())
+	{
+		return Edited;
+	}
+	if (UMetaLandRoadSplineComponent* Meta = GetEditedMetaLandRoadSpline())
+	{
+		return Meta;
+	}
+	if (!GEditor)
+	{
+		return nullptr;
+	}
+	for (FSelectionIterator It(GEditor->GetSelectedActorIterator()); It; ++It)
+	{
+		if (AMoKuEditSplineActor* Road = Cast<AMoKuEditSplineActor>(*It))
+		{
+			if (UMoKuEditSplinesComponent* Spline = Road->GetSplineComponent())
+			{
+				return Spline;
+			}
+		}
+	}
+	return nullptr;
+}
+
+bool FMoKuEditSplinesComponentVisualizer::CanAddSplinePointOnCurve() const
+{
+	const USplineComponent* Spline = ResolveSplineForAddPoint();
+	return Spline && Spline->GetNumberOfSplinePoints() >= 2;
+}
+
+void FMoKuEditSplinesComponentVisualizer::OnSafeAddKeyToSegment()
+{
+	USplineComponent* Spline = ResolveSplineForAddPoint();
+	if (!Spline)
+	{
+		UE_LOG(LogTemp, Error, TEXT("[MetaLandRoad] Add point: no selected road spline"));
+		if (GEngine)
+		{
+			GEngine->AddOnScreenDebugMessage(
+				991140, 3.0f, FColor::Red, TEXT("[MetaLandRoad] Add point failed: select the road first"));
+		}
+		return;
+	}
+
+	if (SelectionState)
+	{
+		FComponentPropertyPath Path(Spline);
+		if (Path.IsValid())
+		{
+			SelectionState->SetSplinePropertyPath(Path);
+		}
+	}
+	if (UMetaLandRoadSplineComponent* RoadSpline = Cast<UMetaLandRoadSplineComponent>(Spline))
+	{
+		SetActiveForSpline(RoadSpline);
+	}
+
+	EnsureKeySelectionForSegmentSplit();
+
+	if (!TryInsertSplinePointPreservingCurve())
+	{
+		UE_LOG(LogTemp, Error, TEXT("[MetaLandRoad] Add point on curve failed"));
+		if (GEngine)
+		{
+			GEngine->AddOnScreenDebugMessage(
+				991140,
+				4.0f,
+				FColor::Red,
+				TEXT("[MetaLandRoad] Add point failed: could not insert on curve"));
+		}
+	}
 }
 
 void FMoKuEditSplinesComponentVisualizer::SyncEngineSelectionStateForSpline(
@@ -4463,8 +5385,24 @@ void FMoKuEditSplinesComponentVisualizer::SyncEngineSelectionStateForSpline(
 	if (SplinePropertyPath.IsValid()
 		&& SelectionState->GetSplinePropertyPath().GetComponent() != SplineComp)
 	{
+		const int32 KeptKey = SelectionState->GetLastKeyIndexSelected();
+		const int32 KeptSeg = SelectionState->GetSelectedSegmentIndex();
 		SelectionState->SetSplinePropertyPath(SplinePropertyPath);
-		ClearNativeKeySelection();
+		const int32 NumPts = SplineComp->GetNumberOfSplinePoints();
+		if (KeptKey != INDEX_NONE && KeptKey >= 0 && KeptKey < NumPts)
+		{
+			SelectionState->ClearSelectedKeys();
+			SelectionState->ModifySelectedKeys().Add(KeptKey);
+			SelectionState->SetLastKeyIndexSelected(KeptKey);
+			if (KeptSeg != INDEX_NONE && KeptSeg >= 0 && KeptSeg < SplineComp->GetNumberOfSplineSegments())
+			{
+				SelectionState->SetSelectedSegmentIndex(KeptSeg);
+			}
+		}
+		else
+		{
+			ClearNativeKeySelection();
+		}
 	}
 }
 
@@ -4478,8 +5416,43 @@ void FMoKuEditSplinesComponentVisualizer::ClearNativeKeySelection()
 	SelectionState->ClearSelectedSegmentIndex();
 	SelectionState->ClearSelectedTangentHandle();
 	SelectionState->SetLastKeyIndexSelected(INDEX_NONE);
-	CachedNativeHoveredKey = INDEX_NONE;
-	CachedNativeHoveredSegment = INDEX_NONE;
+}
+
+void FMoKuEditSplinesComponentVisualizer::SelectNativeEditKey(
+	int32 KeyIndex,
+	FEditorViewportClient* ViewportClient)
+{
+	UMetaLandRoadSplineComponent* SplineComp = FMetaLandRoadModule::Get().GetActiveNativeEditSpline();
+	if (!SplineComp)
+	{
+		SplineComp = GetEditedMetaLandRoadSpline();
+	}
+	if (!SplineComp || !SelectionState
+		|| KeyIndex < 0
+		|| KeyIndex >= SplineComp->GetNumberOfSplinePoints())
+	{
+		return;
+	}
+
+	FComponentPropertyPath Path(SplineComp);
+	if (Path.IsValid())
+	{
+		SelectionState->SetSplinePropertyPath(Path);
+	}
+	SelectionState->ClearSelectedKeys();
+	SelectionState->ModifySelectedKeys().Add(KeyIndex);
+	SelectionState->SetLastKeyIndexSelected(KeyIndex);
+	SelectionState->ClearSelectedSegmentIndex();
+	SelectionState->ClearSelectedTangentHandle();
+	SelectionState->SetSelectedSplinePosition(
+		SplineComp->GetLocationAtSplinePoint(KeyIndex, ESplineCoordinateSpace::World));
+	SetActiveForSpline(SplineComp);
+	ActivateRoadVisualization();
+	EnsureNativeEditTranslateWidget(ViewportClient);
+	if (GEditor)
+	{
+		GEditor->RedrawLevelEditingViewports(true);
+	}
 }
 
 #undef LOCTEXT_NAMESPACE

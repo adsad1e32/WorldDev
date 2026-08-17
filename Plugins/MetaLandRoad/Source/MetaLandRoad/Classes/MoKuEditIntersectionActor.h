@@ -125,6 +125,12 @@ class  AMoKuEditIntersectionActor : public AMoKuEditBaseActor
 		/** Recalculate arm cuts from linked road geometry and rebuild fill mesh. */
 		void RecookFromLinkedRoads();
 
+		/**
+		 * Copy Height/Weight falloff from the first linked road when this junction still has
+		 * empty / seed defaults — keeps Terrain settings on the shared base actor in sync.
+		 */
+		void SyncTerrainInfluenceFromLinkedRoads();
+
 		/** Debug: full junction recook + linked road refresh (Details button). */
 		UFUNCTION(CallInEditor, Category = "MetaLandRoad|Debug", meta = (DisplayName = "Recook Junction"))
 		void DebugRecookJunction();

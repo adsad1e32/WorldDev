@@ -1137,7 +1137,11 @@ void MoKuSplineEditorUtils::OctreeSegmentsIntersect(FSplineRoadActorOctree Octre
 	return nullptr;
 }
 
-bool MoKuSplineEditorUtils::DoSplineIntersect(USplineComponent* Spline1, USplineComponent* Spline2, FVector& OutIntersectionPoint)
+bool MoKuSplineEditorUtils::DoSplineIntersect(
+	USplineComponent* Spline1,
+	USplineComponent* Spline2,
+	FVector& OutIntersectionPoint,
+	float MaxHeightDeltaCm)
 {
 	if (!Spline1 || !Spline2)
 	{
@@ -1147,6 +1151,33 @@ bool MoKuSplineEditorUtils::DoSplineIntersect(USplineComponent* Spline1, USpline
 	{
 		return false;
 	}
+
+	auto AcceptHeightAtXY = [Spline1, Spline2, MaxHeightDeltaCm](FVector& InOutPoint) -> bool
+	{
+		// Query at mid-Z of both tips so elevated roads are not biased toward Z=0.
+		const float HintZ = 0.5f * (
+			Spline1->GetLocationAtSplinePoint(0, ESplineCoordinateSpace::World).Z
+			+ Spline2->GetLocationAtSplinePoint(0, ESplineCoordinateSpace::World).Z);
+		const FVector Query(InOutPoint.X, InOutPoint.Y, HintZ);
+		const float Key1 = Spline1->FindInputKeyClosestToWorldLocation(Query);
+		const float Key2 = Spline2->FindInputKeyClosestToWorldLocation(Query);
+		const float Z1 = Spline1->GetLocationAtSplineInputKey(Key1, ESplineCoordinateSpace::World).Z;
+		const float Z2 = Spline2->GetLocationAtSplineInputKey(Key2, ESplineCoordinateSpace::World).Z;
+		InOutPoint.Z = 0.5f * (Z1 + Z2);
+		// 0 (or negative) = ignore height — elevated / embankment roads still form hubs.
+		if (MaxHeightDeltaCm <= 0.0f)
+		{
+			return true;
+		}
+		const float DeltaZ = FMath::Abs(Z1 - Z2);
+		if (DeltaZ > MaxHeightDeltaCm)
+		{
+			UE_LOG(LogTemp, Verbose, TEXT("[RoadIntersect] skip XY cross — |ΔZ|=%.1f > max=%.1f (overpass)"),
+				DeltaZ, MaxHeightDeltaCm);
+			return false;
+		}
+		return true;
+	};
 
 	auto BuildSampledSegments = [](USplineComponent* Spline, TArray<TPair<FVector2D, FVector2D>>& OutSegments)
 	{
@@ -1199,9 +1230,11 @@ bool MoKuSplineEditorUtils::DoSplineIntersect(USplineComponent* Spline1, USpline
 				Seg2Alpha))
 			{
 				OutIntersectionPoint = FVector(Intersection2D.X, Intersection2D.Y, 0.0f);
-				const float ClosestKey = Spline1->FindInputKeyClosestToWorldLocation(OutIntersectionPoint);
-				OutIntersectionPoint.Z = Spline1->GetLocationAtSplineInputKey(ClosestKey, ESplineCoordinateSpace::World).Z;
-				return true;
+				if (AcceptHeightAtXY(OutIntersectionPoint))
+				{
+					return true;
+				}
+				// XY hit but height gap too large — keep searching other segments.
 			}
 		}
 	}
@@ -1240,9 +1273,7 @@ bool MoKuSplineEditorUtils::DoSplineIntersect(USplineComponent* Spline1, USpline
 	if (BestDistSq <= ProximityToleranceSq)
 	{
 		OutIntersectionPoint = (BestPointOnSpline1 + BestPointOnSpline2) * 0.5;
-		const float ClosestKey = Spline1->FindInputKeyClosestToWorldLocation(OutIntersectionPoint);
-		OutIntersectionPoint.Z = Spline1->GetLocationAtSplineInputKey(ClosestKey, ESplineCoordinateSpace::World).Z;
-		return true;
+		return AcceptHeightAtXY(OutIntersectionPoint);
 	}
 
 	return false;

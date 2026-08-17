@@ -3,6 +3,12 @@
 #include "MetaLandRoadLaneEditPick.h"
 #include "MetaLandRoadLaneVisualization.h"
 
+bool UMetaLandRoadSectionComponentVisualizerSelectionState::HasLaneWidthMenuContext() const
+{
+	return bLaneWidthMenuContext
+		|| GetStateVerified() >= EMetaLandRoadSectionSelectionState::Lane;
+}
+
 void UMetaLandRoadSectionComponentVisualizerSelectionState::SetCachedData(
 	const FVector& Position,
 	const FQuat& Rotation,
@@ -458,7 +464,15 @@ EMetaLandRoadSectionSelectionState UMetaLandRoadSectionComponentVisualizerSelect
 
 			if (State == EMetaLandRoadSectionSelectionState::Section && SelectedLaneIndex != LANE_INDEX_NONE)
 			{
-				return EMetaLandRoadSectionSelectionState::Component;
+				const int32 LaneSectionIndex = MetaLandRoadLaneVisualization::ResolveLaneSectionIndexForSpan(
+					Component,
+					SelectedSectionIndex,
+					SelectedLaneIndex);
+				if (LaneSectionIndex != INDEX_NONE
+					&& Component->GetLaneSection(LaneSectionIndex).CheckLaneIndex(SelectedLaneIndex))
+				{
+					return EMetaLandRoadSectionSelectionState::Lane;
+				}
 			}
 
 			if (State >= EMetaLandRoadSectionSelectionState::Lane)

@@ -29,9 +29,11 @@
 #include "EditorModeManager.h"
 #include "Tools/UEdMode.h"
 #include "EditSplineRoadInfo.h"
+#include "WorldLandscapeBlueprintBrush.h"
 #include "PrimitiveDrawingUtils.h"
 #include "MetaLandRoadLaneVisualization.h"
 #include "MetaLandRoadModule.h"
+#include "ComponentVisualizers/MetaLandRoadSectionComponentVisualizer.h"
 #include "Utils/MetaLandRoadCompVisUtils.h"
 #include "MetaLandRoadEditorMode.h"
 #include "MetaLandRoadTypes.h"
@@ -41,6 +43,11 @@
 #include "LevelEditorViewport.h"
 #include "SceneView.h"
 #include "Framework/Application/SlateApplication.h"
+#include "Engine/Engine.h"
+#include "Engine/Font.h"
+#include "CanvasItem.h"
+#include "CanvasTypes.h"
+#include "SceneView.h"
 
 
 #define LOCTEXT_NAMESPACE "UMetaLandRoadInteractiveTool"
@@ -120,7 +127,8 @@ namespace
 	}
 
 	/** Match RefreshDynamicRoadMesh default surface lift. */
-	constexpr float GuidanceMeshSurfaceZOffset = 10.0f;
+	// MetaRoad-like: tiny lift so PDI is visible; large values make rails look like a floating tower.
+	constexpr float GuidanceMeshSurfaceZOffset = 2.0f;
 
 	struct FEndSnapTargetLanePick
 	{
@@ -149,8 +157,8 @@ namespace
 			return false;
 		}
 
-		const double SnapDistSq = static_cast<double>(FMath::Max(SnapDistCm, 200.0f))
-			* static_cast<double>(FMath::Max(SnapDistCm, 200.0f));
+		const float PickCm = FMath::Clamp(SnapDistCm * 0.4f, 80.0f, 280.0f);
+		const double SnapDistSq = static_cast<double>(PickCm) * static_cast<double>(PickCm);
 		double BestDistSq = TNumericLimits<double>::Max();
 
 		for (TActorIterator<AMoKuEditSplineActor> It(World); It; ++It)
@@ -373,8 +381,9 @@ namespace
 		FVector NextLoc = SplineComponent->GetLocationAtSplinePoint(
 			NextIndex, ESplineCoordinateSpace::World);
 
+		const double DistToNext = FVector::Dist2D(MouthPinned, NextLoc);
 		const double Along = FVector::DotProduct(NextLoc - MouthPinned, Forward);
-		if (Along < 1.0)
+		if (DistToNext <= MinAlongCm * 2.0 && Along < 1.0)
 		{
 			const FVector Lateral = NextLoc - MouthPinned - Forward * Along;
 			NextLoc = MouthPinned + Forward * MinAlongCm + Lateral;
@@ -545,7 +554,7 @@ namespace
 		const float SplineLen = SnapSpline->GetSplineLength();
 		OutSampleDist = SampleDist;
 
-		const float MouthSnapCm = FMath::Max(SnapDistCm, 200.0f);
+		const float MouthSnapCm = FMath::Clamp(SnapDistCm * 0.4f, 80.0f, 280.0f);
 		const bool bNearStart = SampleDist <= MouthSnapCm;
 		const bool bNearEnd = SampleDist >= FMath::Max(0.0f, SplineLen - MouthSnapCm);
 		if (bNearStart || bNearEnd)
@@ -556,8 +565,7 @@ namespace
 				MouthS, MouthLeft, MouthRight, MouthCenter, ESplineCoordinateSpace::World))
 			{
 				const FVector MouthMid = (MouthLeft + MouthRight) * 0.5;
-				if (FVector::Dist2D(CursorWorld, MouthMid) <= static_cast<double>(MouthSnapCm) * 1.25
-					|| FVector::Dist2D(ApproachFrom, MouthMid) <= static_cast<double>(MouthSnapCm) * 2.0)
+				if (FVector::Dist2D(CursorWorld, MouthMid) <= static_cast<double>(MouthSnapCm))
 				{
 					const FVector SplineDir = SnapSpline->GetDirectionAtDistanceAlongSpline(
 						MouthS, ESplineCoordinateSpace::World).GetSafeNormal2D();
@@ -623,6 +631,184 @@ namespace
 	static void ApplyGuidanceSurfaceZ(FVector& Point)
 	{
 		Point.Z += GuidanceMeshSurfaceZOffset + GuidancePDILiftCm;
+	}
+
+	/** Vertical snap to landscape / ground — ignore road & junction meshes so draw does not climb their tops. */
+	static bool ProjectPointOntoLandscapeSurface(
+		UWorld* World,
+		FVector& InOutPoint,
+		const AActor* ExtraIgnoreActor = nullptr)
+	{
+		if (!World)
+		{
+			return false;
+		}
+
+		FCollisionQueryParams Params(SCENE_QUERY_STAT(MetaLandRoadSurfaceSnap), true);
+		Params.bTraceComplex = true;
+		if (ExtraIgnoreActor)
+		{
+			Params.AddIgnoredActor(ExtraIgnoreActor);
+		}
+		for (TActorIterator<AMoKuEditSplineActor> It(World); It; ++It)
+		{
+			if (IsValid(*It))
+			{
+				Params.AddIgnoredActor(*It);
+			}
+		}
+		for (TActorIterator<AMoKuEditIntersectionActor> It(World); It; ++It)
+		{
+			if (IsValid(*It))
+			{
+				Params.AddIgnoredActor(*It);
+			}
+		}
+
+		const FVector TraceStart(InOutPoint.X, InOutPoint.Y, InOutPoint.Z + 100000.0);
+		const FVector TraceEnd(InOutPoint.X, InOutPoint.Y, InOutPoint.Z - 200000.0);
+		FHitResult Hit;
+		if (!World->LineTraceSingleByChannel(Hit, TraceStart, TraceEnd, ECC_WorldStatic, Params))
+		{
+			return false;
+		}
+
+		InOutPoint.Z = Hit.ImpactPoint.Z;
+		return true;
+	}
+
+	static void BlendRailTowardEdge(TArray<FVector>& Rail, const FVector& Edge, bool bFromStart)
+	{
+		if (Rail.Num() < 2)
+		{
+			return;
+		}
+
+		const int32 BlendCount = FMath::Clamp(Rail.Num() / 4, 2, 6);
+		if (bFromStart)
+		{
+			Rail[0] = Edge;
+			for (int32 i = 1; i < BlendCount && i < Rail.Num(); ++i)
+			{
+				const double A = 1.0 - static_cast<double>(i) / static_cast<double>(BlendCount);
+				Rail[i] = FMath::Lerp(Rail[i], Edge, A * A);
+			}
+			return;
+		}
+
+		const int32 Last = Rail.Num() - 1;
+		Rail[Last] = Edge;
+		for (int32 k = 1; k < BlendCount && k <= Last; ++k)
+		{
+			const double A = 1.0 - static_cast<double>(k) / static_cast<double>(BlendCount);
+			Rail[Last - k] = FMath::Lerp(Rail[Last - k], Edge, A * A);
+		}
+	}
+
+	static void MatchEdgePairToRailTips(
+		const TArray<FVector>& Left,
+		const TArray<FVector>& Right,
+		FVector& EdgeL,
+		FVector& EdgeR,
+		bool bUseStart)
+	{
+		if (Left.Num() == 0 || Right.Num() == 0)
+		{
+			return;
+		}
+
+		const FVector LeftTip = bUseStart ? Left[0] : Left.Last();
+		const FVector RightTip = bUseStart ? Right[0] : Right.Last();
+		const double LL = FVector::Dist2D(LeftTip, EdgeL);
+		const double LR = FVector::Dist2D(LeftTip, EdgeR);
+		const double RL = FVector::Dist2D(RightTip, EdgeL);
+		const double RR = FVector::Dist2D(RightTip, EdgeR);
+		if (LR + RL < LL + RR)
+		{
+			Swap(EdgeL, EdgeR);
+		}
+	}
+
+	static FVector TransportOffsetRight(const FVector& Tangent, const FVector& PrevRight, const FVector& PreferRight)
+	{
+		FVector Right = FVector::CrossProduct(FVector::UpVector, Tangent).GetSafeNormal2D();
+		if (Right.IsNearlyZero())
+		{
+			return PrevRight.IsNearlyZero() ? FVector::RightVector : PrevRight;
+		}
+		if (!PreferRight.IsNearlyZero() && PrevRight.IsNearlyZero()
+			&& FVector::DotProduct(Right, PreferRight) < 0.0)
+		{
+			Right = -Right;
+		}
+		else if (!PrevRight.IsNearlyZero() && FVector::DotProduct(Right, PrevRight) < 0.0)
+		{
+			Right = -Right;
+		}
+		return Right;
+	}
+
+	static void SoftenGuidanceRailStart(
+		TArray<FVector>& Rail,
+		const FVector& TipEdge,
+		const FVector& TipTangent,
+		double StepCm)
+	{
+		(void)TipTangent;
+		(void)StepCm;
+		BlendRailTowardEdge(Rail, TipEdge, true);
+	}
+
+	static void SoftenGuidanceRailFreeEnd(TArray<FVector>& Rail)
+	{
+		if (Rail.Num() < 3)
+		{
+			return;
+		}
+
+		const int32 Last = Rail.Num() - 1;
+		const FVector PrevDir = (Rail[Last - 1] - Rail[Last - 2]).GetSafeNormal2D();
+		const FVector LastDir = (Rail[Last] - Rail[Last - 1]).GetSafeNormal2D();
+		if (PrevDir.IsNearlyZero() || LastDir.IsNearlyZero())
+		{
+			return;
+		}
+
+		// Hermite arrive whip / Right flip → outward hook at free end.
+		if (FVector::DotProduct(PrevDir, LastDir) < 0.55)
+		{
+			const double Len = FVector::Dist2D(Rail[Last], Rail[Last - 1]);
+			FVector Fixed = Rail[Last - 1] + PrevDir * Len;
+			Fixed.Z = Rail[Last].Z;
+			Rail[Last] = Fixed;
+		}
+	}
+
+	/** MetaRoad-style: dual-rail preview stays on one horizontal plane (+ small PDI lift). */
+	static void FlattenGuidanceRailToPlaneZ(TArray<FVector>& Rail, float PlaneZ)
+	{
+		for (FVector& P : Rail)
+		{
+			P.Z = PlaneZ;
+			ApplyGuidanceSurfaceZ(P);
+		}
+	}
+
+	/**
+	 * Guidance plane Z = landscape under tip XY (not elevated road-mesh / embankment Z).
+	 * Tip mesh can sit on a raised cliff from ZOffset; rails must stay MetaRoad-flat on the ground.
+	 */
+	static float ResolveGuidancePlaneZOnSurface(
+		UWorld* World,
+		const FVector& TipCenter,
+		const AActor* IgnoreActor)
+	{
+		FVector Probe = TipCenter;
+		if (World && ProjectPointOntoLandscapeSurface(World, Probe, IgnoreActor))
+		{
+			return static_cast<float>(Probe.Z);
+		}
+		return static_cast<float>(TipCenter.Z);
 	}
 
 	static int32 MapSpawnedBranchLaneIndex(int32 SourceLaneIndex, const TArray<int32>& SourceLanes)
@@ -749,7 +935,9 @@ namespace
 		double HalfWidthLeft,
 		double HalfWidthRight,
 		TArray<FVector>& OutLeft,
-		TArray<FVector>& OutRight)
+		TArray<FVector>& OutRight,
+		const FVector& ForcedStartTangent = FVector::ZeroVector,
+		const FVector& ForcedEndTangent = FVector::ZeroVector)
 	{
 		OutLeft.Reset();
 		OutRight.Reset();
@@ -759,29 +947,46 @@ namespace
 		}
 		OutLeft.Reserve(CenterSamples.Num());
 		OutRight.Reserve(CenterSamples.Num());
+		const FVector StartT = ForcedStartTangent.GetSafeNormal2D();
+		const FVector EndT = ForcedEndTangent.GetSafeNormal2D();
+		const int32 LastIdx = CenterSamples.Num() - 1;
+		FVector PrevRight = FVector::ZeroVector;
+		const FVector PreferRight = !StartT.IsNearlyZero()
+			? FVector::CrossProduct(FVector::UpVector, StartT).GetSafeNormal2D()
+			: FVector::ZeroVector;
 		for (int32 i = 0; i < CenterSamples.Num(); ++i)
 		{
 			FVector Tangent = FVector::ZeroVector;
-			if (i + 1 < CenterSamples.Num())
+			if (i == 0 && !StartT.IsNearlyZero())
 			{
-				Tangent += (CenterSamples[i + 1] - CenterSamples[i]).GetSafeNormal2D();
+				Tangent = StartT;
 			}
-			if (i > 0)
+			else if (i == LastIdx && !EndT.IsNearlyZero() && i > 0)
 			{
-				Tangent += (CenterSamples[i] - CenterSamples[i - 1]).GetSafeNormal2D();
+				const FVector PathT = (CenterSamples[i] - CenterSamples[i - 1]).GetSafeNormal2D();
+				Tangent = (!PathT.IsNearlyZero() && FVector::DotProduct(EndT, PathT) > 0.35)
+					? EndT
+					: (PathT.IsNearlyZero() ? EndT : PathT);
+			}
+			else
+			{
+				if (i + 1 < CenterSamples.Num())
+				{
+					Tangent += (CenterSamples[i + 1] - CenterSamples[i]).GetSafeNormal2D();
+				}
+				if (i > 0)
+				{
+					Tangent += (CenterSamples[i] - CenterSamples[i - 1]).GetSafeNormal2D();
+				}
 			}
 			if (!Tangent.Normalize())
 			{
-				Tangent = FVector::ForwardVector;
+				Tangent = !StartT.IsNearlyZero() ? StartT : FVector::ForwardVector;
 			}
-			// Match USplineComponent::GetRightVector (Cross(Up, Tangent)), not Cross(Tangent, Up).
-			const FVector Right = FVector::CrossProduct(FVector::UpVector, Tangent).GetSafeNormal2D();
-			FVector LeftPos = CenterSamples[i] - Right * HalfWidthLeft;
-			FVector RightPos = CenterSamples[i] + Right * HalfWidthRight;
-			ApplyGuidanceSurfaceZ(LeftPos);
-			ApplyGuidanceSurfaceZ(RightPos);
-			OutLeft.Add(LeftPos);
-			OutRight.Add(RightPos);
+			const FVector Right = TransportOffsetRight(Tangent, PrevRight, PreferRight);
+			PrevRight = Right;
+			OutLeft.Add(CenterSamples[i] - Right * HalfWidthLeft);
+			OutRight.Add(CenterSamples[i] + Right * HalfWidthRight);
 		}
 	}
 
@@ -810,6 +1015,103 @@ namespace
 		}
 	}
 
+	/** Centripetal Catmull-Rom (α=0.5): knot spacing = √|ΔP|. */
+	static double CatmullRomKnotDelta(const FVector& A, const FVector& B)
+	{
+		return FMath::Max(FMath::Sqrt(FVector::Dist2D(A, B)), 1.0);
+	}
+
+	/**
+	 * Ghost P0/P3 encode leave/arrive so a 2-point extend has determined tangents.
+	 * P1 = mouth, P2 = cursor/snap. Chord-length ghosts keep tangent magnitude consistent.
+	 */
+	static void BuildCentripetalCatmullRomGhosts(
+		const FVector& P1,
+		const FVector& P2,
+		const FVector& StartTangent,
+		const FVector& EndTangent,
+		FVector& OutP0,
+		FVector& OutP3)
+	{
+		const double Chord = FMath::Max(FVector::Dist2D(P1, P2), 50.0);
+		const FVector ChordDir = (P2 - P1).GetSafeNormal2D();
+		FVector T0 = StartTangent.GetSafeNormal2D();
+		FVector T1 = EndTangent.GetSafeNormal2D();
+		if (T0.IsNearlyZero())
+		{
+			T0 = ChordDir;
+		}
+		if (T1.IsNearlyZero())
+		{
+			T1 = ChordDir;
+		}
+		// Arrive pointing back at the source makes P3 fold over P2 → V kink at the mouth.
+		if (!ChordDir.IsNearlyZero() && FVector::DotProduct(T1, ChordDir) < 0.0)
+		{
+			T1 = -T1;
+		}
+		OutP0 = P1 - T0 * Chord;
+		OutP3 = P2 + T1 * Chord;
+		OutP0.Z = P1.Z;
+		OutP3.Z = P2.Z;
+	}
+
+	static FVector EvalCentripetalCatmullRomPoint(
+		const FVector& P0,
+		const FVector& P1,
+		const FVector& P2,
+		const FVector& P3,
+		double S)
+	{
+		const double T0 = 0.0;
+		const double T1 = T0 + CatmullRomKnotDelta(P0, P1);
+		const double T2 = T1 + CatmullRomKnotDelta(P1, P2);
+		const double T3 = T2 + CatmullRomKnotDelta(P2, P3);
+		const double T = FMath::Lerp(T1, T2, FMath::Clamp(S, 0.0, 1.0));
+
+		auto LerpKnot = [](double TA, const FVector& A, double TB, const FVector& B, double TNow) -> FVector
+		{
+			const double Den = TB - TA;
+			if (FMath::Abs(Den) < KINDA_SMALL_NUMBER)
+			{
+				return A;
+			}
+			return A + (B - A) * ((TNow - TA) / Den);
+		};
+
+		const FVector A1 = LerpKnot(T0, P0, T1, P1, T);
+		const FVector A2 = LerpKnot(T1, P1, T2, P2, T);
+		const FVector A3 = LerpKnot(T2, P2, T3, P3, T);
+		const FVector B1 = LerpKnot(T0, A1, T2, A2, T);
+		const FVector B2 = LerpKnot(T1, A2, T3, A3, T);
+		FVector C = LerpKnot(T1, B1, T2, B2, T);
+		C.Z = FMath::Lerp(P1.Z, P2.Z, static_cast<float>(FMath::Clamp(S, 0.0, 1.0)));
+		return C;
+	}
+
+	/** dP/ds on s∈[0,1] for Unreal CurveCustomTangent (matches the CR preview). */
+	static void ComputeCentripetalCatmullRomHermiteTangents(
+		const FVector& P1,
+		const FVector& P2,
+		const FVector& StartTangent,
+		const FVector& EndTangent,
+		FVector& OutM0,
+		FVector& OutM1)
+	{
+		FVector P0;
+		FVector P3;
+		BuildCentripetalCatmullRomGhosts(P1, P2, StartTangent, EndTangent, P0, P3);
+		const double T0 = 0.0;
+		const double T1 = T0 + CatmullRomKnotDelta(P0, P1);
+		const double T2 = T1 + CatmullRomKnotDelta(P1, P2);
+		const double T3 = T2 + CatmullRomKnotDelta(P2, P3);
+		const double DtSeg = FMath::Max(T2 - T1, KINDA_SMALL_NUMBER);
+		OutM0 = (P2 - P0) / FMath::Max(T2 - T0, KINDA_SMALL_NUMBER) * DtSeg;
+		OutM1 = (P3 - P1) / FMath::Max(T3 - T1, KINDA_SMALL_NUMBER) * DtSeg;
+		OutM0.Z = 0.0;
+		OutM1.Z = 0.0;
+	}
+
 	static void AppendHermiteSegment(
 		const FVector& P0,
 		const FVector& P1,
@@ -821,33 +1123,271 @@ namespace
 	{
 		const double Chord = FVector::Dist2D(P0, P1);
 		const int32 Segs = FMath::Max(1, FMath::CeilToInt(Chord / FMath::Max(StepCm, 10.0)));
-		// Wider handles → larger turn radius → fewer inner-edge self-intersections.
-		const FVector T0N = Tangent0.GetSafeNormal2D();
-		const FVector T1N = Tangent1.GetSafeNormal2D();
-		const FVector ChordDir = (P1 - P0).GetSafeNormal2D();
-		const double LeaveAlign = FVector::DotProduct(T0N, ChordDir);
-		// Larger handles → rounder arcs (was 0.58/0.48 — looked like two chords).
-		const double TangentScale = Chord * (LeaveAlign < 0.55 ? 0.88 : (LeaveAlign < 0.85 ? 0.75 : 0.62));
-		const FVector M0 = T0N * TangentScale;
-		const FVector M1 = T1N * TangentScale;
+		FVector GhostP0;
+		FVector GhostP3;
+		BuildCentripetalCatmullRomGhosts(P0, P1, Tangent0, Tangent1, GhostP0, GhostP3);
 		for (int32 i = bIncludeStart ? 0 : 1; i <= Segs; ++i)
 		{
 			const double T = static_cast<double>(i) / static_cast<double>(Segs);
-			const double T2 = T * T;
-			const double T3 = T2 * T;
-			const double H00 = 2.0 * T3 - 3.0 * T2 + 1.0;
-			const double H10 = T3 - 2.0 * T2 + T;
-			const double H01 = -2.0 * T3 + 3.0 * T2;
-			const double H11 = T3 - T2;
-			FVector P = P0 * H00 + M0 * H10 + P1 * H01 + M1 * H11;
-			P.Z = FMath::Lerp(P0.Z, P1.Z, static_cast<float>(T));
-			OutCenter.Add(P);
+			OutCenter.Add(EvalCentripetalCatmullRomPoint(GhostP0, P0, P1, GhostP3, T));
 		}
 	}
 
+	struct FAsymmetricTangentBezier
+	{
+		FVector Pos0 = FVector::ZeroVector;
+		FVector Pos1 = FVector::ZeroVector;
+		FVector Dir0 = FVector::ForwardVector;
+		FVector Dir1 = FVector::ForwardVector;
+		FVector Pos0Ext = FVector::ZeroVector;
+		FVector Pos1Ext = FVector::ZeroVector;
+		FVector Ctrl1 = FVector::ZeroVector;
+		FVector Ctrl2 = FVector::ZeroVector;
+		double ExtLen0 = 0.0;
+		double ExtLen1 = 0.0;
+		double Scale0 = 0.0;
+		double Scale1 = 0.0;
+		bool bValid = false;
+	};
+
+	/** Mouth leave + mouth arrive → one cubic Bezier (no straight stubs). */
+	static bool ComputeAsymmetricTangentBezier(
+		const FVector& Pos0,
+		const FVector& Pos1,
+		const FVector& LeaveDir,
+		const FVector& ArriveDir,
+		double StraightFactor,
+		FAsymmetricTangentBezier& Out)
+	{
+		Out = FAsymmetricTangentBezier();
+		Out.Pos0 = Pos0;
+		Out.Pos1 = Pos1;
+		FVector Dir0 = LeaveDir.GetSafeNormal2D();
+		FVector Dir1 = ArriveDir.GetSafeNormal2D();
+		const FVector Chord = (Pos1 - Pos0).GetSafeNormal2D();
+		const double BaseDist = FMath::Max(FVector::Dist2D(Pos0, Pos1), 1.0);
+		if (Dir0.IsNearlyZero())
+		{
+			Dir0 = Chord;
+		}
+		if (Dir1.IsNearlyZero())
+		{
+			Dir1 = Chord;
+		}
+		if (Dir0.IsNearlyZero() || Dir1.IsNearlyZero())
+		{
+			return false;
+		}
+
+		// Keep leave/arrive on the chord side so the Hermite cannot fold back (折线).
+		auto AlignToChord = [&Chord](FVector Dir)
+		{
+			const double Align = FVector::DotProduct(Dir, Chord);
+			if (Align >= 0.25)
+			{
+				return Dir;
+			}
+			return (Dir * FMath::Max(Align + 0.5, 0.15) + Chord * (0.25 - FMath::Min(Align, 0.25))).GetSafeNormal2D();
+		};
+		Dir0 = AlignToChord(Dir0);
+		Dir1 = AlignToChord(Dir1);
+		if (Dir0.IsNearlyZero())
+		{
+			Dir0 = Chord;
+		}
+		if (Dir1.IsNearlyZero())
+		{
+			Dir1 = Chord;
+		}
+
+		const FVector Dir1Rev = -Dir1;
+		const FVector W0 = Pos0 - Pos1;
+		const double A = 1.0;
+		const double B = FVector::DotProduct(Dir0, Dir1Rev);
+		const double C = 1.0;
+		const double D = FVector::DotProduct(Dir0, W0);
+		const double E = FVector::DotProduct(Dir1Rev, W0);
+		const double Denom = A * C - B * B;
+		double T0 = BaseDist * 0.5;
+		double T1 = BaseDist * 0.5;
+		if (FMath::Abs(Denom) >= 0.0001)
+		{
+			T0 = (B * E - C * D) / Denom;
+			T1 = (A * E - B * D) / Denom;
+		}
+		if (T0 < 0.0)
+		{
+			T0 = BaseDist * 0.5;
+		}
+		if (T1 < 0.0)
+		{
+			T1 = BaseDist * 0.5;
+		}
+
+		double Factor = StraightFactor;
+		if (Factor <= 0.0)
+		{
+			Factor = 0.45;
+		}
+		// Follow each mouth tangent toward the virtual intersection (asymmetric blend).
+		double Scale0 = T0 * Factor;
+		double Scale1 = T1 * Factor;
+		const double MinH = BaseDist * 0.18;
+		const double MaxH = BaseDist * 0.38;
+		Scale0 = FMath::Clamp(Scale0, MinH, MaxH);
+		Scale1 = FMath::Clamp(Scale1, MinH, MaxH);
+
+		Out.Dir0 = Dir0;
+		Out.Dir1 = Dir1;
+		Out.Scale0 = Scale0;
+		Out.Scale1 = Scale1;
+		Out.ExtLen0 = Scale0;
+		Out.ExtLen1 = Scale1;
+		Out.Ctrl1 = Pos0 + Dir0 * Scale0;
+		Out.Ctrl2 = Pos1 - Dir1 * Scale1;
+		Out.Ctrl1.Z = Pos0.Z;
+		Out.Ctrl2.Z = Pos1.Z;
+		Out.Pos0Ext = Out.Ctrl1;
+		Out.Pos1Ext = Out.Ctrl2;
+		Out.bValid = true;
+		return true;
+	}
+
+	static FVector EvalCubicBezier(
+		const FVector& P0,
+		const FVector& C1,
+		const FVector& C2,
+		const FVector& P1,
+		double T)
+	{
+		const double U = 1.0 - FMath::Clamp(T, 0.0, 1.0);
+		const double S = 1.0 - U;
+		return (U * U * U) * P0
+			+ (3.0 * U * U * S) * C1
+			+ (3.0 * U * S * S) * C2
+			+ (S * S * S) * P1;
+	}
+
+	static FVector EvalCubicBezierDerivative(
+		const FVector& P0,
+		const FVector& C1,
+		const FVector& C2,
+		const FVector& P1,
+		double T)
+	{
+		const double S = FMath::Clamp(T, 0.0, 1.0);
+		const double U = 1.0 - S;
+		return 3.0 * U * U * (C1 - P0)
+			+ 6.0 * U * S * (C2 - C1)
+			+ 3.0 * S * S * (P1 - C2);
+	}
+
+	static void AppendAsymmetricTangentBezierPath(
+		const FAsymmetricTangentBezier& Path,
+		double StepCm,
+		TArray<FVector>& OutCenter,
+		bool bIncludeStart)
+	{
+		if (!Path.bValid)
+		{
+			return;
+		}
+
+		const double Chord = FMath::Max(FVector::Dist2D(Path.Pos0, Path.Pos1), 1.0);
+		const int32 CurveSteps = FMath::Clamp(
+			FMath::CeilToInt(Chord / FMath::Max(StepCm, 25.0)), 16, 36);
+
+		if (bIncludeStart || OutCenter.Num() == 0)
+		{
+			OutCenter.Add(Path.Pos0);
+		}
+		for (int32 i = 1; i <= CurveSteps; ++i)
+		{
+			const double T = static_cast<double>(i) / static_cast<double>(CurveSteps);
+			OutCenter.Add(EvalCubicBezier(Path.Pos0, Path.Ctrl1, Path.Ctrl2, Path.Pos1, T));
+		}
+	}
+
+	static void ApplyAsymmetricTangentBezierConnection(
+		UMoKuEditSplinesComponent* SplineComponent,
+		int32 StartIndex,
+		const FVector& EndPos,
+		const FVector& LeaveDir,
+		const FVector& ArriveDir)
+	{
+		if (!SplineComponent
+			|| StartIndex < 0
+			|| StartIndex >= SplineComponent->GetNumberOfSplinePoints())
+		{
+			return;
+		}
+
+		FAsymmetricTangentBezier Path;
+		const FVector Pos0 = SplineComponent->GetLocationAtSplinePoint(
+			StartIndex, ESplineCoordinateSpace::World);
+		if (!ComputeAsymmetricTangentBezier(Pos0, EndPos, LeaveDir, ArriveDir, 0.35, Path))
+		{
+			return;
+		}
+
+		while (SplineComponent->GetNumberOfSplinePoints() > StartIndex + 1)
+		{
+			SplineComponent->RemoveSplinePoint(SplineComponent->GetNumberOfSplinePoints() - 1, false);
+		}
+
+		const double Chord = FMath::Max(FVector::Dist2D(Path.Pos0, Path.Pos1), 1.0);
+		// Cubic Bezier = 2 on-curve keys; leave/arrive tangents carry C1/C2.
+		const int32 InteriorCount = 0;
+		const int32 SampleCount = 2;
+		for (int32 i = 1; i < SampleCount; ++i)
+		{
+			const double T = static_cast<double>(i) / static_cast<double>(SampleCount - 1);
+			const FVector Sample = (i == SampleCount - 1)
+				? Path.Pos1
+				: EvalCubicBezier(Path.Pos0, Path.Ctrl1, Path.Ctrl2, Path.Pos1, T);
+			SplineComponent->AddSplinePointLocation(Sample, SplineComponent->GetNumberOfSplinePoints());
+		}
+
+		const double Dt = 1.0 / static_cast<double>(SampleCount - 1);
+		for (int32 i = 0; i < SampleCount; ++i)
+		{
+			const int32 PointIndex = StartIndex + i;
+			if (!SplineComponent->SplineCurves.Position.Points.IsValidIndex(PointIndex))
+			{
+				break;
+			}
+			const double T = static_cast<double>(i) * Dt;
+			const FVector Deriv = EvalCubicBezierDerivative(
+				Path.Pos0, Path.Ctrl1, Path.Ctrl2, Path.Pos1, T);
+			const FVector Tan = Deriv * Dt;
+			SplineComponent->SetSplinePointType(PointIndex, ESplinePointType::CurveCustomTangent, false);
+			// 2-point connector: Arrive==Leave so the main-line tangent is one handle,
+			// not a leftover mouth Arrive stacked on the Bezier Leave.
+			if (i == 0 && SplineComponent->GetNumberOfSplinePoints() > 2)
+			{
+				const FVector MouthArrive = SplineComponent->GetArriveTangentAtSplinePoint(
+					PointIndex, ESplineCoordinateSpace::World);
+				SplineComponent->SetTangentsAtSplinePoint(
+					PointIndex, MouthArrive, Tan, ESplineCoordinateSpace::World, false);
+			}
+			else
+			{
+				SplineComponent->SetTangentsAtSplinePoint(
+					PointIndex, Tan, Tan, ESplineCoordinateSpace::World, false);
+			}
+		}
+
+		UE_LOG(
+			LogTemp,
+			Warning,
+			TEXT("[MetaLandRoad] Bezier baked points=%d interiors=%d chord=%.1f"),
+			SplineComponent->GetNumberOfSplinePoints(),
+			InteriorCount,
+			Chord);
+	}
+
 	/**
-	 * Red-line path: straight stub along mouth outward (贴边), then C1 Hermite to cursor.
-	 * Stub end uses the same T0 so guidance stays smooth (no fake elbow kink).
+	 * Straight leave → cubic Bezier → straight arrive (asymmetric ray intersection).
 	 */
 	static void AppendRampCenterPath(
 		const FVector& P0,
@@ -859,47 +1399,18 @@ namespace
 		TArray<FVector>& OutCenter,
 		bool bIncludeStart)
 	{
-		const FVector T0 = Tangent0.GetSafeNormal2D();
-		const double Chord2D = FVector::Dist2D(P0, P1);
-		constexpr double MinCurveTailCm = 200.0;
-		const bool bUseStub = StubLengthCm >= 50.0
-			&& !T0.IsNearlyZero()
-			&& Chord2D > StubLengthCm + MinCurveTailCm;
-
-		if (!bUseStub)
+		(void)StubLengthCm;
+		FAsymmetricTangentBezier Path;
+		if (ComputeAsymmetricTangentBezier(P0, P1, Tangent0, Tangent1, 0.35, Path))
 		{
-			AppendHermiteSegment(P0, P1, Tangent0, Tangent1, StepCm, OutCenter, bIncludeStart);
+			AppendAsymmetricTangentBezierPath(Path, StepCm, OutCenter, bIncludeStart);
 			return;
 		}
-
-		const double StubLen = FMath::Min(static_cast<double>(StubLengthCm), Chord2D - MinCurveTailCm);
-		FVector StubEnd = P0 + T0 * StubLen;
-		StubEnd.Z = FMath::Lerp(P0.Z, P1.Z, static_cast<float>(StubLen / Chord2D));
-
-		AppendResampledSegment(P0, StubEnd, StepCm, OutCenter, bIncludeStart);
-		AppendHermiteSegment(StubEnd, P1, T0, Tangent1, StepCm, OutCenter, false);
-	}
-
-	static FVector EvalCubicHermitePoint(
-		const FVector& P0,
-		const FVector& P1,
-		const FVector& M0,
-		const FVector& M1,
-		double T)
-	{
-		const double T2 = T * T;
-		const double T3 = T2 * T;
-		const double H00 = 2.0 * T3 - 3.0 * T2 + 1.0;
-		const double H10 = T3 - 2.0 * T2 + T;
-		const double H01 = -2.0 * T3 + 3.0 * T2;
-		const double H11 = T3 - T2;
-		FVector P = P0 * H00 + M0 * H10 + P1 * H01 + M1 * H11;
-		P.Z = FMath::Lerp(P0.Z, P1.Z, static_cast<float>(T));
-		return P;
+		AppendHermiteSegment(P0, P1, Tangent0, Tangent1, StepCm, OutCenter, bIncludeStart);
 	}
 
 	/**
-	 * Sparse mesh keys (excludes P0): optional stub key (贴边) + Hermite interiors + end.
+	 * Sparse mesh keys (excludes P0): optional stub key (贴边) + centripetal Catmull-Rom interiors + end.
 	 * bForceSmoothTurn: never allow tip→end-only on turns (that is the big 折角).
 	 */
 	static void BuildRampKeyPointsForSpline(
@@ -971,15 +1482,14 @@ namespace
 			FMath::Max(0, MaxInteriorKeys));
 		if (InteriorCount > 0)
 		{
-			// Longer handles = larger turn radius → less inner-edge pinch.
-			const double TangentScale = CurveLen * (LeaveAlign < 0.55 ? 0.55 : 0.45);
+			FVector GhostP0;
+			FVector GhostP3;
 			const FVector ArriveDir = Tangent1.GetSafeNormal2D().IsNearlyZero() ? CurveDir : Tangent1.GetSafeNormal2D();
-			const FVector M0 = CurveTangent0.GetSafeNormal2D() * TangentScale;
-			const FVector M1 = ArriveDir * TangentScale;
+			BuildCentripetalCatmullRomGhosts(CurveStart, P1, CurveTangent0, ArriveDir, GhostP0, GhostP3);
 			for (int32 Index = 1; Index <= InteriorCount; ++Index)
 			{
 				const double T = static_cast<double>(Index) / static_cast<double>(InteriorCount + 1);
-				OutKeys.Add(EvalCubicHermitePoint(CurveStart, P1, M0, M1, T));
+				OutKeys.Add(EvalCentripetalCatmullRomPoint(GhostP0, CurveStart, P1, GhostP3, T));
 			}
 		}
 
@@ -1015,19 +1525,8 @@ namespace
 		}
 	}
 
-	/** Same handle scale as AppendHermiteSegment / green rails. */
-	static double ResolveGuidanceHermiteHandleScale(
-		double ChordCm,
-		const FVector& StartTangent,
-		const FVector& ChordDir)
-	{
-		const double LeaveAlign = FVector::DotProduct(StartTangent.GetSafeNormal2D(), ChordDir.GetSafeNormal2D());
-		return ChordCm * (LeaveAlign < 0.55 ? 0.88 : (LeaveAlign < 0.85 ? 0.75 : 0.62));
-	}
-
 	/**
-	 * One Hermite segment = tip + end only (no mid keys).
-	 * Mid bake keys + Curve auto + Soften were the pink 折角 control points.
+	 * Tip + end only. Leave/Arrive from centripetal Catmull-Rom (mouth outward + end arrive).
 	 */
 	static void ApplyLaneExtendHermiteSegmentHandles(
 		UMoKuEditSplinesComponent* SplineComponent,
@@ -1065,9 +1564,9 @@ namespace
 			T1 = ChordDir;
 		}
 
-		const double Scale = ResolveGuidanceHermiteHandleScale(Chord, T0, ChordDir);
-		const FVector Handle0World = T0 * Scale;
-		const FVector Handle1World = T1 * Scale;
+		FVector Handle0World;
+		FVector Handle1World;
+		ComputeCentripetalCatmullRomHermiteTangents(P0, P1, T0, T1, Handle0World, Handle1World);
 
 		SplineComponent->SetSplinePointType(StartIndex, ESplinePointType::CurveCustomTangent, false);
 		if (bPreserveStartArrive)
@@ -1460,14 +1959,22 @@ namespace
 			EffectiveEnd = TipCenter + TipTangent.GetSafeNormal2D() * MouthSpanCm;
 		}
 
-		// Mouth mid = spawn MouthLoc / mesh centerline.
-		const FVector PathCenter = (TipLeft + TipRight) * 0.5;
-		const FVector PathEnd = EffectiveEnd;
+		// Mouth mid = spawn MouthLoc / mesh centerline. Lock entire preview to this plane (MetaRoad).
+		FVector PathCenter = (TipLeft + TipRight) * 0.5;
+		const float PlaneZ = static_cast<float>(PathCenter.Z);
+		PathCenter.Z = PlaneZ;
+		FVector PathEnd = EffectiveEnd;
+		PathEnd.Z = PlaneZ;
+		FVector FlatTipLeft = TipLeft;
+		FVector FlatTipRight = TipRight;
+		FlatTipLeft.Z = PlaneZ;
+		FlatTipRight.Z = PlaneZ;
+
 		const double HalfWidthLeft = FMath::Max(
-			FVector::Dist2D(TipLeft, PathCenter),
+			FVector::Dist2D(FlatTipLeft, PathCenter),
 			MetaLandRoad::DefaultRoadLaneWidth * 0.25);
 		const double HalfWidthRight = FMath::Max(
-			FVector::Dist2D(TipRight, PathCenter),
+			FVector::Dist2D(FlatTipRight, PathCenter),
 			MetaLandRoad::DefaultRoadLaneWidth * 0.25);
 		const double EndHalfWidthLeft = bTaperToMouth
 			? FMath::Max(FVector::Dist2D(*OptionalEndLeft, PathEnd), MetaLandRoad::DefaultRoadLaneWidth * 0.25)
@@ -1476,10 +1983,10 @@ namespace
 			? FMath::Max(FVector::Dist2D(*OptionalEndRight, PathEnd), MetaLandRoad::DefaultRoadLaneWidth * 0.25)
 			: HalfWidthRight;
 
-		// Hermite: no stub. Denser samples on sharp leave so green rails stay smooth.
+		// Straight rubber-band (initial draw / no Hermite): tip → end ONLY.
+		// Dense 80cm resampling produced 100+ pts (L0..L130) on a simple tip→cursor line.
 		TArray<FVector> CenterSamples;
-		CenterSamples.Reserve(64);
-		const double StubForRails = bUseHermite ? 0.0 : RampStubLengthCm;
+		CenterSamples.Reserve(bUseHermite ? 64 : 2);
 		const FVector TipT = TipTangent.GetSafeNormal2D();
 		const FVector ChordDir = (PathEnd - PathCenter).GetSafeNormal2D();
 		const double LeaveAlign = (!TipT.IsNearlyZero() && !ChordDir.IsNearlyZero())
@@ -1488,16 +1995,106 @@ namespace
 		const double RailStepCm = (bUseHermite && LeaveAlign < 0.75)
 			? FMath::Min(SampleStepCm, 45.0)
 			: SampleStepCm;
-		BuildCenterSamplesFromExtendPlan(
-			PathCenter,
-			PathEnd,
-			TipTangent,
-			EndTangent,
-			bUseHermite,
-			StubForRails,
-			RailStepCm,
-			true,
-			CenterSamples);
+		if (bUseHermite && bTaperToMouth)
+		{
+			FAsymmetricTangentBezier Fusion;
+			FVector Arrive = EndTangent.GetSafeNormal2D();
+			if (Arrive.IsNearlyZero())
+			{
+				Arrive = ChordDir;
+			}
+			if (ComputeAsymmetricTangentBezier(PathCenter, PathEnd, TipT, Arrive, 0.4, Fusion))
+			{
+				const int32 Steps = 28;
+				FVector StartL = FlatTipLeft;
+				FVector StartR = FlatTipRight;
+				FVector EndL = *OptionalEndLeft;
+				FVector EndR = *OptionalEndRight;
+				EndL.Z = PlaneZ;
+				EndR.Z = PlaneZ;
+				// Pair mouth corners by nearest distance — world Across-dot flips on facing mouths (X).
+				if (FVector::Dist2D(StartL, EndR) + FVector::Dist2D(StartR, EndL)
+					< FVector::Dist2D(StartL, EndL) + FVector::Dist2D(StartR, EndR))
+				{
+					Swap(EndL, EndR);
+				}
+				FVector Across0 = (StartR - StartL).GetSafeNormal2D();
+				FVector Across1 = (EndR - EndL).GetSafeNormal2D();
+				if (Across0.IsNearlyZero())
+				{
+					Across0 = FVector::CrossProduct(FVector::UpVector, TipT).GetSafeNormal2D();
+				}
+				if (Across1.IsNearlyZero())
+				{
+					Across1 = Across0;
+				}
+
+				OutLeft.Reset();
+				OutRight.Reset();
+				OutLeft.Reserve(Steps + 1);
+				OutRight.Reserve(Steps + 1);
+				for (int32 i = 0; i <= Steps; ++i)
+				{
+					const double T = static_cast<double>(i) / static_cast<double>(Steps);
+					FVector Center = EvalCubicBezier(
+						Fusion.Pos0, Fusion.Ctrl1, Fusion.Ctrl2, Fusion.Pos1, T);
+					Center.Z = PlaneZ;
+					FVector Across = FMath::Lerp(Across0, Across1, T).GetSafeNormal2D();
+					if (Across.IsNearlyZero())
+					{
+						Across = Across0;
+					}
+					const double PairedEndHwL = FMath::Max(
+						FVector::Dist2D(EndL, PathEnd), MetaLandRoad::DefaultRoadLaneWidth * 0.25);
+					const double PairedEndHwR = FMath::Max(
+						FVector::Dist2D(EndR, PathEnd), MetaLandRoad::DefaultRoadLaneWidth * 0.25);
+					const double HwL = FMath::Lerp(HalfWidthLeft, PairedEndHwL, T);
+					const double HwR = FMath::Lerp(HalfWidthRight, PairedEndHwR, T);
+					if (i == 0)
+					{
+						OutLeft.Add(StartL);
+						OutRight.Add(StartR);
+					}
+					else if (i == Steps)
+					{
+						OutLeft.Add(EndL);
+						OutRight.Add(EndR);
+					}
+					else
+					{
+						OutLeft.Add(Center - Across * HwL);
+						OutRight.Add(Center + Across * HwR);
+					}
+				}
+				FlattenGuidanceRailToPlaneZ(OutLeft, PlaneZ);
+				FlattenGuidanceRailToPlaneZ(OutRight, PlaneZ);
+				return;
+			}
+		}
+
+		if (bUseHermite)
+		{
+			BuildCenterSamplesFromExtendPlan(
+				PathCenter,
+				PathEnd,
+				TipTangent,
+				EndTangent,
+				true,
+				/*StubForRails*/ 0.0,
+				RailStepCm,
+				true,
+				CenterSamples);
+		}
+		else
+		{
+			CenterSamples.Add(PathCenter);
+			CenterSamples.Add(PathEnd);
+		}
+
+		for (FVector& Sample : CenterSamples)
+		{
+			Sample.Z = PlaneZ;
+		}
 
 		if (CenterSamples.Num() < 2)
 		{
@@ -1506,11 +2103,35 @@ namespace
 			CenterSamples.Add(PathCenter + TipT * MouthSpanCm);
 		}
 
-		if (bTaperToMouth)
+		if (!bUseHermite && !bTaperToMouth)
+		{
+			// Parallel dual straight: ONE Right from tip→cursor for BOTH ends.
+			// Pinning mouth TipLeft/Right + offset(chord) caused L/R swap → green X (图二).
+			FVector Chord = ChordDir;
+			if (Chord.IsNearlyZero())
+			{
+				Chord = TipT.IsNearlyZero() ? FVector::ForwardVector : TipT;
+			}
+			FVector Right = FVector::CrossProduct(FVector::UpVector, Chord).GetSafeNormal2D();
+			const FVector MouthAcross = (FlatTipRight - FlatTipLeft).GetSafeNormal2D();
+			if (!MouthAcross.IsNearlyZero() && FVector::DotProduct(MouthAcross, Right) < 0.0)
+			{
+				Right = -Right;
+			}
+			OutLeft.Reset();
+			OutRight.Reset();
+			OutLeft.Add(PathCenter - Right * HalfWidthLeft);
+			OutLeft.Add(PathEnd - Right * HalfWidthLeft);
+			OutRight.Add(PathCenter + Right * HalfWidthRight);
+			OutRight.Add(PathEnd + Right * HalfWidthRight);
+		}
+		else if (bTaperToMouth)
 		{
 			OutLeft.Reserve(CenterSamples.Num());
 			OutRight.Reserve(CenterSamples.Num());
 			const int32 Last = CenterSamples.Num() - 1;
+			FVector PrevRight = FVector::ZeroVector;
+			const FVector PreferRight = (FlatTipRight - FlatTipLeft).GetSafeNormal2D();
 			for (int32 i = 0; i < CenterSamples.Num(); ++i)
 			{
 				FVector Tangent = FVector::ZeroVector;
@@ -1526,42 +2147,58 @@ namespace
 				{
 					Tangent = TipT.IsNearlyZero() ? FVector::ForwardVector : TipT;
 				}
-				const FVector Right = FVector::CrossProduct(FVector::UpVector, Tangent).GetSafeNormal2D();
+				const FVector Right = TransportOffsetRight(Tangent, PrevRight, PreferRight);
+				PrevRight = Right;
 				const double Alpha = Last > 0 ? static_cast<double>(i) / static_cast<double>(Last) : 1.0;
 				const double HwL = FMath::Lerp(HalfWidthLeft, EndHalfWidthLeft, Alpha);
 				const double HwR = FMath::Lerp(HalfWidthRight, EndHalfWidthRight, Alpha);
-				FVector LeftPos = CenterSamples[i] - Right * HwL;
-				FVector RightPos = CenterSamples[i] + Right * HwR;
-				ApplyGuidanceSurfaceZ(LeftPos);
-				ApplyGuidanceSurfaceZ(RightPos);
-				OutLeft.Add(LeftPos);
-				OutRight.Add(RightPos);
+				OutLeft.Add(CenterSamples[i] - Right * HwL);
+				OutRight.Add(CenterSamples[i] + Right * HwR);
 			}
 		}
 		else
 		{
-			BuildOffsetRails(CenterSamples, HalfWidthLeft, HalfWidthRight, OutLeft, OutRight);
+			const FVector EndTForRails = EndTangent.GetSafeNormal2D();
+			BuildOffsetRails(
+				CenterSamples,
+				HalfWidthLeft,
+				HalfWidthRight,
+				OutLeft,
+				OutRight,
+				TipT,
+				EndTForRails.IsNearlyZero() ? TipT : EndTForRails);
 		}
 
-		// Pin rail start to mouth edges (must match road CS / mesh outer edge).
-		if (OutLeft.Num() > 0 && OutRight.Num() > 0)
+		// Hermite only: blend onto mouth edges. Straight dual-rail must stay parallel (no pin).
+		if (bUseHermite && OutLeft.Num() > 0 && OutRight.Num() > 0)
 		{
-			OutLeft[0] = TipLeft;
-			OutRight[0] = TipRight;
-			ApplyGuidanceSurfaceZ(OutLeft[0]);
-			ApplyGuidanceSurfaceZ(OutRight[0]);
+			FVector StartL = FlatTipLeft;
+			FVector StartR = FlatTipRight;
+			MatchEdgePairToRailTips(OutLeft, OutRight, StartL, StartR, true);
+			SoftenGuidanceRailStart(OutLeft, StartL, TipT, RailStepCm);
+			SoftenGuidanceRailStart(OutRight, StartR, TipT, RailStepCm);
 		}
 
-		// EndConnection: pin green rail tips to the yellow target mouth (not source-width stubs).
+		// EndConnection: blend green rail tips onto the target mouth (flattened).
 		if (bTaperToMouth && OutLeft.Num() > 0 && OutRight.Num() > 0)
 		{
 			FVector EndL = *OptionalEndLeft;
 			FVector EndR = *OptionalEndRight;
-			ApplyGuidanceSurfaceZ(EndL);
-			ApplyGuidanceSurfaceZ(EndR);
-			OutLeft.Last() = EndL;
-			OutRight.Last() = EndR;
+			EndL.Z = PlaneZ;
+			EndR.Z = PlaneZ;
+			MatchEdgePairToRailTips(OutLeft, OutRight, EndL, EndR, false);
+			BlendRailTowardEdge(OutLeft, EndL, false);
+			BlendRailTowardEdge(OutRight, EndR, false);
 		}
+		else
+		{
+			SoftenGuidanceRailFreeEnd(OutLeft);
+			SoftenGuidanceRailFreeEnd(OutRight);
+		}
+
+		// Single PDI lift pass — BuildOffsetRails may have already lifted; normalize to plane+lift.
+		FlattenGuidanceRailToPlaneZ(OutLeft, PlaneZ);
+		FlattenGuidanceRailToPlaneZ(OutRight, PlaneZ);
 	}
 
 	static double ResolveDrawTipSForGuidance(
@@ -1612,6 +2249,51 @@ namespace
 		}
 
 		return Spline->GetRoadEdgePointsAtS(TipS, OutLeft, OutRight, OutCenter, ESplineCoordinateSpace::World);
+	}
+
+	/** Prefer road/junction along ray — raised landscape often wins LineTraceSingle and blocks Ctrl cook. */
+	static bool ResolveCtrlDrawRayHit(
+		UWorld* World,
+		const FRay& WorldRay,
+		FHitResult& OutHit,
+		AActor*& OutHitActor)
+	{
+		OutHitActor = nullptr;
+		if (!World)
+		{
+			return false;
+		}
+
+		const FName TraceTagName = FName("WorldCollision");
+		FCollisionObjectQueryParams QueryParams(FCollisionObjectQueryParams::AllObjects);
+		FCollisionQueryParams QueryCollisionParams(TraceTagName, true);
+		TArray<FHitResult> Hits;
+		const bool bHitAny = World->LineTraceMultiByObjectType(
+			Hits,
+			WorldRay.Origin,
+			WorldRay.PointAt(HALF_WORLD_MAX),
+			QueryParams,
+			QueryCollisionParams);
+		if (!bHitAny || Hits.IsEmpty())
+		{
+			return false;
+		}
+
+		for (const FHitResult& Hit : Hits)
+		{
+			AActor* Actor = Hit.GetActor();
+			if (Actor
+				&& (Actor->IsA<AMoKuEditSplineActor>() || Actor->IsA<AMoKuEditIntersectionActor>()))
+			{
+				OutHit = Hit;
+				OutHitActor = Actor;
+				return true;
+			}
+		}
+
+		OutHit = Hits[0];
+		OutHitActor = OutHit.GetActor();
+		return true;
 	}
 
 	static FVector ProjectOntoParallelLaneExtend(
@@ -1884,8 +2566,11 @@ namespace
 		bool bHasStoredPlaneZ,
 		float FallbackZ,
 		const FVector& TraceHitPos,
-		bool bHasTraceHit)
+		bool bHasTraceHit,
+		UWorld* /*WorldUnused*/ = nullptr)
 	{
+		// MetaRoad-style: stay on one horizontal plane (mouth / tip Z). Do NOT mix tip Z with
+		// landscape Z — that pulls green rails into a vertical "tower".
 		if (bHasStoredPlaneZ)
 		{
 			FVector PlaneCursor;
@@ -1907,7 +2592,13 @@ namespace
 
 		if (bHasTraceHit)
 		{
-			return TraceHitPos;
+			// Free draw without a stored plane: keep hit XY, lock Z to tip/fallback plane if any.
+			FVector Cursor = TraceHitPos;
+			if (!FMath::IsNearlyZero(FallbackZ))
+			{
+				Cursor.Z = FallbackZ;
+			}
+			return Cursor;
 		}
 
 		FVector PlaneCursor;
@@ -1938,7 +2629,6 @@ void UMetaLandRoadInteractiveTool::Setup()
 	if (!TargetWorld)return;
 	if (FModuleManager::Get().IsModuleLoaded(TEXT("MetaLandRoad")))
 	{
-		// Alt+E/T/W lane lines conflict with spline draw guidance — force Standard while this tool is active.
 		FMetaLandRoadModule::Get().SetEditorVisMode(EMetaLandRoadEditorVisMode::Standard);
 	}
 	UEdMode* ParentMode = GLevelEditorModeTools().GetActiveScriptableMode(UMetaLandRoadEditorMode::EM_MetaLandRoadEditorModeId);
@@ -2086,10 +2776,15 @@ void UMetaLandRoadInteractiveTool::OnClickPress(const FInputDeviceRay& PressPos)
 	{
 		// Lane extend mix on TARGET tip (never EditTarget).
 		// UE viewport steals Alt+LMB for camera orbit — Shift is the reliable click.
-		// Alt alone = hover preview only; Alt+Shift = add-only; Shift = toggle.
+		// Alt alone = hover preview; Alt+Shift = add-only; Shift = pick/toggle.
+		// Mix locks on Shift. Ctrl+LMB does not confirm EndConnection (A does).
 		const FModifierKeysState& MixModKeys = FSlateApplication::Get().GetModifierKeys();
-		const bool bTargetMixClick =
+		UMetaLandRoadEditorMode* MixRoadMode = ResolveMetaLandRoadEditorMode(this);
+		const bool bHasSourceMouth =
 			bLaneAnchorDrawSession
+			|| (MixRoadMode && MixRoadMode->GetEditTarget().bHasPendingAnchor);
+		const bool bTargetMixClick =
+			bHasSourceMouth
 			&& !MixModKeys.IsControlDown()
 			&& MixModKeys.IsShiftDown();
 		if (bTargetMixClick)
@@ -2201,18 +2896,10 @@ void UMetaLandRoadInteractiveTool::OnClickPress(const FInputDeviceRay& PressPos)
 		{
 			FScopedTransaction ResumeTx(LOCTEXT("ResumeLaneExtend", "Resume Lane Extend"));
 			UpdateEditState(true);
-			FMetaLandRoadDrawAnchor EndSnapCommitCopy;
-			const FMetaLandRoadDrawAnchor* EndSnapCommitPtr = ResolveEndSnapCommitAnchor(EndSnapCommitCopy);
 			SyncLaneDrawCursorFromRay(PressPos.WorldRay);
-			const bool bConnectionSnap = bLaneAnchorDrawSession
-				&& (EndSnapCommitPtr != nullptr
-					|| (bIsDraw
-						&& HitActor
-						&& HitActor->IsA<AMoKuEditSplineActor>()
-						&& HitActor != ActiveActor));
 			const FRotator HitRot = FRotationMatrix::MakeFromX(
 				(ResultHitPos - GuidanceLastCursor).GetSafeNormal2D()).Rotator();
-			if (!AddLaneDrawSegmentFromCursor(ResultHitPos, HitRot, false, bConnectionSnap, EndSnapCommitPtr))
+			if (!AddLaneDrawSegmentFromCursor(ResultHitPos, HitRot, false, false, nullptr))
 			{
 				AddSplinePoint(ResultHitPos, HitRot, false);
 			}
@@ -2286,7 +2973,8 @@ void UMetaLandRoadInteractiveTool::OnClickPress(const FInputDeviceRay& PressPos)
 			bHasGuidancePlaneZ,
 			static_cast<float>(MouthLoc.Z),
 			bHitWorld ? Result.ImpactPoint : MouthLoc + MouthForward * 500.0f,
-			bHitWorld);
+			bHitWorld,
+			TargetWorld);
 		const FRotator HitRot = MouthForward.Rotation();
 
 		// Exact mouth mid — no outset gap (outset caused “衔接对不上”).
@@ -2341,11 +3029,9 @@ void UMetaLandRoadInteractiveTool::OnClickPress(const FInputDeviceRay& PressPos)
 
 	// Normal Ctrl draw (no lane anchor) OR continue lane-extend session.
 	FScopedTransaction Transaction(LOCTEXT("BasicAddPoint", "Basic Add Point"));
-	const FName TraceTagName = FName("WorldCollision");
-	FCollisionObjectQueryParams QueryParams(FCollisionObjectQueryParams::AllObjects);
 	FHitResult Result;
-	FCollisionQueryParams QueryCollisionParams(TraceTagName, true);
-	bool bHitWorld = TargetWorld->LineTraceSingleByObjectType(Result, PressPos.WorldRay.Origin, PressPos.WorldRay.PointAt(HALF_WORLD_MAX), QueryParams, QueryCollisionParams);
+	AActor* ResolvedHitActor = nullptr;
+	const bool bHitWorld = ResolveCtrlDrawRayHit(TargetWorld, PressPos.WorldRay, Result, ResolvedHitActor);
 	if (bCtrlModifierOn)
 	{
 		AMoKuEditSplineActor* ActiveSplineActor = Cast<AMoKuEditSplineActor>(ActiveActor);
@@ -2353,7 +3039,19 @@ void UMetaLandRoadInteractiveTool::OnClickPress(const FInputDeviceRay& PressPos)
 		{
 			SyncLaneDrawCursorFromRay(PressPos.WorldRay);
 		}
-		HitActor = Result.GetActor();
+		else if (bHitWorld)
+		{
+			ResultHitPos = Result.ImpactPoint;
+			// Always snap commit XY→landscape Z (ignore elevated road tops / stale guidance plane).
+			ProjectPointOntoLandscapeSurface(
+				TargetWorld, ResultHitPos, Cast<AMoKuEditSplineActor>(ActiveActor));
+			// Guidance rails may stay planar; plane seeds from ground under first click.
+			if (!bHasGuidancePlaneZ)
+			{
+				SetGuidancePlaneFromMouthCenter(ResultHitPos);
+			}
+		}
+		HitActor = ResolvedHitActor;
 		// Do NOT force parallel project here — ResolveLaneExtendCenterPlan chooses Hermite vs straight.
 		const FVector3d HitPos = ResultHitPos;
 		FRotator HitRot = FRotator::ZeroRotator;
@@ -2382,8 +3080,6 @@ void UMetaLandRoadInteractiveTool::OnClickPress(const FInputDeviceRay& PressPos)
 			}
 			else if (!bInsertJunction && GetEditState())
 			{
-				FMetaLandRoadDrawAnchor EndSnapCommitCopy;
-				const FMetaLandRoadDrawAnchor* EndSnapCommitPtr = ResolveEndSnapCommitAnchor(EndSnapCommitCopy);
 				SyncLaneDrawCursorFromRay(PressPos.WorldRay);
 				if (SourceActor)
 				{
@@ -2391,14 +3087,33 @@ void UMetaLandRoadInteractiveTool::OnClickPress(const FInputDeviceRay& PressPos)
 				}
 				const FVector EndCursor = bIsDraw ? FVector(DrawOutSplinePos) : ResultHitPos;
 
-				// Lane-anchor Direct = Connect continue; road-hit still cooks junction immediately.
+				// Lane-extend: Shift locks mix; A commits EndConnection. Ctrl+LMB only adds points.
 				if (bLaneAnchorDrawSession)
 				{
-					const bool bEndSnapCommit = EndSnapCommitPtr != nullptr;
 					const bool bHitOtherRoad = SourceActor && SourceActor != ActiveSplineActor;
 					const bool bHitExistingJunction = HitJunction != nullptr;
+					const bool bHitMixTarget = bEndSnapBundleUserLocked
+						&& LaneDrawEndSnapAnchor.IsValid()
+						&& SourceActor
+						&& LaneDrawEndSnapAnchor.SourceSpline.Get()
+						&& LaneDrawEndSnapAnchor.SourceSpline.Get()->GetOwner() == SourceActor;
 
-					if ((bHitOtherRoad || bHitExistingJunction) && !bEndSnapCommit)
+					if (bHitMixTarget)
+					{
+						AddLaneDrawSegmentFromCursor(EndCursor, HitRot, false, false, nullptr);
+						UpdateDrawGuidanceRails();
+						if (GEngine)
+						{
+							GEngine->AddOnScreenDebugMessage(
+								991123,
+								2.0f,
+								FColor::Cyan,
+								TEXT("[MetaLandRoad] End mix locked — press A to connect (Ctrl does not confirm)"));
+						}
+						return;
+					}
+
+					if ((bHitOtherRoad || bHitExistingJunction) && !bEndSnapBundleUserLocked)
 					{
 						if (bHitOtherRoad && SourceActor->GetSplineComponent())
 						{
@@ -2423,7 +3138,6 @@ void UMetaLandRoadInteractiveTool::OnClickPress(const FInputDeviceRay& PressPos)
 						AMoKuEditSplineActor* BranchActor = Cast<AMoKuEditSplineActor>(ActiveActor);
 						if (bLaneAnchorDrawSession && IsLaneBranchRoad(BranchActor))
 						{
-							// Local hub cook at cross-road hit (not full-world rebuild).
 							CookJunctionForActiveRoad(true, true);
 							ClearSelectionForDrawSession();
 							return;
@@ -2434,12 +3148,9 @@ void UMetaLandRoadInteractiveTool::OnClickPress(const FInputDeviceRay& PressPos)
 						return;
 					}
 
-					const bool bConnectionSnap = bEndSnapCommit
-						|| (bIsDraw && bHitOtherRoad);
-					if (AddLaneDrawSegmentFromCursor(EndCursor, HitRot, false, bConnectionSnap, EndSnapCommitPtr))
+					if (AddLaneDrawSegmentFromCursor(EndCursor, HitRot, false, false, nullptr))
 					{
 						UpdateDrawGuidanceRails();
-						ClearSelectionForDrawSession();
 						return;
 					}
 				}
@@ -2474,6 +3185,11 @@ void UMetaLandRoadInteractiveTool::OnClickPress(const FInputDeviceRay& PressPos)
 				}
 
 				AddSplinePoint(ResultHitPos, HitRot, false);
+				// Hit self / non-road base actor: still cook if new segment XY-crosses another road.
+				if (TryCookJunctionOnCtrlPressIfCrossed())
+				{
+					return;
+				}
 				ClearSelectionForDrawSession();
 				return;
 			}
@@ -2483,12 +3199,16 @@ void UMetaLandRoadInteractiveTool::OnClickPress(const FInputDeviceRay& PressPos)
 				GEditor->SelectActor(ActiveActor, true, true, false, true);
 				AddSplinePoint(HitPos, HitRot, false);
 
-				// Started from a road: only cook+interrupt when the click lands on another road/junction.
+				// Started from a road: cook on other road/junction hit, or XY cross under terrain.
 				const bool bHitOtherRoad = SourceActor && SourceActor != ActiveSplineActor;
 				const bool bHitExistingJunction = HitJunction != nullptr;
 				if (bHitOtherRoad || bHitExistingJunction)
 				{
 					CookJunctionForActiveRoad(true);
+				}
+				else
+				{
+					TryCookJunctionOnCtrlPressIfCrossed();
 				}
 				bInsertJunction = false;
 				return;
@@ -2496,25 +3216,22 @@ void UMetaLandRoadInteractiveTool::OnClickPress(const FInputDeviceRay& PressPos)
 		}
 		else if (HitActor && !HitActor->IsA<AMoKuEditSplineActor>() && bInsertJunction)
 		{
-			// Terrain click after starting from a road: keep drawing, clear insert flag only.
+			// Terrain click after starting from a road — raised ground often hides the crossed mesh.
 			ClearSelectionForDrawSession();
 			AddSplinePoint(HitPos, HitRot, false);
 			bInsertJunction = false;
+			if (TryCookJunctionOnCtrlPressIfCrossed())
+			{
+				return;
+			}
 		}
 		else if ((!HitActor || !HitActor->IsA<AMoKuEditSplineActor>()) && !bInsertJunction)
 		{
-			FMetaLandRoadDrawAnchor EndSnapCommitCopy;
-			const FMetaLandRoadDrawAnchor* EndSnapCommitPtr = ResolveEndSnapCommitAnchor(EndSnapCommitCopy);
 			SyncLaneDrawCursorFromRay(PressPos.WorldRay);
 			const FVector ClickPos = ResultHitPos;
 			if (bLaneAnchorDrawSession && GetEditState())
 			{
-				const bool bConnectionSnap = EndSnapCommitPtr != nullptr
-					|| (bIsDraw
-						&& HitActor
-						&& HitActor->IsA<AMoKuEditSplineActor>()
-						&& HitActor != ActiveSplineActor);
-				if (AddLaneDrawSegmentFromCursor(ClickPos, HitRot, false, bConnectionSnap, EndSnapCommitPtr))
+				if (AddLaneDrawSegmentFromCursor(ClickPos, HitRot, false, false, nullptr))
 				{
 					UpdateDrawGuidanceRails();
 				}
@@ -2531,6 +3248,11 @@ void UMetaLandRoadInteractiveTool::OnClickPress(const FInputDeviceRay& PressPos)
 					const int32 PointIndex = Comp->GetNumberOfSplinePoints() - 2;
 					SplineActor->UpdateInterpolateType(PointIndex);
 				}
+			}
+			// Terrain / miss: detect centerline XY cross after the new point (no mesh hit required).
+			if (TryCookJunctionOnCtrlPressIfCrossed())
+			{
+				return;
 			}
 		}
 		if (0)
@@ -2718,7 +3440,28 @@ void UMetaLandRoadInteractiveTool::OnClickPress(const FInputDeviceRay& PressPos)
 void UMetaLandRoadInteractiveTool::DrawHUD(FCanvas* Canvas, IToolsContextRenderAPI* RenderAPI)
 {
 	Super::DrawHUD(Canvas, RenderAPI);
-	if (Canvas == nullptr|| !bIsDrawHud) return;
+	if (Canvas == nullptr)
+	{
+		return;
+	}
+
+	// Engine may not expose RenderAPI->GetSceneView(); use active editor viewport.
+	if (GCurrentLevelEditingViewportClient && GCurrentLevelEditingViewportClient->Viewport)
+	{
+		FSceneViewFamilyContext ViewFamily(FSceneViewFamily::ConstructionValues(
+			GCurrentLevelEditingViewportClient->Viewport,
+			GCurrentLevelEditingViewportClient->GetScene(),
+			GCurrentLevelEditingViewportClient->EngineShowFlags));
+		if (const FSceneView* View = GCurrentLevelEditingViewportClient->CalcSceneView(&ViewFamily))
+		{
+			DrawDrawGuidanceRailPointHUD(Canvas, View);
+		}
+	}
+
+	if (!bIsDrawHud)
+	{
+		return;
+	}
 
 	FString HelpText = TEXT("LMB / Shift+LMB: Select lane anchor\n")
 		TEXT("Hover: Mouth highlight\n")
@@ -2732,7 +3475,6 @@ void UMetaLandRoadInteractiveTool::DrawHUD(FCanvas* Canvas, IToolsContextRenderA
 		TEXT("Ctrl+Z: Undo\n")
 		TEXT("Shift+F1: Toggle Help");
 	MoKuSplineEditorUtils::DrawHelpCanvasTileItem(Canvas, HelpText);
-	
 }
 
 
@@ -2993,6 +3735,12 @@ void UMetaLandRoadInteractiveTool::AddSplinePoint(const FVector& InHitPos, const
 		AMoKuEditSplineActor::bSuppressJunctionRecookFromRoadRefresh, true);
 	UMoKuEditSplinesComponent* SplineComponent = nullptr;
 	FVector Tangent = InTangent;
+	// Commit points stick to landscape — never keep elevated road/junction mesh Z (walls).
+	FVector SnapHitPos = InHitPos;
+	ProjectPointOntoLandscapeSurface(
+		TargetWorld ? TargetWorld : GetWorld(),
+		SnapHitPos,
+		Cast<AMoKuEditSplineActor>(ActiveActor));
 	if (!ActiveActor|| !GetEditState())
 	{
 		ClearSelectionForDrawSession(true);
@@ -3000,10 +3748,18 @@ void UMetaLandRoadInteractiveTool::AddSplinePoint(const FVector& InHitPos, const
 		SpawnParams.OverrideLevel = this->TargetWorld->PersistentLevel;
 		SpawnParams.bNoFail = true;
 		SpawnParams.ObjectFlags |= RF_Transactional;
-		ActiveActor = this->TargetWorld->SpawnActor<AMoKuEditSplineActor>(InHitPos, InHitRot, SpawnParams);
+		ActiveActor = this->TargetWorld->SpawnActor<AMoKuEditSplineActor>(SnapHitPos, InHitRot, SpawnParams);
 		if (ActiveActor)
 		{
 			ActiveActor->SetFolderPath(SCENE_ROAD_PATH);
+			if (AWorldSceneManagement* Manager = AWorldLandscapeBlueprintBrush::EnsureWorldEditorManagerForRoadActor(ActiveActor))
+			{
+				SceneManagement = Manager;
+				if (UMetaLandRoadEditorMode* RoadMode = ResolveMetaLandRoadEditorMode(this))
+				{
+					RoadMode->SceneManagement = Manager;
+				}
+			}
 		}
 		AMoKuEditSplineActor* SplineActor = Cast<AMoKuEditSplineActor>(ActiveActor);
 		SplineActor->RoadModeType = OutputProperties->RoadModeType;
@@ -3049,22 +3805,22 @@ void UMetaLandRoadInteractiveTool::AddSplinePoint(const FVector& InHitPos, const
 			{	
 				if (StateOfEditor == EMoKuEditState::Forward)
 				{
-					SplineComponent->AddSplinePointLocation(InHitPos, 0);
+					SplineComponent->AddSplinePointLocation(SnapHitPos, 0);
 				}
 				if (StateOfEditor == EMoKuEditState::Defult)
 				{
-					SplineComponent->AddSplinePointLocation(InHitPos, SplineComponent->GetNumberOfSplinePoints());
+					SplineComponent->AddSplinePointLocation(SnapHitPos, SplineComponent->GetNumberOfSplinePoints());
 				}
 				HideEditorSplineRibbon(SplineComponent);
 				SplineActor->SetSplineComponent(SplineComponent);
 			}
 			else
 			{
-				FVector InterPos = InHitPos + Tangent.GetSafeNormal()*50;
+				FVector InterPos = SnapHitPos + Tangent.GetSafeNormal()*50;
+				ProjectPointOntoLandscapeSurface(
+					TargetWorld ? TargetWorld : GetWorld(), InterPos, SplineActor);
 				SplineComponent->AddSplinePointLocation(InterPos, SplineComponent->GetNumberOfSplinePoints());
-				//SplineComponent->SetTangentAtSplinePoint(SplineComponent->GetNumberOfSplinePoints(), -InTangent.GetSafeNormal(), ESplineCoordinateSpace::World);
-				SplineComponent->AddSplinePointLocation(InHitPos, SplineComponent->GetNumberOfSplinePoints());
-				//SplineComponent->SetTangentAtSplinePoint(SplineComponent->GetNumberOfSplinePoints(),-InTangent.GetSafeNormal(), ESplineCoordinateSpace::World);
+				SplineComponent->AddSplinePointLocation(SnapHitPos, SplineComponent->GetNumberOfSplinePoints());
 				SplineActor->SetSplineComponent(SplineComponent);
 
 			}
@@ -3333,6 +4089,21 @@ void UMetaLandRoadInteractiveTool::EndLaneExtendVisualSession(bool bClearActiveA
 	}
 }
 
+bool UMetaLandRoadInteractiveTool::ShouldSuppressLanePickOverlay() const
+{
+	return GetEditState() && bCtrlModifierOn && bIsDraw;
+}
+
+bool UMetaLandRoadInteractiveTool::ShouldSuppressLanePickEditHover() const
+{
+	return GetEditState() && bCtrlModifierOn && bIsDraw;
+}
+
+bool UMetaLandRoadInteractiveTool::ShouldSuppressEditTargetMouthBar() const
+{
+	return bLaneAnchorDrawSession || (GetEditState() && bIsDraw);
+}
+
 bool UMetaLandRoadInteractiveTool::TryGetLaneDrawEndSnapOverlay(FMetaLandRoadDrawAnchor& OutAnchor) const
 {
 	if (bEndSnapBundleUserLocked && bHasLaneDrawEndSnapAnchor && LaneDrawEndSnapAnchor.IsValid())
@@ -3350,7 +4121,96 @@ bool UMetaLandRoadInteractiveTool::TryGetEndSnapMixHoverOverlay(FMetaLandRoadDra
 		OutAnchor = EndSnapMixHoverAnchor;
 		return true;
 	}
+	if (!bEndSnapBundleUserLocked && bHasLaneDrawEndSnapAnchor && LaneDrawEndSnapAnchor.IsValid())
+	{
+		OutAnchor = LaneDrawEndSnapAnchor;
+		return true;
+	}
 	return false;
+}
+
+void UMetaLandRoadInteractiveTool::ApplyIdleEndSnapTarget(const FMetaLandRoadDrawAnchor& Anchor)
+{
+	if (!Anchor.IsValid() || !Anchor.SourceSpline.IsValid())
+	{
+		return;
+	}
+
+	UMetaLandRoadEditorMode* RoadMode = ResolveMetaLandRoadEditorMode(this);
+	if (RoadMode && RoadMode->GetEditTarget().bHasPendingAnchor)
+	{
+		if (AActor* SourceOwner = RoadMode->GetEditTarget().RoadActor.Get())
+		{
+			if (Anchor.SourceSpline->GetOwner() == SourceOwner)
+			{
+				return;
+			}
+		}
+	}
+
+	LaneDrawEndSnapAnchor = Anchor;
+	bHasLaneDrawEndSnapAnchor = true;
+	bEndSnapBundleUserLocked = true;
+
+	FVector TipLeft, TipRight, TipCenter, Outward;
+	if (MetaLandRoadLaneEditPick::ComputeAnchorMouthRailFrame(
+		Anchor.SourceSpline.Get(), Anchor, TipLeft, TipRight, TipCenter, Outward))
+	{
+		EndSnapGhostLeft = TipLeft;
+		EndSnapGhostRight = TipRight;
+		ApplyGuidanceSurfaceZ(EndSnapGhostLeft);
+		ApplyGuidanceSurfaceZ(EndSnapGhostRight);
+		bHasEndSnapGhost = true;
+		DrawOutSplinePos = TipCenter;
+		HitActor = Anchor.SourceSpline->GetOwner();
+		LaneSnapArriveTangent = (-Outward).GetSafeNormal2D();
+		bHasLaneSnapArriveTangent = !LaneSnapArriveTangent.IsNearlyZero();
+	}
+
+	if (OutputProperties)
+	{
+		OutputProperties->bEndConnectMatchSourceLanes = false;
+		OutputProperties->EndConnectTargetLaneCount = FMath::Clamp(
+			CountDrawAnchorBundleLanes(LaneDrawEndSnapAnchor), 1, 8);
+	}
+
+	UpdateAnchorPreviewGuidanceRails();
+	if (GEngine)
+	{
+		GEngine->AddOnScreenDebugMessage(
+			991132,
+			4.0f,
+			FColor::Green,
+			TEXT("[MetaLandRoad] Two mouths ready — press A to generate the connection"));
+	}
+	if (GEditor)
+	{
+		GEditor->RedrawLevelEditingViewports(false);
+	}
+}
+
+void UMetaLandRoadInteractiveTool::ClearLaneDrawEndSnap(bool bClearUserLock)
+{
+	if (!bClearUserLock && bEndSnapBundleUserLocked)
+	{
+		return;
+	}
+
+	bHasEndSnapGhost = false;
+	bHasLaneDrawEndSnapAnchor = false;
+	bHasEndSnapMixHover = false;
+	bHasLaneSnapArriveTangent = false;
+	bEndSnapBundleUserLocked = false;
+	LaneDrawEndSnapAnchor = FMetaLandRoadDrawAnchor();
+	EndSnapMixHoverAnchor = FMetaLandRoadDrawAnchor();
+	LaneSnapArriveTangent = FVector::ForwardVector;
+	EndSnapGhostLeft = FVector::ZeroVector;
+	EndSnapGhostRight = FVector::ZeroVector;
+}
+
+bool UMetaLandRoadInteractiveTool::HasLaneDrawEndSnap() const
+{
+	return bEndSnapBundleUserLocked || bHasEndSnapGhost || bHasLaneDrawEndSnapAnchor;
 }
 
 void UMetaLandRoadInteractiveTool::ResetDrawSessionState()
@@ -3392,26 +4252,64 @@ void UMetaLandRoadInteractiveTool::UpdateEndSnapMixHoverPreview(const FVector& C
 	bHasEndSnapMixHover = false;
 	EndSnapMixHoverAnchor = FMetaLandRoadDrawAnchor();
 
-	if (!bLaneAnchorDrawSession)
+	UMetaLandRoadEditorMode* HoverRoadMode = ResolveMetaLandRoadEditorMode(this);
+	const bool bHasSourceMouth =
+		bLaneAnchorDrawSession
+		|| (HoverRoadMode && HoverRoadMode->GetEditTarget().bHasPendingAnchor);
+	if (!bHasSourceMouth)
 	{
 		return;
 	}
 
 	const FModifierKeysState& ModKeys = FSlateApplication::Get().GetModifierKeys();
-	// Alt = add-preview; Shift during extend = toggle-preview (same cyan/green mouth bars).
-	const bool bMixHoverMod =
-		!ModKeys.IsControlDown()
-		&& (ModKeys.IsAltDown() || ModKeys.IsShiftDown());
-	if (!bMixHoverMod)
+	if (ModKeys.IsControlDown())
 	{
 		return;
 	}
 
 	AMoKuEditSplineActor* ActiveRoad = Cast<AMoKuEditSplineActor>(ActiveActor);
+	if (!ActiveRoad && HoverRoadMode)
+	{
+		ActiveRoad = HoverRoadMode->GetEditTarget().RoadActor.Get();
+	}
 	if (!ActiveRoad || !TargetWorld)
 	{
 		return;
 	}
+
+	auto ApplyHoverGhost = [this](const FMetaLandRoadDrawAnchor& Anchor)
+	{
+		UMetaLandRoadSplineComponent* HoverSpline = Anchor.SourceSpline.Get();
+		FVector TipLeft, TipRight, TipCenter, Outward;
+		if (!HoverSpline
+			|| !MetaLandRoadLaneEditPick::ComputeAnchorMouthRailFrame(
+				HoverSpline, Anchor, TipLeft, TipRight, TipCenter, Outward))
+		{
+			return;
+		}
+		if (!bEndSnapBundleUserLocked)
+		{
+			LaneDrawEndSnapAnchor = Anchor;
+			bHasLaneDrawEndSnapAnchor = true;
+			EndSnapGhostLeft = TipLeft;
+			EndSnapGhostRight = TipRight;
+			ApplyGuidanceSurfaceZ(EndSnapGhostLeft);
+			ApplyGuidanceSurfaceZ(EndSnapGhostRight);
+			bHasEndSnapGhost = true;
+			DrawOutSplinePos = TipCenter;
+		}
+		else
+		{
+			DrawOutSplinePos = (EndSnapGhostLeft + EndSnapGhostRight) * 0.5;
+		}
+		bIsDraw = true;
+		if (AActor* Owner = HoverSpline->GetOwner())
+		{
+			HitActor = Owner;
+		}
+		LaneSnapArriveTangent = (-Outward).GetSafeNormal2D();
+		bHasLaneSnapArriveTangent = !LaneSnapArriveTangent.IsNearlyZero();
+	};
 
 	// Screen pick first — same path as Alt/Shift click (works with dual side sections).
 	if (FLevelEditorViewportClient* ViewportClient = GCurrentLevelEditingViewportClient)
@@ -3438,6 +4336,7 @@ void UMetaLandRoadInteractiveTool::UpdateEndSnapMixHoverPreview(const FVector& C
 			{
 				EndSnapMixHoverAnchor = PickedAnchor;
 				bHasEndSnapMixHover = true;
+				ApplyHoverGhost(EndSnapMixHoverAnchor);
 				return;
 			}
 		}
@@ -3451,6 +4350,10 @@ void UMetaLandRoadInteractiveTool::UpdateEndSnapMixHoverPreview(const FVector& C
 		GetConnectionSnapDistanceCm(),
 		Pick))
 	{
+		if (!bEndSnapBundleUserLocked)
+		{
+			ClearLaneDrawEndSnap(false);
+		}
 		return;
 	}
 
@@ -3471,6 +4374,10 @@ void UMetaLandRoadInteractiveTool::UpdateEndSnapMixHoverPreview(const FVector& C
 	}
 
 	bHasEndSnapMixHover = EndSnapMixHoverAnchor.IsValid();
+	if (bHasEndSnapMixHover)
+	{
+		ApplyHoverGhost(EndSnapMixHoverAnchor);
+	}
 	(void)CursorWorld;
 }
 
@@ -3483,12 +4390,20 @@ bool UMetaLandRoadInteractiveTool::TryHandleEndSnapTargetLaneMixPick(
 	const bool bMixModifier = bAddOnly
 		? (ModKeys.IsAltDown() && !ModKeys.IsControlDown())
 		: (ModKeys.IsShiftDown() && !ModKeys.IsControlDown());
-	if (!bLaneAnchorDrawSession || !bMixModifier || ModKeys.IsControlDown())
+	UMetaLandRoadEditorMode* MixRoadMode = ResolveMetaLandRoadEditorMode(this);
+	const bool bHasSourceMouth =
+		bLaneAnchorDrawSession
+		|| (MixRoadMode && MixRoadMode->GetEditTarget().bHasPendingAnchor);
+	if (!bHasSourceMouth || !bMixModifier || ModKeys.IsControlDown())
 	{
 		return false;
 	}
 
 	AMoKuEditSplineActor* ActiveRoad = Cast<AMoKuEditSplineActor>(ActiveActor);
+	if (!ActiveRoad && MixRoadMode)
+	{
+		ActiveRoad = MixRoadMode->GetEditTarget().RoadActor.Get();
+	}
 	if (!TargetWorld)
 	{
 		return true;
@@ -3510,7 +4425,7 @@ bool UMetaLandRoadInteractiveTool::TryHandleEndSnapTargetLaneMixPick(
 
 	FMetaLandRoadDrawAnchor PickedAnchor;
 	UMetaLandRoadSplineComponent* PickedSpline = nullptr;
-	if (!MetaLandRoadLaneEditPick::PickLaneAnchorAtMouse(
+	const bool bPicked = MetaLandRoadLaneEditPick::PickLaneAnchorAtMouse(
 		TargetWorld,
 		ViewportClient,
 		ViewportClient->Viewport,
@@ -3520,35 +4435,73 @@ bool UMetaLandRoadInteractiveTool::TryHandleEndSnapTargetLaneMixPick(
 		ExistingAnchor,
 		PickedAnchor,
 		PickedSpline)
-		|| !PickedAnchor.IsValid()
-		|| !PickedSpline)
+		&& PickedAnchor.IsValid()
+		&& PickedSpline;
+
+	if (!bPicked)
 	{
-		if (GEngine)
+		const FMetaLandRoadDrawAnchor* HoverAnchor =
+			bHasEndSnapMixHover && EndSnapMixHoverAnchor.IsValid()
+			? &EndSnapMixHoverAnchor
+			: nullptr;
+		UMetaLandRoadSplineComponent* HoverSpline = HoverAnchor
+			? HoverAnchor->SourceSpline.Get()
+			: nullptr;
+		if (HoverSpline
+			&& HoverAnchor->IsValid()
+			&& Cast<AMoKuEditSplineActor>(HoverSpline->GetOwner()) != ActiveRoad)
 		{
-			GEngine->AddOnScreenDebugMessage(
-				991123,
-				1.5f,
-				FColor::Orange,
-				bAddOnly
-					? TEXT("[MetaLandRoad] Alt+Shift+LMB: click TARGET tip lane to add mix")
-					: TEXT("[MetaLandRoad] Shift+LMB: click TARGET tip lane to toggle mix"));
+			if (ExistingAnchor
+				&& MetaLandRoadLaneEditPick::IsSamePhysicalMouth(
+					*ExistingAnchor,
+					HoverSpline,
+					HoverAnchor->MouthSide,
+					HoverAnchor->AnchorS))
+			{
+				PickedAnchor = *ExistingAnchor;
+				if (HoverAnchor->LaneIndex != PickedAnchor.LaneIndex
+					&& !PickedAnchor.BundledLaneIndices.Contains(HoverAnchor->LaneIndex))
+				{
+					MetaLandRoadLaneEditPick::TryExpandAnchorBundle(
+						PickedAnchor, HoverAnchor->LaneIndex);
+				}
+				else if (HoverAnchor->LaneIndex != PickedAnchor.LaneIndex)
+				{
+					PickedAnchor.BundledLaneIndices.Remove(HoverAnchor->LaneIndex);
+				}
+				else if (PickedAnchor.BundledLaneIndices.Num() > 0)
+				{
+					PickedAnchor.LaneIndex = PickedAnchor.BundledLaneIndices[0];
+					PickedAnchor.BundledLaneIndices.RemoveAt(0);
+				}
+			}
+			else
+			{
+				PickedAnchor = *HoverAnchor;
+			}
+			PickedSpline = HoverSpline;
 		}
-		return true; // consume — do not fall through to source lane pick
+		else
+		{
+			if (GEngine)
+			{
+				GEngine->AddOnScreenDebugMessage(
+					991123,
+					1.5f,
+					FColor::Orange,
+					bAddOnly
+						? TEXT("[MetaLandRoad] Alt+Shift+LMB: click TARGET tip lane to add mix")
+						: TEXT("[MetaLandRoad] Shift+LMB: click TARGET tip lane to pick/toggle mix"));
+			}
+			return true;
+		}
 	}
 
 	UMetaLandRoadSplineComponent* BestSpline = PickedSpline;
 
 	if (ActiveRoad && Cast<AMoKuEditSplineActor>(BestSpline->GetOwner()) == ActiveRoad)
 	{
-		if (GEngine)
-		{
-			GEngine->AddOnScreenDebugMessage(
-				991124,
-				1.5f,
-				FColor::Orange,
-				TEXT("[MetaLandRoad] Pick TARGET road lane, not the branch being drawn"));
-		}
-		return true;
+		return false;
 	}
 
 	if (bAddOnly && ExistingAnchor)
@@ -3630,7 +4583,7 @@ bool UMetaLandRoadInteractiveTool::TryHandleEndSnapTargetLaneMixPick(
 			2.5f,
 			FColor::Cyan,
 			FString::Printf(
-				TEXT("[MetaLandRoad] EndSnap mix lanes [%s] count=%d — Shift toggles, Ctrl commit"),
+				TEXT("[MetaLandRoad] End mix [%s] count=%d — Shift+/- | A connects (Ctrl does not confirm)"),
 				*LaneList,
 				Count));
 	}
@@ -3832,6 +4785,214 @@ void UMetaLandRoadInteractiveTool::FinalizeLaneDrawFromConnection(
 }
 
 
+bool UMetaLandRoadInteractiveTool::TryCommitIdleMouthToMouthConnection()
+{
+	if (bLaneAnchorDrawSession || GetEditState())
+	{
+		return false;
+	}
+
+	UMetaLandRoadEditorMode* RoadMode = ResolveMetaLandRoadEditorMode(this);
+	if (!RoadMode)
+	{
+		return false;
+	}
+
+	const FMetaLandRoadEditTarget& SourceTarget = RoadMode->GetEditTarget();
+	if (!SourceTarget.bHasPendingAnchor || !SourceTarget.Spline.IsValid() || !SourceTarget.RoadActor.Get())
+	{
+		return false;
+	}
+
+	FMetaLandRoadDrawAnchor TargetStorage;
+	const FMetaLandRoadDrawAnchor* TargetAnchor = ResolveEndSnapCommitAnchor(TargetStorage);
+	if (!TargetAnchor || !TargetAnchor->IsValid() || !TargetAnchor->SourceSpline.IsValid())
+	{
+		if (FLevelEditorViewportClient* ViewportClient = GCurrentLevelEditingViewportClient)
+		{
+			if (ViewportClient->Viewport && TargetWorld)
+			{
+				FIntPoint MousePos;
+				ViewportClient->Viewport->GetMousePos(MousePos);
+				FMetaLandRoadDrawAnchor PickedAnchor;
+				UMetaLandRoadSplineComponent* PickedSpline = nullptr;
+				if (MetaLandRoadLaneEditPick::PickLaneAnchorAtMouse(
+					TargetWorld,
+					ViewportClient,
+					ViewportClient->Viewport,
+					MousePos,
+					/*bShiftDown*/ true,
+					/*bSelectAllLanesOnSide*/ false,
+					nullptr,
+					PickedAnchor,
+					PickedSpline)
+					&& PickedAnchor.IsValid()
+					&& PickedSpline
+					&& PickedSpline->GetOwner() != SourceTarget.RoadActor.Get())
+				{
+					TargetStorage = PickedAnchor;
+					TargetAnchor = &TargetStorage;
+				}
+			}
+		}
+	}
+	if (!TargetAnchor || !TargetAnchor->IsValid() || !TargetAnchor->SourceSpline.IsValid())
+	{
+		if (GEngine)
+		{
+			GEngine->AddOnScreenDebugMessage(
+				991133,
+				2.5f,
+				FColor::Orange,
+				TEXT("[MetaLandRoad] A: Shift-select the TARGET mouth first"));
+		}
+		return false;
+	}
+	if (TargetAnchor->SourceSpline->GetOwner() == SourceTarget.RoadActor.Get())
+	{
+		return false;
+	}
+
+	FVector SrcL, SrcR, SrcC, SrcOut;
+	FVector TgtL, TgtR, TgtC, TgtOut;
+	if (!MetaLandRoadLaneEditPick::ComputeAnchorMouthRailFrame(
+			SourceTarget.Spline.Get(), SourceTarget.PendingAnchor, SrcL, SrcR, SrcC, SrcOut)
+		|| !MetaLandRoadLaneEditPick::ComputeAnchorMouthRailFrame(
+			TargetAnchor->SourceSpline.Get(), *TargetAnchor, TgtL, TgtR, TgtC, TgtOut))
+	{
+		return false;
+	}
+
+	const FVector Arrive = (-TgtOut).GetSafeNormal2D().IsNearlyZero()
+		? (TgtC - SrcC).GetSafeNormal2D()
+		: (-TgtOut).GetSafeNormal2D();
+	const FVector Leave = SrcOut.GetSafeNormal2D().IsNearlyZero()
+		? (TgtC - SrcC).GetSafeNormal2D()
+		: SrcOut.GetSafeNormal2D();
+
+	UWorld* World = TargetWorld ? TargetWorld : GetWorld();
+	if (!World)
+	{
+		return false;
+	}
+
+	GEditor->BeginTransaction(FText::FromString(TEXT("Connect Two Lane Mouths")));
+
+	LaneDrawStartAnchor = SourceTarget.PendingAnchor;
+	bHasLaneDrawStartAnchor = true;
+	LaneDrawEndSnapAnchor = *TargetAnchor;
+	bHasLaneDrawEndSnapAnchor = true;
+	bEndSnapBundleUserLocked = true;
+
+	const FRotator SpawnRot = Leave.Rotation();
+	AddSplinePoint(SrcC, SpawnRot, false);
+	AMoKuEditSplineActor* SpawnedRoad = Cast<AMoKuEditSplineActor>(ActiveActor);
+	UMoKuEditSplinesComponent* SpawnedSpline = SpawnedRoad ? SpawnedRoad->GetSplineComponent() : nullptr;
+	if (!SpawnedRoad || !SpawnedSpline)
+	{
+		GEditor->EndTransaction();
+		return false;
+	}
+
+	while (SpawnedSpline->GetNumberOfSplinePoints() > 1)
+	{
+		SpawnedSpline->RemoveSplinePoint(SpawnedSpline->GetNumberOfSplinePoints() - 1, false);
+	}
+	if (UMetaLandRoadSplineComponent* SourceSpline = SourceTarget.Spline.Get())
+	{
+		MetaLandRoadProfile::ApplyRoadProfileFromDrawAnchor(
+			SpawnedSpline, SourceSpline, SourceTarget.PendingAnchor);
+	}
+	SpawnedSpline->SetLocationAtSplinePoint(0, SrcC, ESplineCoordinateSpace::World, false);
+	SpawnedSpline->AddSplinePointLocation(TgtC, SpawnedSpline->GetNumberOfSplinePoints());
+	ApplyAsymmetricTangentBezierConnection(SpawnedSpline, 0, TgtC, Leave, Arrive);
+	SpawnedSpline->SetLocationAtSplinePoint(0, SrcC, ESplineCoordinateSpace::World, false);
+	if (SpawnedSpline->GetNumberOfSplinePoints() >= 2)
+	{
+		SpawnedSpline->SetLocationAtSplinePoint(
+			SpawnedSpline->GetNumberOfSplinePoints() - 1, TgtC, ESplineCoordinateSpace::World, false);
+	}
+	ApplyAsymmetricTangentBezierConnection(SpawnedSpline, 0, TgtC, Leave, Arrive);
+	UE_LOG(
+		LogTemp,
+		Warning,
+		TEXT("[MetaLandRoad] Idle A pin SrcC=%s TgtC=%s chord=%.1f srcLanes=%d tgtLanes=%d"),
+		*SrcC.ToCompactString(),
+		*TgtC.ToCompactString(),
+		FVector::Dist2D(SrcC, TgtC),
+		CountDrawAnchorBundleLanes(SourceTarget.PendingAnchor),
+		CountDrawAnchorBundleLanes(*TargetAnchor));
+
+	SpawnedRoad->Tags.AddUnique(MetaLandRoadLaneBranchTag);
+	if (UMetaLandRoadSplineComponent* RoadSpline = Cast<UMetaLandRoadSplineComponent>(SpawnedSpline))
+	{
+		TGuardValue<bool> SuppressJunctionRecook(
+			AMoKuEditSplineActor::bSuppressJunctionRecookFromRoadRefresh, true);
+		RoadSpline->ConnectRoadToDrawAnchor(LaneDrawStartAnchor, /*bAttachAtSplineStart*/ true);
+		RoadSpline->BlendEndWidthToTargetMouth(*TargetAnchor, EMetaLandRoadEndWidthBlendSpan::EntireRoad);
+		RoadSpline->ConnectRoadToDrawAnchor(*TargetAnchor, /*bAttachAtSplineStart*/ false);
+		// Connect/blend must not keep a Fit-nudged stub — re-pin both mouths last.
+		RoadSpline->SetLocationAtSplinePoint(0, SrcC, ESplineCoordinateSpace::World, false);
+		if (RoadSpline->GetNumberOfSplinePoints() >= 2)
+		{
+			RoadSpline->SetLocationAtSplinePoint(
+				RoadSpline->GetNumberOfSplinePoints() - 1, TgtC, ESplineCoordinateSpace::World, false);
+		}
+		ApplyAsymmetricTangentBezierConnection(SpawnedSpline, 0, TgtC, Leave, Arrive);
+		RoadSpline->UpdateSpline();
+		SpawnedRoad->SetSplineComponent(SpawnedSpline);
+		SpawnedRoad->RefreshDynamicRoadMesh();
+		MetaLandRoadLaneVisualization::RefreshLaneVisualization(RoadSpline);
+		if (UMetaLandRoadSplineComponent* TargetSpline = TargetAnchor->SourceSpline.Get())
+		{
+			if (AMoKuEditSplineActor* TargetRoad = Cast<AMoKuEditSplineActor>(TargetSpline->GetOwner()))
+			{
+				TargetRoad->RefreshDynamicRoadMesh();
+			}
+		}
+		if (AMoKuEditSplineActor* SourceRoad = SourceTarget.RoadActor.Get())
+		{
+			SourceRoad->RefreshDynamicRoadMesh();
+		}
+	}
+
+	if (UMetaLandRoadEditorMode* ClearMode = ResolveMetaLandRoadEditorMode(this))
+	{
+		ClearMode->ClearEditTarget();
+	}
+	ClearDrawGuidanceRails();
+	UpdateEditState(false);
+	bIsDraw = false;
+	bLaneAnchorDrawSession = false;
+	bHasLaneDrawStartAnchor = false;
+	bHasLaneDrawEndSnapAnchor = false;
+	bEndSnapBundleUserLocked = false;
+	bHasEndSnapGhost = false;
+	ActiveActor = nullptr;
+	FMetaLandRoadModule::Get().RestoreAllRoadActorsViewportSelection();
+	if (TSharedPtr<FMoKuEditSplinesComponentVisualizer> RoadVis =
+		FMetaLandRoadModule::Get().GetRoadComponentVisualizer())
+	{
+		RoadVis->ClearNativeKeySelection();
+		RoadVis->EndEditing();
+	}
+	if (GEditor)
+	{
+		GEditor->SelectNone(false, true);
+	}
+
+	GEditor->EndTransaction();
+	if (GEngine)
+	{
+		GEngine->AddOnScreenDebugMessage(
+			-1,
+			3.0f,
+			FColor::Green,
+			TEXT("[MetaLandRoad] Mouth-to-mouth Bezier committed (A)"));
+	}
+	return true;
+}
+
 void UMetaLandRoadInteractiveTool::FinalizeLaneDrawEndConnection(
 	AMoKuEditSplineActor* ActiveRoad,
 	const FMetaLandRoadDrawAnchor& TargetAnchor)
@@ -3909,15 +5070,6 @@ void UMetaLandRoadInteractiveTool::FinalizeLaneDrawEndConnection(
 			MetaLandRoadProfile::EnsureLaneCountFromDrawAnchor(
 				ActiveSpline, TargetSpline, WorkingTarget);
 		}
-
-		if (TargetSpline
-			&& !bEndSnapBundleUserLocked
-			&& SourceLaneCount > TargetBundleCount
-			&& TargetBundleCount > 0)
-		{
-			MetaLandRoadLaneEditPick::ExpandAnchorBundleToCount(
-				TargetSpline, WorkingTarget, SourceLaneCount, nullptr);
-		}
 	}
 
 	if (GEngine)
@@ -3939,13 +5091,59 @@ void UMetaLandRoadInteractiveTool::FinalizeLaneDrawEndConnection(
 		return;
 	}
 
-	ActiveSpline->FitSplineToAnchor(WorkingTarget, /*bAtSplineStart*/ false);
+	FVector TargetLeft, TargetRight, TargetCenter, TargetOutward;
+	const bool bHaveTargetFrame = TargetSpline
+		&& MetaLandRoadLaneEditPick::ComputeAnchorMouthRailFrame(
+			TargetSpline, WorkingTarget, TargetLeft, TargetRight, TargetCenter, TargetOutward);
+
+	FVector LeaveDir = FVector::ZeroVector;
+	if (bHasLaneDrawStartAnchor && SourceAnchorCopy.IsValid() && SourceSpline)
+	{
+		FVector SrcL, SrcR, SrcC, SrcOut;
+		if (MetaLandRoadLaneEditPick::ComputeAnchorMouthRailFrame(
+			SourceSpline, SourceAnchorCopy, SrcL, SrcR, SrcC, SrcOut))
+		{
+			LeaveDir = SrcOut.GetSafeNormal2D();
+		}
+	}
+	if (LeaveDir.IsNearlyZero())
+	{
+		LeaveDir = ActiveSpline->GetLeaveTangentAtSplinePoint(0, ESplineCoordinateSpace::World).GetSafeNormal2D();
+	}
+	if (LeaveDir.IsNearlyZero() && ActiveSpline->GetNumberOfSplinePoints() >= 2)
+	{
+		LeaveDir = (ActiveSpline->GetLocationAtSplinePoint(1, ESplineCoordinateSpace::World)
+			- ActiveSpline->GetLocationAtSplinePoint(0, ESplineCoordinateSpace::World)).GetSafeNormal2D();
+	}
+
+	FVector ArriveDir = bHaveTargetFrame
+		? (-TargetOutward).GetSafeNormal2D()
+		: FVector::ZeroVector;
+	if (ArriveDir.IsNearlyZero() && bHaveTargetFrame)
+	{
+		ArriveDir = (TargetCenter
+			- ActiveSpline->GetLocationAtSplinePoint(0, ESplineCoordinateSpace::World)).GetSafeNormal2D();
+	}
+
+	if (bHaveTargetFrame && !LeaveDir.IsNearlyZero() && !ArriveDir.IsNearlyZero())
+	{
+		ApplyAsymmetricTangentBezierConnection(
+			ActiveSpline,
+			/*StartIndex*/ 0,
+			TargetCenter,
+			LeaveDir,
+			ArriveDir);
+	}
+	else
+	{
+		ActiveSpline->FitSplineToAnchor(WorkingTarget, /*bAtSplineStart*/ false);
+	}
 	const EMetaLandRoadEndWidthBlendSpan BlendSpan = OutputProperties
 		? OutputProperties->EndWidthBlendSpan
 		: EMetaLandRoadEndWidthBlendSpan::LastTwoSegments;
 
-	// LaneBranch: only blend tip width when target bundle is same count and not much wider.
-	// Otherwise keep uniform N-lane width — junction cover (not one arm) owns the hub flare.
+	// LaneBranch: taper down to a narrower target (2→1 mix) is allowed.
+	// Skip only when the target mouth is substantially wider (hub cover owns flare).
 	bool bDoEndWidthBlend = true;
 	if (bLaneBranch && SourceSpline && SourceAnchorCopy.IsValid() && TargetSpline)
 	{
@@ -3966,14 +5164,13 @@ void UMetaLandRoadInteractiveTool::FinalizeLaneDrawEndConnection(
 			{
 				TgtSum += FMath::Max(W, 1.0f);
 			}
-			const bool bSameCount = SrcLanes.Num() == TgtLanes.Num() && SrcLanes.Num() > 0;
-			bDoEndWidthBlend = bSameCount && TgtSum <= SrcSum * 1.12f;
+			bDoEndWidthBlend = TgtSum <= SrcSum * 1.12f;
 			if (!bDoEndWidthBlend)
 			{
 				UE_LOG(
 					LogTemp,
 					Log,
-					TEXT("[EndConnection] LaneBranch skip width-grow (srcSum=%.0f tgtSum=%.0f lanes=%d/%d) — keep proportional N-lane"),
+					TEXT("[EndConnection] LaneBranch skip width-grow (srcSum=%.0f tgtSum=%.0f lanes=%d/%d)"),
 					SrcSum,
 					TgtSum,
 					SrcLanes.Num(),
@@ -4035,9 +5232,15 @@ void UMetaLandRoadInteractiveTool::FinalizeLaneDrawEndConnection(
 	}
 
 	FMetaLandRoadModule::Get().RestoreAllRoadActorsViewportSelection();
-
+	if (TSharedPtr<FMoKuEditSplinesComponentVisualizer> RoadVis =
+		FMetaLandRoadModule::Get().GetRoadComponentVisualizer())
+	{
+		RoadVis->ClearNativeKeySelection();
+		RoadVis->EndEditing();
+	}
 	if (GEditor)
 	{
+		GEditor->SelectNone(false, true);
 		GEditor->RedrawLevelEditingViewports(true);
 	}
 }
@@ -4158,19 +5361,16 @@ int32 UMetaLandRoadInteractiveTool::ResolveEndConnectTargetLaneCount() const
 		return FMath::Clamp(Count, 1, 8);
 	};
 
-	const int32 StartCount =
-		(bHasLaneDrawStartAnchor && LaneDrawStartAnchor.IsValid())
-			? CountBundle(LaneDrawStartAnchor)
-			: 0;
 	const int32 LockedEndCount =
 		(bEndSnapBundleUserLocked && bHasLaneDrawEndSnapAnchor && LaneDrawEndSnapAnchor.IsValid())
 			? CountBundle(LaneDrawEndSnapAnchor)
 			: 0;
 
-	// Prefer the extend selection (start). Never let a 2-lane end-hover win over a 3-lane start.
-	if (StartCount > 0 || LockedEndCount > 0)
+	// Locked mix is authoritative (2-lane begin → 1-lane end is allowed).
+	// Hover seeds 1 lane; Shift+/- grows/shrinks the target bundle.
+	if (LockedEndCount > 0)
 	{
-		return FMath::Max(StartCount, LockedEndCount);
+		return LockedEndCount;
 	}
 	if (OutputProperties && !OutputProperties->bEndConnectMatchSourceLanes)
 	{
@@ -4190,6 +5390,11 @@ const FMetaLandRoadDrawAnchor* UMetaLandRoadInteractiveTool::ResolveEndSnapCommi
 	if (bHasLaneDrawEndSnapAnchor && LaneDrawEndSnapAnchor.IsValid())
 	{
 		OutStorage = LaneDrawEndSnapAnchor;
+		return &OutStorage;
+	}
+	if (bHasEndSnapMixHover && EndSnapMixHoverAnchor.IsValid())
+	{
+		OutStorage = EndSnapMixHoverAnchor;
 		return &OutStorage;
 	}
 	return nullptr;
@@ -4250,6 +5455,32 @@ void UMetaLandRoadInteractiveTool::UpdateLaneDrawSnapFromWorldHit(
 {
 	const bool bKeepUserBundle = bEndSnapBundleUserLocked && LaneDrawEndSnapAnchor.IsValid();
 	const FMetaLandRoadDrawAnchor LockedAnchor = LaneDrawEndSnapAnchor;
+
+	// Idle two-mouth: hover must not wipe a locked / hovered target mouth.
+	if (!GetEditState() && !bLaneAnchorDrawSession)
+	{
+		if (bKeepUserBundle && LockedAnchor.IsValid() && LockedAnchor.SourceSpline.IsValid())
+		{
+			FVector TipLeft, TipRight, TipCenter, Outward;
+			if (MetaLandRoadLaneEditPick::ComputeAnchorMouthRailFrame(
+				LockedAnchor.SourceSpline.Get(), LockedAnchor, TipLeft, TipRight, TipCenter, Outward))
+			{
+				EndSnapGhostLeft = TipLeft;
+				EndSnapGhostRight = TipRight;
+				ApplyGuidanceSurfaceZ(EndSnapGhostLeft);
+				ApplyGuidanceSurfaceZ(EndSnapGhostRight);
+				bHasEndSnapGhost = true;
+				DrawOutSplinePos = TipCenter;
+				LaneSnapArriveTangent = (-Outward).GetSafeNormal2D();
+				bHasLaneSnapArriveTangent = !LaneSnapArriveTangent.IsNearlyZero();
+				if (AActor* Owner = LockedAnchor.SourceSpline->GetOwner())
+				{
+					HitActor = Owner;
+				}
+			}
+		}
+		return;
+	}
 
 	bHasLaneSnapArriveTangent = false;
 	LaneSnapArriveTangent = FVector::ForwardVector;
@@ -4458,11 +5689,23 @@ void UMetaLandRoadInteractiveTool::SyncLaneDrawCursorFromRay(const FRay& WorldRa
 			bHasGuidancePlaneZ,
 			FallbackZ,
 			bHitWorld ? Result.ImpactPoint : ResultHitPos,
-			bHitWorld);
+			bHitWorld,
+			World);
 	}
 	else if (bHitWorld)
 	{
 		ResultHitPos = Result.ImpactPoint;
+		// Free draw: if we already have a guidance plane, keep MetaRoad planar Z.
+		if (bHasGuidancePlaneZ)
+		{
+			ResultHitPos.Z = GuidancePlaneZ;
+		}
+		else if (Cast<AMoKuEditSplineActor>(Result.GetActor())
+			|| Cast<AMoKuEditIntersectionActor>(Result.GetActor()))
+		{
+			// Hit road top — drop XY onto landscape so first point is not elevated on mesh.
+			ProjectPointOntoLandscapeSurface(World, ResultHitPos, HoverActor);
+		}
 	}
 
 	AActor* TraceHitActor = bHitWorld ? Result.GetActor() : nullptr;
@@ -4493,7 +5736,10 @@ void UMetaLandRoadInteractiveTool::ResolveLaneExtendCenterPlan(
 
 	if (!bAllowHermiteRamp)
 	{
-		OutPlan.EndCenter = ProjectOntoParallelLaneExtend(TipCenter, OutPlan.StartTangent, OutPlan.EndCenter);
+		// Initial dual-rail (NumPts < 3): free tip → mouse. Do NOT project onto tip leave —
+		// that "Ctrl locks" the rubber-band onto one axis and makes L/R cross when mouse goes aside.
+		OutPlan.EndCenter = CursorOnPlane;
+		OutPlan.EndTangent = (OutPlan.EndCenter - TipCenter).GetSafeNormal2D();
 		if (OutPlan.EndTangent.IsNearlyZero())
 		{
 			OutPlan.EndTangent = OutPlan.StartTangent;
@@ -4553,28 +5799,8 @@ void UMetaLandRoadInteractiveTool::ResolveLaneExtendCenterPlan(
 		{
 			OutPlan.bUseHermite = true;
 			OutPlan.EndCenter = CursorWorld;
-			// Exit tangent = Start rotated toward ToCursor (same as unit ToCursor when both unit),
-			// but keep a bit of Start on mild turns so rails don't kink at the tip.
-			if (ToCursor.IsNearlyZero())
-			{
-				OutPlan.EndTangent = OutPlan.StartTangent;
-			}
-			else if (DotAlign < 0.2)
-			{
-				// Hard corner: arrive along travel at end ≈ ToCursor, but bias off pure chord pinch.
-				const FVector TurnAxis = FVector::CrossProduct(OutPlan.StartTangent, ToCursor);
-				const double TurnDeg = FMath::RadiansToDegrees(FMath::Atan2(TurnAxis.Z, DotAlign));
-				OutPlan.EndTangent = OutPlan.StartTangent.RotateAngleAxis(
-					static_cast<float>(TurnDeg), FVector::UpVector).GetSafeNormal2D();
-				if (OutPlan.EndTangent.IsNearlyZero())
-				{
-					OutPlan.EndTangent = ToCursor;
-				}
-			}
-			else
-			{
-				OutPlan.EndTangent = ToCursor;
-			}
+			// Free-end arrive = ToCursor (rotated StartTangent caused outward V on green rails).
+			OutPlan.EndTangent = ToCursor.IsNearlyZero() ? OutPlan.StartTangent : ToCursor;
 		}
 		else
 		{
@@ -4614,6 +5840,52 @@ void UMetaLandRoadInteractiveTool::AppendLaneDrawKeysToActiveSpline(
 	if (!bForward && NumBefore >= 2)
 	{
 		CaptureLaneExtendPointFreezes(SplineComponent, 0, NumBefore, CommittedFreezes);
+	}
+
+	if (Plan.bUseHermite && !bForward)
+	{
+		TGuardValue<bool> SuppressJunctionRecook(
+			AMoKuEditSplineActor::bSuppressJunctionRecookFromRoadRefresh, true);
+		SplineComponent->Modify();
+		SplineActor->Modify();
+		Modify();
+		const int32 SegStartIndex = (NumBefore <= 2) ? 0 : FMath::Max(NumBefore - 1, 0);
+		ApplyAsymmetricTangentBezierConnection(
+			SplineComponent,
+			SegStartIndex,
+			Plan.EndCenter,
+			Plan.StartTangent,
+			Plan.EndTangent);
+		if (bPinConnectionEnd && SplineComponent->GetNumberOfSplinePoints() >= 2)
+		{
+			const int32 EndIndex = SplineComponent->GetNumberOfSplinePoints() - 1;
+			SplineComponent->SetLocationAtSplinePoint(
+				EndIndex, Plan.EndCenter, ESplineCoordinateSpace::World, false);
+		}
+		if (CommittedFreezes.Num() > 0 && SegStartIndex > 0)
+		{
+			RestoreLaneExtendPointFreezes(
+				SplineComponent,
+				/*IndexBegin*/ 0,
+				CommittedFreezes,
+				/*TipIndexKeepNewLeave*/ SegStartIndex);
+		}
+		HideEditorSplineRibbon(SplineComponent);
+		SplineComponent->UpdateSpline();
+		SplineActor->SetSplineComponent(SplineComponent);
+		ActiveActor->IsInit = false;
+		RefreshGizmoInfo();
+		if (SplineActor)
+		{
+			SplineActor->RefreshDynamicRoadMesh();
+			if (UMetaLandRoadSplineComponent* RoadSpline = Cast<UMetaLandRoadSplineComponent>(SplineComponent))
+			{
+				MetaLandRoadLaneVisualization::RefreshLaneVisualization(RoadSpline);
+			}
+		}
+		GuidanceLastCursor = Plan.EndCenter;
+		GuidanceMoveDir = (Plan.EndCenter - Plan.StartCenter).GetSafeNormal2D();
+		return;
 	}
 	// Lane-extend key inserts refresh mesh — junction cook waits for A.
 	TGuardValue<bool> SuppressJunctionRecook(
@@ -4812,6 +6084,10 @@ bool UMetaLandRoadInteractiveTool::AddLaneDrawSegmentFromCursor(
 		return false;
 	}
 
+	FVector CursorSnap = CursorOnPlane;
+	ProjectPointOntoLandscapeSurface(
+		TargetWorld ? TargetWorld : GetWorld(), CursorSnap, RoadActor);
+
 	const bool bForward = (StateOfEditor == EMoKuEditState::Forward);
 	const int32 NumPts = Spline->GetNumberOfSplinePoints();
 	const int32 TipIndex = bForward ? 0 : NumPts - 1;
@@ -4885,11 +6161,12 @@ bool UMetaLandRoadInteractiveTool::AddLaneDrawSegmentFromCursor(
 	}
 
 	FLaneExtendCenterPlan Plan;
-	ResolveLaneExtendCenterPlan(TipCenter, TipTangent, CursorOnPlane, true, Plan);
+	ResolveLaneExtendCenterPlan(TipCenter, TipTangent, CursorSnap, true, Plan);
 	Plan.StartCenter = TipCenter;
 	Plan.StartTangent = TipTangent.GetSafeNormal2D().IsNearlyZero()
 		? Plan.StartTangent
 		: TipTangent.GetSafeNormal2D();
+	Plan.EndCenter.Z = CursorSnap.Z;
 
 	// Hermite: one new end key + CurveUser handles (same math as green rails).
 	// Mid bake keys created pink control-point 折角 and folded mesh rings.
@@ -4995,6 +6272,21 @@ void UMetaLandRoadInteractiveTool::PopulateLaneExtendGuidance(
 		EndLeftPtr = &EndSnapGhostLeft;
 		EndRightPtr = &EndSnapGhostRight;
 		Plan.EndCenter = (EndSnapGhostLeft + EndSnapGhostRight) * 0.5;
+		Plan.StartTangent = TipDir;
+		if (bHasLaneSnapArriveTangent && !LaneSnapArriveTangent.IsNearlyZero())
+		{
+			Plan.EndTangent = LaneSnapArriveTangent.GetSafeNormal2D();
+		}
+		else
+		{
+			const FVector Across = (EndSnapGhostRight - EndSnapGhostLeft).GetSafeNormal2D();
+			Plan.EndTangent = FVector::CrossProduct(Across, FVector::UpVector).GetSafeNormal2D();
+			if (Plan.EndTangent.IsNearlyZero())
+			{
+				Plan.EndTangent = (Plan.EndCenter - TipCenter).GetSafeNormal2D();
+			}
+		}
+		Plan.bUseHermite = true;
 	}
 
 	// One corridor (L/R rails). Per-lane multi-rails cross on turns and hide width lerp.
@@ -5112,11 +6404,37 @@ void UMetaLandRoadInteractiveTool::UpdateAnchorPreviewGuidanceRails()
 		return;
 	}
 
-	ApplyGuidanceSurfaceZ(TipLeft);
-	ApplyGuidanceSurfaceZ(TipRight);
-	ApplyGuidanceSurfaceZ(TipCenter);
+	const float PlaneZ = ResolveGuidancePlaneZOnSurface(
+		TargetWorld ? TargetWorld : GetWorld(),
+		TipCenter,
+		Target.RoadActor.Get());
+	TipLeft.Z = PlaneZ;
+	TipRight.Z = PlaneZ;
+	TipCenter.Z = PlaneZ;
+	GuidancePlaneZ = PlaneZ;
+	bHasGuidancePlaneZ = true;
 
-	const FVector Cursor = ResultHitPos;
+	FVector Cursor = ResultHitPos;
+	if (bHasEndSnapGhost)
+	{
+		Cursor = (EndSnapGhostLeft + EndSnapGhostRight) * 0.5;
+	}
+	else if (bHasLaneDrawEndSnapAnchor && LaneDrawEndSnapAnchor.IsValid()
+		&& LaneDrawEndSnapAnchor.SourceSpline.IsValid())
+	{
+		FVector SnapL, SnapR, SnapC, SnapOut;
+		if (MetaLandRoadLaneEditPick::ComputeAnchorMouthRailFrame(
+			LaneDrawEndSnapAnchor.SourceSpline.Get(),
+			LaneDrawEndSnapAnchor,
+			SnapL,
+			SnapR,
+			SnapC,
+			SnapOut))
+		{
+			Cursor = SnapC;
+		}
+	}
+	Cursor.Z = PlaneZ;
 	GuidanceLastCursor = Cursor;
 	GuidanceMoveDir = (Cursor - TipCenter).GetSafeNormal2D();
 
@@ -5178,8 +6496,9 @@ void UMetaLandRoadInteractiveTool::UpdateDrawGuidanceRails()
 		&& HitActor
 		&& HitActor->IsA<AMoKuEditSplineActor>()
 		&& HitActor != ActiveActor;
-	// End snap: aim at locked target mouth mid only — hover ghost must not twist free extend.
-	const FVector Cursor = (bEndSnapBundleUserLocked && bHasEndSnapGhost)
+	const bool bAimAtEndSnapMouth = bHasEndSnapGhost
+		&& (bEndSnapBundleUserLocked || bHasEndSnapMixHover || bHasLaneDrawEndSnapAnchor);
+	FVector Cursor = bAimAtEndSnapMouth
 		? ((EndSnapGhostLeft + EndSnapGhostRight) * 0.5)
 		: (bConnectionGuidance ? FVector(DrawOutSplinePos) : ResultHitPos);
 	const FVector Delta2D = (Cursor - GuidanceLastCursor).GetSafeNormal2D();
@@ -5247,10 +6566,8 @@ void UMetaLandRoadInteractiveTool::UpdateDrawGuidanceRails()
 	}
 
 	// Always path from mouth mid — must match spawn MouthLoc / mesh centerline.
+	// Keep raw tip Z here; BuildLaneWidthGuidanceRails flattens + applies one PDI lift (MetaRoad).
 	TipCenter = (TipLeft + TipRight) * 0.5;
-	ApplyGuidanceSurfaceZ(TipLeft);
-	ApplyGuidanceSurfaceZ(TipRight);
-	ApplyGuidanceSurfaceZ(TipCenter);
 
 	FVector TipTangent = ExtendTangent;
 	if (TipTangent.IsNearlyZero())
@@ -5319,9 +6636,6 @@ void UMetaLandRoadInteractiveTool::UpdateDrawGuidanceRails()
 			Spline, LiveStartBundle, TipLeft, TipRight, BundleCenter, BundleTangent))
 		{
 			TipCenter = BundleCenter;
-			ApplyGuidanceSurfaceZ(TipLeft);
-			ApplyGuidanceSurfaceZ(TipRight);
-			ApplyGuidanceSurfaceZ(TipCenter);
 			if (!BundleTangent.IsNearlyZero())
 			{
 				TipTangent = BundleTangent.GetSafeNormal2D();
@@ -5329,9 +6643,20 @@ void UMetaLandRoadInteractiveTool::UpdateDrawGuidanceRails()
 		}
 	}
 
-	// Corridor guidance only (no PerLaneAnchor) — width = tip mouth span, taper to EndSnap ghost.
+	// Plane = landscape under tip (not elevated mesh Z) so green rails hug ground like MetaRoad.
+	const float PlaneZ = ResolveGuidancePlaneZOnSurface(TargetWorld, TipCenter, RoadActor);
+	TipLeft.Z = PlaneZ;
+	TipRight.Z = PlaneZ;
+	TipCenter.Z = PlaneZ;
+	RubberEnd.Z = PlaneZ;
+	GuidancePlaneZ = PlaneZ;
+	bHasGuidancePlaneZ = true;
+
+	// Hermite rubber-band when spline already has a segment (NumPts >= 2).
+	// NumPts < 2 (刚落第一点): tip→cursor stays parallel dual straight.
+	const bool bAllowCurveGuidance = NumPts >= 2;
 	PopulateLaneExtendGuidance(
-		TipLeft, TipRight, TipCenter, TipTangent, RubberEnd, true, nullptr, TipS);
+		TipLeft, TipRight, TipCenter, TipTangent, RubberEnd, bAllowCurveGuidance, nullptr, TipS);
 	(void)bConnectionGuidance;
 }
 
@@ -5358,6 +6683,119 @@ void UMetaLandRoadInteractiveTool::DrawDrawGuidanceRails(FPrimitiveDrawInterface
 	for (const TArray<FVector>& Rail : GuidanceRightPolylines)
 	{
 		DrawRail(Rail, GuidanceRightRailColor);
+	}
+
+	// Default off — green dual-rails only; enable via Tool Details → Debug Guidance Points.
+	if (!OutputProperties || !OutputProperties->bDebugDrawGuidanceRailPoints)
+	{
+		return;
+	}
+
+	auto DrawRailPoints = [PDI](const TArray<FVector>& Rail, const FLinearColor& Color, bool bLeft)
+	{
+		const float PointSize = bLeft ? 12.0f : 10.0f;
+		for (int32 i = 0; i < Rail.Num(); ++i)
+		{
+			const FLinearColor PtColor = (i == 0)
+				? FLinearColor(1.0f, 1.0f, 0.15f, 1.0f)   // tip = yellow
+				: ((i == Rail.Num() - 1)
+					? FLinearColor(1.0f, 0.35f, 0.1f, 1.0f) // free end = orange
+					: Color);
+			PDI->DrawPoint(Rail[i], PtColor, PointSize, SDPG_Foreground);
+			// Tiny axis so a lone point is obvious in Perspective.
+			const FVector Nudge = FVector::UpVector * 25.0;
+			PDI->DrawLine(Rail[i], Rail[i] + Nudge, PtColor, SDPG_Foreground, 2.0f);
+		}
+	};
+	for (const TArray<FVector>& Rail : GuidanceLeftPolylines)
+	{
+		DrawRailPoints(Rail, GuidanceLeftRailColor, true);
+	}
+	for (const TArray<FVector>& Rail : GuidanceRightPolylines)
+	{
+		DrawRailPoints(Rail, GuidanceRightRailColor, false);
+	}
+}
+
+void UMetaLandRoadInteractiveTool::DrawDrawGuidanceRailPointHUD(
+	FCanvas* Canvas,
+	const FSceneView* View) const
+{
+	if (!Canvas || !View)
+	{
+		return;
+	}
+	if (!OutputProperties || !OutputProperties->bDebugDrawGuidanceRailPoints)
+	{
+		return;
+	}
+	if (!HasDrawGuidanceRails())
+	{
+		return;
+	}
+
+	UFont* Font = GEngine ? GEngine->GetSmallFont() : nullptr;
+	if (!Font)
+	{
+		return;
+	}
+
+	auto DrawRailLabels = [Canvas, View, Font](
+		const TArray<TArray<FVector>>& Rails,
+		const TCHAR* Prefix,
+		const FLinearColor& TextColor)
+	{
+		for (int32 RailIdx = 0; RailIdx < Rails.Num(); ++RailIdx)
+		{
+			const TArray<FVector>& Rail = Rails[RailIdx];
+			for (int32 i = 0; i < Rail.Num(); ++i)
+			{
+				FVector2D Screen;
+				if (!View->WorldToPixel(Rail[i], Screen))
+				{
+					continue;
+				}
+				const FString Label = (Rails.Num() > 1)
+					? FString::Printf(TEXT("%s%d.%d"), Prefix, RailIdx, i)
+					: FString::Printf(TEXT("%s%d"), Prefix, i);
+				const FVector2D TextPos(Screen.X + 6.0f, Screen.Y - 14.0f);
+				FCanvasTextItem TextItem(TextPos, FText::FromString(Label), Font, TextColor);
+				TextItem.EnableShadow(FLinearColor::Black);
+				TextItem.bOutlined = true;
+				TextItem.OutlineColor = FLinearColor(0.f, 0.f, 0.f, 0.85f);
+				Canvas->DrawItem(TextItem);
+			}
+		}
+	};
+
+	DrawRailLabels(GuidanceLeftPolylines, TEXT("L"), FLinearColor(0.85f, 1.0f, 0.2f, 1.0f));
+	DrawRailLabels(GuidanceRightPolylines, TEXT("R"), FLinearColor(0.3f, 0.95f, 1.0f, 1.0f));
+
+	// Summary: point counts help spot duplicate / empty rails.
+	{
+		int32 LeftN = 0;
+		int32 RightN = 0;
+		for (const TArray<FVector>& Rail : GuidanceLeftPolylines)
+		{
+			LeftN += Rail.Num();
+		}
+		for (const TArray<FVector>& Rail : GuidanceRightPolylines)
+		{
+			RightN += Rail.Num();
+		}
+		const FString Summary = FString::Printf(
+			TEXT("GuidanceDebug  LRails=%d LPts=%d  RRails=%d RPts=%d  (yellow=tip orange=end)"),
+			GuidanceLeftPolylines.Num(),
+			LeftN,
+			GuidanceRightPolylines.Num(),
+			RightN);
+		FCanvasTextItem SummaryItem(
+			FVector2D(24.0f, 48.0f),
+			FText::FromString(Summary),
+			Font,
+			FLinearColor(1.0f, 0.95f, 0.4f, 1.0f));
+		SummaryItem.EnableShadow(FLinearColor::Black);
+		Canvas->DrawItem(SummaryItem);
 	}
 }
 
@@ -5529,6 +6967,19 @@ void UMetaLandRoadInteractiveTool::OnBeginHover(const FInputDeviceRay& DevicePos
 }
 bool UMetaLandRoadInteractiveTool::OnUpdateHover(const FInputDeviceRay& DevicePos)
 {
+	// Alt+W/E/T: CompVis owns hover/pick. Skip world line-traces here — they fight
+	// key editing and add heavy per-frame cost (feels like a frozen viewport).
+	if (FModuleManager::Get().IsModuleLoaded(TEXT("MetaLandRoad")))
+	{
+		const FMetaLandRoadModule& Module = FMetaLandRoadModule::Get();
+		if (Module.ShouldShowNativeEditOverlay()
+			|| Module.IsSectionMode()
+			|| Module.IsLaneEditMode())
+		{
+			return false;
+		}
+	}
+
 	UWorld* World = TargetWorld ? TargetWorld : GetWorld();
 	if (!World)
 	{
@@ -5567,11 +7018,21 @@ bool UMetaLandRoadInteractiveTool::OnUpdateHover(const FInputDeviceRay& DevicePo
 			bHasGuidancePlaneZ,
 			FallbackZ,
 			bHitWorld ? Result.ImpactPoint : ResultHitPos,
-			bHitWorld);
+			bHitWorld,
+			World);
 	}
 	else if (bHitWorld)
 	{
 		ResultHitPos = Result.ImpactPoint;
+		if (bHasGuidancePlaneZ)
+		{
+			ResultHitPos.Z = GuidancePlaneZ;
+		}
+		else if (Cast<AMoKuEditSplineActor>(Result.GetActor())
+			|| Cast<AMoKuEditIntersectionActor>(Result.GetActor()))
+		{
+			ProjectPointOntoLandscapeSurface(World, ResultHitPos, HoverActor);
+		}
 	}
 	else
 	{
@@ -5670,6 +7131,57 @@ bool UMetaLandRoadInteractiveTool::OnUpdateHover(const FInputDeviceRay& DevicePo
 	return true;
 }
 
+bool UMetaLandRoadInteractiveTool::TryCookJunctionOnCtrlPressIfCrossed()
+{
+	AMoKuEditSplineActor* ActiveRoad = Cast<AMoKuEditSplineActor>(ActiveActor);
+	if (!ActiveRoad || !GetEditState())
+	{
+		return false;
+	}
+
+	UMoKuEditSplinesComponent* ActiveSpline = ActiveRoad->GetSplineComponent();
+	if (!ActiveSpline || ActiveSpline->GetNumberOfSplinePoints() < 2)
+	{
+		return false;
+	}
+
+	UWorld* World = TargetWorld ? TargetWorld : GetWorld();
+	if (!World)
+	{
+		return false;
+	}
+
+	const float MaxHeightDelta =
+		OutputProperties ? OutputProperties->JunctionMaxHeightDeltaCm : 0.0f;
+
+	for (TActorIterator<AMoKuEditSplineActor> It(World); It; ++It)
+	{
+		AMoKuEditSplineActor* OtherRoad = *It;
+		UMoKuEditSplinesComponent* OtherSpline = OtherRoad ? OtherRoad->GetSplineComponent() : nullptr;
+		if (!OtherSpline
+			|| OtherRoad == ActiveRoad
+			|| OtherSpline == ActiveSpline
+			|| OtherSpline->GetNumberOfSplinePoints() < 2)
+		{
+			continue;
+		}
+
+		FVector IntersectWorld = FVector::ZeroVector;
+		if (!MoKuSplineEditorUtils::DoSplineIntersect(
+				ActiveSpline, OtherSpline, IntersectWorld, MaxHeightDelta))
+		{
+			continue;
+		}
+
+		// Local cook for current road only (not A / not full-world) — avoids the heavy A-finish path.
+		CookJunctionForActiveRoad(/*bFinishEditSession=*/true, /*bForceHubJunctionCook=*/false);
+		ClearSelectionForDrawSession();
+		return true;
+	}
+
+	return false;
+}
+
 void UMetaLandRoadInteractiveTool::CookJunctionForActiveRoad(
 	bool bFinishEditSession,
 	bool bForceHubJunctionCook)
@@ -5699,7 +7211,9 @@ void UMetaLandRoadInteractiveTool::CookJunctionForActiveRoad(
 		{
 			const bool bFullWorldRebuild =
 				OutputProperties && OutputProperties->bFullWorldJunctionRecookOnDrawFinish;
-			RoadMode->ProcessInteractiveFinishedRoadDraw(FinishActor, bFullWorldRebuild);
+			const float MaxHeightDelta =
+				OutputProperties ? OutputProperties->JunctionMaxHeightDeltaCm : 0.0f;
+			RoadMode->ProcessInteractiveFinishedRoadDraw(FinishActor, bFullWorldRebuild, MaxHeightDelta);
 		}
 		else if (GEngine)
 		{
@@ -5739,9 +7253,24 @@ void UMetaLandRoadInteractiveTool::CookJunctionForActiveRoad(
 
 void UMetaLandRoadInteractiveTool::OnFinishedSplineEdit()
 {
+	if (TryCommitIdleMouthToMouthConnection())
+	{
+		return;
+	}
+
+	if (!bLaneAnchorDrawSession && !GetEditState())
+	{
+		return;
+	}
+
 	const bool bWasLaneAnchorDraw = bLaneAnchorDrawSession || bRoadSpawnedFromLaneAnchorDraw;
-	const bool bEndSnapFinish = bHasLaneDrawEndSnapAnchor && LaneDrawEndSnapAnchor.IsValid();
-	const FMetaLandRoadDrawAnchor EndSnapAnchorCopy = LaneDrawEndSnapAnchor;
+	FMetaLandRoadDrawAnchor EndSnapAnchorCopy;
+	const FMetaLandRoadDrawAnchor* EndSnapCommit = ResolveEndSnapCommitAnchor(EndSnapAnchorCopy);
+	const bool bEndSnapFinish = EndSnapCommit && EndSnapCommit->IsValid();
+	if (bEndSnapFinish)
+	{
+		EndSnapAnchorCopy = *EndSnapCommit;
+	}
 	const FMetaLandRoadDrawAnchor StartAnchorCopy = LaneDrawStartAnchor;
 
 	AMoKuEditSplineActor* FinishActor = Cast<AMoKuEditSplineActor>(ActiveActor);
@@ -5756,14 +7285,38 @@ void UMetaLandRoadInteractiveTool::OnFinishedSplineEdit()
 	if (ActiveActor && (GetEditState() || bCanFinishRoad))
 	{
 		GEditor->BeginTransaction(FText::FromString(TEXT("Finished The Curvel's Operation!")));
+		const bool bCookOnA = OutputProperties && OutputProperties->bCookJunctionOnAFinish;
 		if (FinishActor && bCanFinishRoad && bEndSnapFinish)
 		{
 			FinalizeLaneDrawEndConnection(FinishActor, EndSnapAnchorCopy);
+			// Mouth connect only — hub cook is click-on-road (unless Cook On A is enabled).
+			if (bCookOnA)
+			{
+				CookJunctionForActiveRoad(/*bFinishEditSession=*/false, /*bForceHubJunctionCook=*/false);
+			}
+			else
+			{
+				RefreshRoadMeshSuppressJunction(FinishActor);
+			}
 		}
 		else if (FinishActor && bCanFinishRoad)
 		{
-			// A = end draw session + mesh refresh only (never hub junction recook).
-			RefreshRoadMeshSuppressJunction(FinishActor);
+			// Default: A = finish mesh + local cook if XY cross exists (no-op when no intersect).
+			// Off: mesh only; cook via Ctrl+click onto another road/junction.
+			if (bCookOnA)
+			{
+				CookJunctionForActiveRoad(/*bFinishEditSession=*/true, /*bForceHubJunctionCook=*/false);
+			}
+			else
+			{
+				RefreshRoadMeshSuppressJunction(FinishActor);
+				if (GEngine)
+				{
+					GEngine->AddOnScreenDebugMessage(
+						-1, 3.0f, FColor::Cyan,
+						TEXT("Draw finished (A). Click onto another road to cook junction."));
+				}
+			}
 		}
 		this->Modify();
 
@@ -5824,11 +7377,7 @@ void UMetaLandRoadInteractiveTool::OnFinishedSplineEdit()
 		Comp->bDrawDebug = false;
 		Comp->bIsRenderPreviewMesh = false;
 		Comp->bIsAddPreviewMeshPoint = false;
-		ActiveActor = FinishActor;
-		if (bWasLaneAnchorDraw || bCanFinishRoad)
-		{
-			CompVisUtils::SelectRoadSplineExclusive(FinishActor, Comp, true);
-		}
+		ActiveActor = nullptr;
 		RefreshGizmoInfo();
 	}
 	else
@@ -5842,9 +7391,15 @@ void UMetaLandRoadInteractiveTool::OnFinishedSplineEdit()
 	}
 
 	FMetaLandRoadModule::Get().RestoreAllRoadActorsViewportSelection();
-
+	if (TSharedPtr<FMoKuEditSplinesComponentVisualizer> RoadVis =
+		FMetaLandRoadModule::Get().GetRoadComponentVisualizer())
+	{
+		RoadVis->ClearNativeKeySelection();
+		RoadVis->EndEditing();
+	}
 	if (GEditor)
 	{
+		GEditor->SelectNone(false, true);
 		GEditor->RedrawLevelEditingViewports(true);
 	}
 }

@@ -110,6 +110,11 @@ public:
 
 	virtual void BlueprintRoadBodyChanged_Native(AActor* Actor) override;
 
+#if WITH_EDITOR
+	/** Allocate RTs + log sizes + open CombinedShapeAndHeight preview when Details shows None. */
+	UFUNCTION(CallInEditor, Category = "Render Targets", meta = (DisplayName = "Debug Allocate And Show RTs"))
+	void DebugForceAllocateRenderTargets();
+#endif
 
 	UFUNCTION(BlueprintCallable, BlueprintPure, meta = (Category = "Debug"))
 	virtual void GetRoadCacheKey(AActor* RoadBrush, URoadBodyBrushCacheContainer*& ContainerObject, FRoadBodyBrushCache& Value);
@@ -158,6 +163,10 @@ public:
 
 	UPROPERTY(VisibleAnywhere, Transient, meta = (Category = "Render Targets"))
 	TObjectPtr<UTextureRenderTarget2D> WeightmapRTB = nullptr;
+
+	/** Flat elevation curve RT (256x1) so CacheDistanceField/MeshBrush CurveRT pins are never unbound. */
+	UPROPERTY(VisibleAnywhere, Transient, meta = (Category = "Render Targets"))
+	TObjectPtr<UTextureRenderTarget2D> DefaultCurveRT = nullptr;
 
 	// Brush materials
 	UPROPERTY(EditAnywhere, AdvancedDisplay, BlueprintReadWrite, meta = (Category = "Brush Materials"))
@@ -265,8 +274,9 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, meta=(Category="Debug"))
 	bool UseDynamicPreviewRT = false;
 		
+	/** Off = allow Curl/Displacement/WeightmapInfluence noise. On (default) = clean edges. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, meta=(Category="Debug"))
-	bool DisableBrushTextureEffects = false;
+	bool DisableBrushTextureEffects = true;
 
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, meta = (Category = "Settings"))
@@ -274,6 +284,10 @@ public:
 
 	bool DeprecateWorldLandscapeInfo(FVector& OutRTWorldLocation, FVector& OutRTWorldSizeVector);
 	void SetupDefaultMaterials();
+	void SyncJumpFloodMaterials();
+
+	/** Force JumpFlood / DF cache rebuild on next RenderLayer (weight FalloffWidth / landscape scale changes). */
+	void InvalidateBrushDistanceFieldCache() { bKillCache = true; }
 
 private:
 
@@ -319,7 +333,9 @@ private:
 	virtual void CacheBrushDistanceField(const FBrushActorRenderContext& BrushActorRenderContext);
 	virtual void CaptureRoadDepth(const FBrushActorRenderContext& BrushActorRenderContext);
 	virtual void DrawCanvasShape(const FBrushActorRenderContext& BrushActorRenderContext);
-	//virtual void FalloffAndBlendMode(const FBrushActorRenderContext& BrushActorRenderContext);
+	virtual void FalloffAndBlendMode(const FBrushActorRenderContext& BrushActorRenderContext);
+	virtual void CurvesSmoothingAndTerracing(const FBrushActorRenderContext& BrushActorRenderContext);
+	virtual void DisplacementSettings(const FBrushActorRenderContext& BrushActorRenderContext);
 	virtual void GetRenderDependencies(TSet<UObject*>& OutDependencies) override;
 	virtual void ApplyWeightmapSettings(const FEditorBrushRenderContext& BrushRenderContext, const FBrushActorRenderContext& BrushActorRenderContext, const FRoadBodyWeightmapSettings& WMSettings);
 private:

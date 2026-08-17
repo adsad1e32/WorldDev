@@ -25,6 +25,8 @@
 
 class UMoKuEditSplinesComponent;
 class FPrimitiveDrawInterface;
+class FCanvas;
+class FSceneView;
 
 UCLASS()
 class UInteractiveToolSettings : public  UInteractiveToolPropertySet
@@ -75,7 +77,7 @@ public:
 	UPROPERTY(EditAnywhere, Category = "Lane Draw|End Snap", meta = (EditCondition = "false", EditConditionHides))
 	bool bEndConnectMatchSourceLanes = false;
 
-	/** Updated by Alt/Shift+LMB target mix picks (informational). */
+	/** Updated by Shift+LMB target mix picks (1..N, independent of begin count). */
 	UPROPERTY(VisibleAnywhere, Category = "Lane Draw|End Snap")
 	int32 EndConnectTargetLaneCount = 1;
 
@@ -85,6 +87,25 @@ public:
 	 */
 	UPROPERTY(EditAnywhere, Category = "MetaLandRoad|Junction", meta = (DisplayName = "Full World Recook On Draw Finish"))
 	bool bFullWorldJunctionRecookOnDrawFinish = false;
+
+	/**
+	 * If false (default): A only finishes the spline mesh — no junction cook (A cook is heavy).
+	 * Junction cook = Ctrl+press while drawing when XY cross is detected (road hit or terrain under cross).
+	 */
+	UPROPERTY(EditAnywhere, Category = "MetaLandRoad|Junction", meta = (DisplayName = "Cook Junction On A Finish"))
+	bool bCookJunctionOnAFinish = false;
+
+	/**
+	 * Overpass gate for XY centerline cross (cm).
+	 * 0 = always cook junction (ignore height — default; elevated roads still get hubs).
+	 * >0 = skip junction when |Z_a − Z_b| exceeds this (treat as grade separation).
+	 */
+	UPROPERTY(EditAnywhere, Category = "MetaLandRoad|Junction", meta = (DisplayName = "Junction Max Height Delta (cm)", ClampMin = "0.0", ClampMax = "2000.0"))
+	float JunctionMaxHeightDeltaCm = 0.0f;
+
+	/** Draw guidance sample points + L#/R# index labels (off = green rails only). */
+	UPROPERTY(EditAnywhere, Category = "Lane Draw|Debug", meta = (DisplayName = "Debug Guidance Points"))
+	bool bDebugDrawGuidanceRailPoints = false;
 
 };
 
@@ -183,10 +204,15 @@ public:
 	void OnFinishedSplineEdit();
 	/**
 	 * Cook junction + interrupt draw session.
-	 * Trigger: Ctrl+click onto another road/junction while drawing (not A).
+	 * Trigger: Ctrl+press while drawing when current road XY-crosses another (not A).
 	 * A finish = end draw + mesh refresh only (see OnFinishedSplineEdit).
 	 */
 	void CookJunctionForActiveRoad(bool bFinishEditSession = true, bool bForceHubJunctionCook = false);
+	/**
+	 * After Ctrl add-point: if active road centerline XY-crosses another road, cook + end session.
+	 * Needed when raised terrain steals the ray from the crossed road mesh.
+	 */
+	bool TryCookJunctionOnCtrlPressIfCrossed();
 
 	/** Rebuild green dual-rail draw guidance (cursor follow + rubber-band/snap). */
 	void UpdateDrawGuidanceRails();
@@ -204,6 +230,8 @@ public:
 	/** Restore extend / EndSnap hover after Ctrl+Z without breaking mouth snap. */
 	void ResyncLaneExtendSessionAfterUndo();
 	void DrawDrawGuidanceRails(FPrimitiveDrawInterface* PDI) const;
+	/** Screen labels for guidance sample indices (pairs with DrawDrawGuidanceRails). */
+	void DrawDrawGuidanceRailPointHUD(FCanvas* Canvas, const FSceneView* View) const;
 	bool HasDrawGuidanceRails() const;
 	/** True while Ctrl-drawing from a lane mouth (lane-extend session). */
 	bool IsLaneAnchorDrawSession() const { return bLaneAnchorDrawSession; }
@@ -211,17 +239,19 @@ public:
 	{
 		return HasDrawGuidanceRails();
 	}
-	/** Hide all mouth overlay while Ctrl is placing points. */
-	bool ShouldSuppressLanePickOverlay() const { return GetEditState() && bIsDraw; }
+	/** Hide all mouth overlay only while Ctrl is placing points. */
+	bool ShouldSuppressLanePickOverlay() const;
 	/** Hide EditTarget yellow while Ctrl is placing points (EndSnap cyan + hover still draw). */
-	bool ShouldSuppressLanePickEditHover() const { return GetEditState() && bIsDraw; }
-	/** Hide EditTarget yellow mouth bars during whole lane-extend / guidance session. */
-	bool ShouldSuppressEditTargetMouthBar() const
-	{
-		return bLaneAnchorDrawSession || HasDrawGuidanceRails() || (GetEditState() && bIsDraw);
-	}
+	bool ShouldSuppressLanePickEditHover() const;
+	/** Hide EditTarget yellow mouth bars only while actually placing an extend (keep idle mouth + green rails). */
+	bool ShouldSuppressEditTargetMouthBar() const;
 	bool TryGetEndSnapMixHoverOverlay(FMetaLandRoadDrawAnchor& OutAnchor) const;
 	bool TryGetLaneDrawEndSnapOverlay(FMetaLandRoadDrawAnchor& OutAnchor) const;
+	/** Idle Shift on another road: lock target mouth without replacing source EditTarget. */
+	void ApplyIdleEndSnapTarget(const FMetaLandRoadDrawAnchor& Anchor);
+	/** Release hover/locked EndSnap so the cursor can move freely again. */
+	void ClearLaneDrawEndSnap(bool bClearUserLock);
+	bool HasLaneDrawEndSnap() const;
 	UMetaLandRoadEditorMode* GetCachedRoadEditorMode() const { return CachedRoadEditorMode.Get(); }
 	void UpdateGizmoInfo(const TMap<TObjectPtr<AMoKuEditBaseActor>, TArray<FSocketGizmoTransformInfo>>& InGizmoInfos){ UpdateGizmoInfos = InGizmoInfos; }
 	TMap <TObjectPtr<AMoKuEditBaseActor>, TArray<FSocketGizmoTransformInfo>> GetGizmoInfo() { return UpdateGizmoInfos; }
@@ -380,7 +410,7 @@ private:
 	/** MetaRoad EndConnection: hover/commit snap onto another road tip mouth. */
 	FMetaLandRoadDrawAnchor LaneDrawEndSnapAnchor;
 	bool bHasLaneDrawEndSnapAnchor = false;
-	/** Shift+LMB during draw locked the target mouth lane bundle (don't auto-rebuild on hover). */
+	/** Shift+LMB locked the target mouth bundle (1..N, may be narrower than begin). */
 	bool bEndSnapBundleUserLocked = false;
 	FVector EndSnapGhostLeft = FVector::ZeroVector;
 	FVector EndSnapGhostRight = FVector::ZeroVector;
@@ -399,7 +429,7 @@ private:
 		UMetaLandRoadSplineComponent* AnchorSpline,
 		const FInputDeviceRay& PressPos);
 
-	/** Alt+LMB add / Shift+LMB toggle target tip lanes for End Snap mix. */
+	/** Shift+LMB: pick/toggle TARGET tip lanes (count independent of begin). A commits EndConnection. */
 	bool TryHandleEndSnapTargetLaneMixPick(const FInputDeviceRay& PressPos, bool bAddOnly);
 	void FinalizeLaneDrawFromConnection(
 		AMoKuEditSplineActor* SpawnedRoad,
@@ -409,6 +439,8 @@ private:
 	void FinalizeLaneDrawEndConnection(
 		AMoKuEditSplineActor* ActiveRoad,
 		const FMetaLandRoadDrawAnchor& TargetAnchor);
+	/** Idle two-mouth snap: A spawns the Bezier connector and ConnectTo both ends. */
+	bool TryCommitIdleMouthToMouthConnection();
 
 
 	void SetGuidancePlaneFromMouthCenter(const FVector& MouthCenter);

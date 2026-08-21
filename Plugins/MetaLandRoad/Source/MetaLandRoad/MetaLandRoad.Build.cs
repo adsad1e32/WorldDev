@@ -69,6 +69,8 @@ public class MetaLandRoad : ModuleRules
 				"AssetRegistry",
 				"TypedElementFramework",
 				"TypedElementRuntime",
+				"RHI",
+				"Renderer",
 				// ... add private dependencies that you statically link with here ...	
 
 				// "DeveloperSettings",

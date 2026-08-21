@@ -169,6 +169,7 @@ public:
 	 * rebuilds height + weight (roads AND junctions that inherit this base).
 	 */
 	void NotifyLandscapeBrushChanged(bool bShapeOrPositionChanged = true, bool bWeightmapSettingsChanged = true, bool bUserTriggered = false);
+	void InvalidateLandscapeDistanceFieldCache();
 
 	/**
 	 * When true, OnRoadBodyChanged / NotifyLandscapeBrushChanged do not broadcast.

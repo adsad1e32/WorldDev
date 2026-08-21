@@ -1,0 +1,185 @@
+// FROZEN CHECKPOINT — centerline profile before box-region dispatch + junction height.
+// Do not edit. Rollback live shader: copy this file over RoadLandscapeProfile.usf
+// Git: branch checkpoint/road-profile-v2-pre-box  tag road-profile-v2-pre-box
+// Version02 — box sides + falloff-controlled corner rounding + light slope noise.
+// Version01 rollback: copy RoadLandscapeProfile_Version01.usf over RoadLandscapeProfile.usf.
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/Landscape/LandscapeCommon.ush"
+
+struct FRoadProfileSample
+{
+	float4 PosS;
+	float4 RightLR;
+	float4 Falloff;
+	float4 Extra;
+};
+
+Texture2D T_Combined;
+StructuredBuffer<FRoadProfileSample> Samples;
+uint NumSamples;
+int2 RTSize;
+int2 StampSize;
+float4x4 RenderAreaToWorld;
+float LandscapeZScale;
+float LandscapeCmPerQuad;
+float2 RoadBoundsMin;
+float2 RoadBoundsMax;
+
+float Hash21(float2 P)
+{
+	return frac(sin(dot(P, float2(127.1, 311.7))) * 43758.5453);
+}
+
+float ValueNoise(float2 P)
+{
+	float2 Cell = floor(P);
+	float2 F = frac(P);
+	float2 U = F * F * (3.0 - 2.0 * F);
+	float A = Hash21(Cell);
+	float B = Hash21(Cell + float2(1.0, 0.0));
+	float C = Hash21(Cell + float2(0.0, 1.0));
+	float D = Hash21(Cell + float2(1.0, 1.0));
+	return lerp(lerp(A, B, U.x), lerp(C, D, U.x), U.y);
+}
+
+// ±1. Two octaves, long wavelength so 50cm verts do not alias.
+float SlopeNoise(float2 WorldXY)
+{
+	float N = ValueNoise(WorldXY * 0.011);
+	N += 0.45 * ValueNoise(WorldXY * 0.028 + 19.0);
+	return (N / 1.45) * 2.0 - 1.0;
+}
+
+// Box = sharp rectangular iso (图二三方头). Euclidean rect = rounded positive iso
+// (not a full capsule: sides stay straight when EndOut==0).
+// Soft is capped at 0.5 so ends never become a half-pill.
+float HybridSolidDistance(float LatOut, float EndOut, float FalloffCm)
+{
+	float BoxD = max(LatOut, EndOut);
+	float2 Outside = float2(max(LatOut, 0.0), max(EndOut, 0.0));
+	float EucD = length(Outside) + min(max(LatOut, EndOut), 0.0);
+	float Soft = saturate(FalloffCm / 800.0) * 0.5;
+	return lerp(BoxD, EucD, Soft);
+}
+
+float4 EvaluateRoadProfile(uint2 Id)
+{
+	float4 Combined = T_Combined.Load(int3(Id, 0));
+	if (any(Id >= (uint2)RTSize) || any(Id >= (uint2)StampSize))
+	{
+		return Combined;
+	}
+
+	float CombinedH = UnpackHeight(Combined.xy);
+
+	float2 WorldXY = mul(float4(float(Id.x), float(Id.y), 0.0, 1.0), RenderAreaToWorld).xy;
+	if (any(WorldXY < RoadBoundsMin) || any(WorldXY > RoadBoundsMax))
+	{
+		return Combined;
+	}
+
+	float BestSigned = 1e9;
+	float BestT = 0.0;
+	uint BestIndex = 0;
+	bool bHit = false;
+
+	for (uint SampleIndex = 0; SampleIndex + 1 < NumSamples; ++SampleIndex)
+	{
+		FRoadProfileSample SampleA = Samples[SampleIndex];
+		FRoadProfileSample SampleB = Samples[SampleIndex + 1];
+		if (SampleA.Extra.y != SampleB.Extra.y)
+		{
+			continue;
+		}
+
+		float2 PointA = SampleA.PosS.xy;
+		float2 PointB = SampleB.PosS.xy;
+		float2 Segment = PointB - PointA;
+		float SegmentLengthSq = dot(Segment, Segment);
+		if (SegmentLengthSq < 1.0)
+		{
+			continue;
+		}
+
+		float SegLen = sqrt(SegmentLengthSq);
+		float MaxHalf = max(max(SampleA.RightLR.z, SampleA.RightLR.w), max(SampleB.RightLR.z, SampleB.RightLR.w));
+		float MaxOffset = max(max(SampleA.Falloff.x, SampleB.Falloff.x), 0.0);
+		float MaxFade = max(max(SampleA.Falloff.y, SampleB.Falloff.y), 1.0);
+		float Influence = MaxHalf + MaxOffset + MaxFade + LandscapeCmPerQuad * 2.0;
+		float2 Mid = (PointA + PointB) * 0.5;
+		if (distance(WorldXY, Mid) > SegLen * 0.5 + Influence)
+		{
+			continue;
+		}
+
+		float TRaw = dot(WorldXY - PointA, Segment) / SegmentLengthSq;
+		float T = saturate(TRaw);
+		float EndOver = 0.0;
+		if (TRaw < 0.0)
+		{
+			EndOver = -TRaw * SegLen;
+		}
+		else if (TRaw > 1.0)
+		{
+			EndOver = (TRaw - 1.0) * SegLen;
+		}
+
+		float2 Tang = Segment / SegLen;
+		float2 Right = float2(-Tang.y, Tang.x);
+		float2 Closest = PointA + Segment * T;
+		float Lateral = dot(WorldXY - Closest, Right);
+		float HalfWidth = max(
+			(Lateral >= 0.0)
+				? lerp(SampleA.RightLR.w, SampleB.RightLR.w, T)
+				: lerp(SampleA.RightLR.z, SampleB.RightLR.z, T),
+			1.0);
+		float SideOffset = max(lerp(SampleA.Falloff.x, SampleB.Falloff.x, T), 0.0);
+		float SideFalloff = max(lerp(SampleA.Falloff.y, SampleB.Falloff.y, T), 1.0);
+		float SolidHalf = HalfWidth + SideOffset;
+		float LatOut = abs(Lateral) - SolidHalf;
+		float Dist = HybridSolidDistance(LatOut, EndOver, SideFalloff);
+		if (Dist >= BestSigned)
+		{
+			continue;
+		}
+
+		BestSigned = Dist;
+		BestT = T;
+		BestIndex = SampleIndex;
+		bHit = true;
+	}
+
+	if (!bHit)
+	{
+		return Combined;
+	}
+
+	FRoadProfileSample SampleA = Samples[BestIndex];
+	FRoadProfileSample SampleB = Samples[BestIndex + 1];
+	float SideFalloff = max(lerp(SampleA.Falloff.y, SampleB.Falloff.y, BestT), 1.0);
+	float HeightOffset = lerp(SampleA.Falloff.z, SampleB.Falloff.z, BestT);
+	float LayerFactor = saturate(lerp(SampleA.Extra.z, SampleB.Extra.z, BestT));
+	float TargetH = lerp(SampleA.PosS.z, SampleB.PosS.z, BestT) + HeightOffset;
+
+	float DistFromSolid = BestSigned;
+	float Taper = saturate(max(DistFromSolid, 0.0) / SideFalloff);
+	float SmoothT = Taper * Taper * Taper * (Taper * (Taper * 6.0 - 15.0) + 10.0);
+	float Alpha = (1.0 - SmoothT) * LayerFactor;
+	if (Alpha < 0.001)
+	{
+		return Combined;
+	}
+
+	float FinalH = lerp(CombinedH, TargetH, saturate(Alpha));
+	// Mid-slope only: 0 on the road bed and at the landscape. About ±12cm.
+	float SlopeMask = SmoothT * (1.0 - SmoothT) * 4.0;
+	float BumpCm = SlopeNoise(WorldXY) * 12.0 * saturate(SlopeMask);
+	float BumpPacked = (BumpCm / max(LandscapeZScale, 0.0001)) * 128.0;
+	FinalH += BumpPacked * saturate(Alpha);
+	return float4(PackHeight(FinalH), Combined.ba);
+}
+
+void RoadLandscapeProfilePS(float4 SvPosition : SV_POSITION, out float4 OutColor : SV_Target0)
+{
+	OutColor = EvaluateRoadProfile(uint2(SvPosition.xy));
+}

@@ -1,4 +1,5 @@
 #include "MetaLandRoadProfile.h"
+#include "MetaLandRoadLaneAttribute.h"
 #include "MetaLandRoadEditorMode.h"
 #include "MetaLandRoadSplineComponent.h"
 #include "MetaLandRoadLaneVisualization.h"
@@ -196,9 +197,66 @@ namespace MetaLandRoadProfile
 
 		FMetaLandRoadLaneSection BaseSection = BuildLaneSection(RoadProfile);
 		BaseSection.SOffset = 0.0;
+		BaseSection.PinAttribute(FMetaLandRoadAttributeRegistry::TypeLandscape);
 		Sections.Add(BaseSection);
 
 		TargetSpline->UpdateRoadLayout();
+	}
+
+	static double GetSectionLocalLength(const UMetaLandRoadSplineComponent* TargetSpline, int32 SectionIndex)
+	{
+		if (!TargetSpline || !TargetSpline->GetLaneSections().IsValidIndex(SectionIndex))
+		{
+			return 0.0;
+		}
+
+		const TArray<FMetaLandRoadLaneSection>& Sections = TargetSpline->GetLaneSections();
+		const double StartS = Sections[SectionIndex].SOffset;
+		const double EndWorldS = (SectionIndex + 1 < Sections.Num())
+			? Sections[SectionIndex + 1].SOffset
+			: TargetSpline->GetSplineLength();
+		return FMath::Max(EndWorldS - StartS, 0.0);
+	}
+
+	void EnsureLandscapeAttributeOnSections(UMetaLandRoadSplineComponent* TargetSpline)
+	{
+		if (!TargetSpline)
+		{
+			return;
+		}
+
+		TArray<FMetaLandRoadLaneSection>& Sections = TargetSpline->GetLaneSectionsMutable();
+		bool bChanged = false;
+		for (int32 SectionIndex = 0; SectionIndex < Sections.Num(); ++SectionIndex)
+		{
+			FMetaLandRoadLaneSection& Section = Sections[SectionIndex];
+			const int32 PrevKeyCount = Section.FindAttribute(FMetaLandRoadAttributeRegistry::TypeLandscape)
+				? Section.FindAttribute(FMetaLandRoadAttributeRegistry::TypeLandscape)->Keys.Num()
+				: 0;
+			FMetaLandRoadLaneAttribute* Track = Section.PinAttribute(FMetaLandRoadAttributeRegistry::TypeLandscape);
+			if (!Track)
+			{
+				continue;
+			}
+
+			Track->EnsureBeginAndEndKeys(GetSectionLocalLength(TargetSpline, SectionIndex));
+			if (PrevKeyCount == 0)
+			{
+				if (const AMoKuEditSplineActor* Road = Cast<AMoKuEditSplineActor>(TargetSpline->GetOwner()))
+				{
+					Track->ApplyFalloffToAllKeys(Road->RoadHeightmapSettings.FalloffSettings);
+				}
+			}
+			if (Track->Keys.Num() != PrevKeyCount)
+			{
+				bChanged = true;
+			}
+		}
+
+		if (bChanged)
+		{
+			TargetSpline->UpdateRoadLayout();
+		}
 	}
 
 	void EnsureDefaultRoadProfile(UMetaLandRoadSplineComponent* TargetSpline)
@@ -221,6 +279,7 @@ namespace MetaLandRoadProfile
 		}
 
 		EnsureBothFacesOnRoad(TargetSpline);
+		EnsureLandscapeAttributeOnSections(TargetSpline);
 	}
 
 	static void HalveLaneWidth(FMetaLandRoadLane& Lane)

@@ -17,6 +17,7 @@
 #include "MetaLandRoadLaneVisualization.h"
 #include "MetaLandRoadStyle.h"
 #include "MetaLandRoadTypes.h"
+#include "MetaLandRoadLaneAttribute.h"
 #include "WorldLandscapeBlueprintBrush.h"
 #include "EngineUtils.h"
 #include "Landscape.h"
@@ -41,6 +42,9 @@
 #include "LevelEditor.h"
 #include "Framework/Commands/UICommandList.h"
 #include "Components/DynamicMeshComponent.h"
+#include "Interfaces/IPluginManager.h"
+#include "Misc/Paths.h"
+#include "ShaderCore.h"
 #define LOCTEXT_NAMESPACE "MetaLandRoadModule"
 
 //DEFINE_LOG_CATEGORY(LogRoadEditor);
@@ -255,7 +259,47 @@ void FMetaLandRoadModule::TryRegisterComponentVisualizers()
 
 void FMetaLandRoadModule::StartupModule()
 {
+	FString ShaderDir;
+	if (const TSharedPtr<IPlugin> Plugin = IPluginManager::Get().FindPlugin(TEXT("MetaLandRoad")))
+	{
+		ShaderDir = FPaths::Combine(Plugin->GetBaseDir(), TEXT("Shaders"));
+	}
+	else
+	{
+		ShaderDir = FPaths::Combine(FPaths::ProjectPluginsDir(), TEXT("MetaLandRoad/Shaders"));
+	}
+	AddShaderSourceDirectoryMapping(TEXT("/Plugin/MetaLandRoad"), ShaderDir);
+
+	// PostConfigInit is required so FRoadLandscapeProfilePS registers before shader serialization.
+	// Slate / GEditor / visualizers must wait until the engine is up.
+	if (GEngine)
+	{
+		RegisterEditorFeatures();
+	}
+	else if (!EditorFeaturesInitHandle.IsValid())
+	{
+		EditorFeaturesInitHandle = FCoreDelegates::OnPostEngineInit.AddRaw(
+			this,
+			&FMetaLandRoadModule::RegisterEditorFeatures);
+	}
+}
+
+void FMetaLandRoadModule::RegisterEditorFeatures()
+{
+	if (bEditorFeaturesRegistered)
+	{
+		return;
+	}
+	bEditorFeaturesRegistered = true;
+
+	if (EditorFeaturesInitHandle.IsValid())
+	{
+		FCoreDelegates::OnPostEngineInit.Remove(EditorFeaturesInitHandle);
+		EditorFeaturesInitHandle.Reset();
+	}
+
 	FMetaLandRoadStyle::Initialize();
+	FMetaLandRoadAttributeRegistry::RegisterBuiltInTypes();
 	FMetaLandRoadEditorModeCommands::Register();
 	FPropertyEditorModule& PropertyEditorModule = FModuleManager::LoadModuleChecked<FPropertyEditorModule>("PropertyEditor");
 	PropertyEditorModule.RegisterCustomClassLayout(AMoKuEditSplineActor::StaticClass()->GetFName(), FOnGetDetailCustomizationInstance::CreateStatic(&FMoKuSplineConnectAssetMeshDetail::MakeInstance));
@@ -722,6 +766,11 @@ void FMetaLandRoadModule::SetEditorVisMode(EMetaLandRoadEditorVisMode NewMode)
 		}
 	}
 
+	if (NewMode != EMetaLandRoadEditorVisMode::Standard)
+	{
+		SetLandscapeAttributeOverlayVisible(false);
+	}
+
 	EditorVisMode = NewMode;
 	ApplyEditorVisModeSideEffects(IsSectionMode());
 
@@ -742,6 +791,60 @@ void FMetaLandRoadModule::SetEditorVisMode(EMetaLandRoadEditorVisMode NewMode)
 		GEditor->RedrawLevelEditingViewports(true);
 	}
 
+}
+
+void FMetaLandRoadModule::SetLandscapeAttributeSelected(bool bSelected)
+{
+	bLandscapeAttributeSelected = bSelected;
+	if (!bSelected)
+	{
+		SetLandscapeAttributeOverlayVisible(false);
+	}
+	if (GEditor)
+	{
+		GEditor->RedrawLevelEditingViewports(true);
+	}
+}
+
+void FMetaLandRoadModule::EnterLandscapeAttributeOverlay()
+{
+	if (!IsStandardMode())
+	{
+		ExitEditorVisModesForInteractiveTool();
+	}
+	SetLandscapeAttributeSelected(true);
+}
+
+void FMetaLandRoadModule::HideLandscapeAttributeDisplay()
+{
+	SetLandscapeAttributeSelected(false);
+}
+
+void FMetaLandRoadModule::SetLandscapeAttributeOverlayVisible(bool bVisible)
+{
+	bShowLandscapeAttributeOverlay = bVisible;
+	if (!bVisible && RoadComponentVisualizer.IsValid())
+	{
+		RoadComponentVisualizer->ClearLandscapeAttributeKeySelection();
+	}
+	FMoKuEditSplinesComponentVisualizer::UpdateEditorViewportTick();
+	BroadcastLandscapeKeyEditorRefresh();
+	if (GEditor)
+	{
+		GEditor->RedrawLevelEditingViewports(true);
+	}
+}
+
+void FMetaLandRoadModule::BroadcastLandscapeKeyEditorRefresh()
+{
+	LandscapeKeyEditorRefresh.Broadcast();
+}
+
+bool FMetaLandRoadModule::ShouldDrawLandscapeAttributeOverlay() const
+{
+	return bShowLandscapeAttributeOverlay
+		&& IsStandardMode()
+		&& !IsLiveSplineDrawSession();
 }
 
 bool FMetaLandRoadModule::IsInteractiveSplineDrawToolActive() const
@@ -1247,6 +1350,12 @@ void FMetaLandRoadModule::EnterLaneEditMode()
 
 void FMetaLandRoadModule::ShutdownModule()
 {
+	if (EditorFeaturesInitHandle.IsValid())
+	{
+		FCoreDelegates::OnPostEngineInit.Remove(EditorFeaturesInitHandle);
+		EditorFeaturesInitHandle.Reset();
+	}
+
 	if (EditorSelectionChangedHandle.IsValid())
 	{
 		USelection::SelectionChangedEvent.Remove(EditorSelectionChangedHandle);

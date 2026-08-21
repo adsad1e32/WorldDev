@@ -1,7 +1,12 @@
 #include "EditSplineRoadInfo.h"
 #include "MoKuEditSplineActor.h"
+#include "MetaLandRoadLaneAttribute.h"
+#include "MetaLandRoadSplineComponent.h"
 #include "Components/DynamicMeshComponent.h"
 #include "UDynamicMesh.h"
+#include "DynamicMesh/DynamicMesh3.h"
+#include "Misc/ScopeExit.h"
+#include "RenderingThread.h"
 #include "Components/SceneCaptureComponent2D.h"
 #include "FloodComponent2D.h"
 #include "SplineRoadEditorSubsystem.h"
@@ -9,24 +14,963 @@
 #include "Materials/MaterialParameterCollection.h"
 #include "WaterUtils.h"
 #include "Engine/TextureRenderTarget2D.h"
+#include "TextureResource.h"
 #include "Engine/Canvas.h"
 #include "WorldEditorSettings.h"
 #include "Kismet/KismetRenderingLibrary.h"
+#include "CollisionQueryParams.h"
+#include "Engine/World.h"
 #if WITH_EDITOR
 #include "Editor.h"
+#include "Selection.h"
 #include "Subsystems/AssetEditorSubsystem.h"
 #endif
+#include "GlobalShader.h"
+#include "ShaderParameterStruct.h"
+#include "RenderGraphBuilder.h"
+#include "RenderGraphResources.h"
+#include "RenderGraphUtils.h"
+#include "RHICommandList.h"
+#include "RHI.h"
+#include "DataDrivenShaderPlatformInfo.h"
+#include "LandscapeDataAccess.h"
+#include "PixelShaderUtils.h"
 
 #include UE_INLINE_GENERATED_CPP_BY_NAME(EditSplineRoadInfo)
 #define LOCTEXT_NAMESPACE "EditPolyLine"
 
+static int32 FindLaneSectionIndexAtWorldS(const UMetaLandRoadSplineComponent* Spline, double WorldS)
+{
+	int32 BestIndex = 0;
+	const TArray<FMetaLandRoadLaneSection>& Sections = Spline->GetLaneSections();
+	for (int32 SectionIndex = 0; SectionIndex < Sections.Num(); ++SectionIndex)
+	{
+		if (WorldS + KINDA_SMALL_NUMBER >= Sections[SectionIndex].SOffset)
+		{
+			BestIndex = SectionIndex;
+		}
+	}
+	return BestIndex;
+}
+
+static bool EvalRoadLandscapeAtWorldS(
+	const UMetaLandRoadSplineComponent* Spline,
+	double WorldS,
+	FMetaLandRoadLandscapeAttributeValue& OutValue)
+{
+	if (!Spline || Spline->GetLaneSectionsNum() == 0)
+	{
+		return false;
+	}
+
+	const int32 SectionIndex = FindLaneSectionIndexAtWorldS(Spline, WorldS);
+	if (!Spline->GetLaneSection(SectionIndex).EvalLandscapeAt(
+		WorldS - Spline->GetLaneSection(SectionIndex).SOffset,
+		OutValue))
+	{
+		return false;
+	}
+
+	OutValue.MigrateLegacyFields();
+	return true;
+}
+
+static bool SampleRoadLandscapeAttribute(AMoKuEditBaseActor* Actor, FMetaLandRoadLandscapeAttributeValue& OutValue)
+{
+	AMoKuEditSplineActor* Road = Cast<AMoKuEditSplineActor>(Actor);
+	if (!Road)
+	{
+		return false;
+	}
+
+	UMetaLandRoadSplineComponent* Spline = Road->GetSplineComponent();
+	if (!Spline)
+	{
+		return false;
+	}
+
+	return EvalRoadLandscapeAtWorldS(Spline, Spline->GetSplineLength() * 0.5, OutValue);
+}
+
+struct FLandscapeHeightSlice
+{
+	double S0 = 0.0;
+	double S1 = 0.0;
+	FMetaLandRoadLandscapeAttributeValue Value;
+};
+
+static bool GSkipAutoLandscapeKeyApply = false;
+static bool GCaptureClipEnabled = false;
+static double GCaptureClipS0 = 0.0;
+static double GCaptureClipS1 = 0.0;
+static float GCaptureLateralDilateCm = 0.0f;
+static float GCaptureFalloffSkirtCm = 0.0f;
+static float GCaptureTipExtendCm = 0.0f;
+static bool GCaptureFlattenToSplineZ = false;
+static bool GHasLandscapeKeyFalloffOverride = false;
+static FRoadFalloffSettings GLandscapeKeyFalloffOverride;
+
+static void SetLandscapeKeyFalloffOverride(const FMetaLandRoadLandscapeAttributeValue& LandscapeValue)
+{
+	FMetaLandRoadLandscapeAttributeValue Synced = LandscapeValue;
+	Synced.MigrateLegacyFields();
+	Synced.SyncFalloffFromMetaRoadFields();
+	GHasLandscapeKeyFalloffOverride = true;
+	GLandscapeKeyFalloffOverride = Synced.FalloffSettings;
+}
+
+static void ClearLandscapeKeyFalloffOverride()
+{
+	GHasLandscapeKeyFalloffOverride = false;
+}
+
+struct FRoadProfileSampleGPU
+{
+	FVector4f PosS = FVector4f(0.0f, 0.0f, 0.0f, 0.0f);
+	FVector4f RightLR = FVector4f(0.0f, 0.0f, 0.0f, 0.0f);
+	FVector4f Falloff = FVector4f(0.0f, 0.0f, 0.0f, 0.0f);
+	FVector4f Extra = FVector4f(0.0f, 0.0f, 0.0f, 0.0f);
+};
+
+class FRoadLandscapeProfilePS : public FGlobalShader
+{
+public:
+	DECLARE_GLOBAL_SHADER(FRoadLandscapeProfilePS);
+	SHADER_USE_PARAMETER_STRUCT(FRoadLandscapeProfilePS, FGlobalShader);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, T_Combined)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<FRoadProfileSample>, Samples)
+		SHADER_PARAMETER(uint32, NumSamples)
+		SHADER_PARAMETER(FIntPoint, RTSize)
+		SHADER_PARAMETER(FIntPoint, StampSize)
+		SHADER_PARAMETER(FMatrix44f, RenderAreaToWorld)
+		SHADER_PARAMETER(float, LandscapeZScale)
+		SHADER_PARAMETER(float, LandscapeCmPerQuad)
+		SHADER_PARAMETER(FVector2f, RoadBoundsMin)
+		SHADER_PARAMETER(FVector2f, RoadBoundsMax)
+		RENDER_TARGET_BINDING_SLOTS()
+	END_SHADER_PARAMETER_STRUCT()
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+	{
+		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+	}
+};
+
+IMPLEMENT_GLOBAL_SHADER(FRoadLandscapeProfilePS, "/Plugin/MetaLandRoad/Private/RoadLandscapeProfile.usf", "RoadLandscapeProfilePS", SF_Pixel);
+
+static constexpr float GRoadProfileSampleStepCm = 100.0f;
+static constexpr int32 GRoadProfileMaxSamples = 4096;
+
+static FMatrix44f MakeVertexAlignedRenderAreaToWorld(
+	const FTransform& RenderAreaWorldTransform,
+	const FTransform& LandscapeTransform)
+{
+	const FVector Origin = RenderAreaWorldTransform.TransformPosition(FVector::ZeroVector);
+	const FVector AxisX = LandscapeTransform.TransformVector(FVector::ForwardVector);
+	const FVector AxisY = LandscapeTransform.TransformVector(FVector::RightVector);
+	FMatrix WorldFromTexel = FMatrix::Identity;
+	WorldFromTexel.SetAxis(0, AxisX);
+	WorldFromTexel.SetAxis(1, AxisY);
+	WorldFromTexel.SetAxis(2, FVector::UpVector);
+	WorldFromTexel.SetOrigin(Origin);
+	return FMatrix44f(WorldFromTexel);
+}
+
+static bool BuildRoadProfileSamples(
+	AMoKuEditSplineActor* Road,
+	const FTransform& LandscapeTransform,
+	TArray<FRoadProfileSampleGPU>& OutSamples)
+{
+	OutSamples.Reset();
+	if (!Road)
+	{
+		return false;
+	}
+
+	UMetaLandRoadSplineComponent* Spline = Road->GetSplineComponent();
+	if (!Spline)
+	{
+		return false;
+	}
+
+	const float ZScale = FMath::Max(FMath::Abs(static_cast<float>(LandscapeTransform.GetScale3D().Z)), 0.0001f);
+
+	TArray<TPair<double, double>> Spans;
+	Road->GetJunctionMeshGenerationSpans(Spans);
+	if (Spans.Num() == 0)
+	{
+		const double Length = Spline->GetSplineLength();
+		if (Length <= 1.0)
+		{
+			return false;
+		}
+		Spans.Emplace(0.0, Length);
+	}
+
+	const FRoadFalloffSettings& ActorFalloff = Road->RoadHeightmapSettings.FalloffSettings;
+	int32 SpanId = 0;
+	for (const TPair<double, double>& Span : Spans)
+	{
+		const double SpanLength = Span.Value - Span.Key;
+		if (SpanLength <= 1.0)
+		{
+			++SpanId;
+			continue;
+		}
+
+		const int32 Num = FMath::Clamp(FMath::CeilToInt(SpanLength / GRoadProfileSampleStepCm) + 1, 2, GRoadProfileMaxSamples);
+		const double Step = SpanLength / static_cast<double>(Num - 1);
+		for (int32 SampleIndex = 0; SampleIndex < Num && OutSamples.Num() < GRoadProfileMaxSamples; ++SampleIndex)
+		{
+			const double S = Span.Key + Step * static_cast<double>(SampleIndex);
+			FVector Left;
+			FVector Right;
+			FVector Center;
+			if (!Spline->GetRoadEdgePointsAtS(S, Left, Right, Center, ESplineCoordinateSpace::World))
+			{
+				continue;
+			}
+
+			FVector2D Right2D(Right.X - Center.X, Right.Y - Center.Y);
+			if (!Right2D.Normalize())
+			{
+				const float InputKey = Spline->GetInputKeyValueAtDistanceAlongSpline(static_cast<float>(S));
+				const FVector SplineRight = Spline->GetRightVectorAtSplineInputKey(InputKey, ESplineCoordinateSpace::World);
+				Right2D = FVector2D(SplineRight.X, SplineRight.Y);
+				Right2D.Normalize();
+			}
+
+			float SideOffsetCm = FMath::Max(ActorFalloff.EdgeOffset, 0.0f);
+			float SideFalloffCm = FMath::Max(ActorFalloff.FalloffWidth, 1.0f);
+			float HeightOffsetCm = FMath::Clamp(ActorFalloff.ZOffset, -2000.0f, 2000.0f);
+			float LayerFactor = 1.0f;
+			FMetaLandRoadLandscapeAttributeValue LandscapeValue;
+			if (EvalRoadLandscapeAtWorldS(Spline, S, LandscapeValue))
+			{
+				SideOffsetCm = FMath::Max(LandscapeValue.SideOffset, 0.0f);
+				SideFalloffCm = FMath::Max(LandscapeValue.SideFalloff, 0.0f);
+				HeightOffsetCm = FMath::Clamp(LandscapeValue.HeightOffset, -2000.0f, 2000.0f);
+				LayerFactor = FMath::Clamp(LandscapeValue.LayerFactor, 0.0f, 1.0f);
+			}
+			const float LocalZ = static_cast<float>(LandscapeTransform.InverseTransformPosition(Center).Z);
+			const float PackedHeight = static_cast<float>(LandscapeDataAccess::GetTexHeight(LocalZ));
+			const float PackedHeightOffset = (HeightOffsetCm / ZScale) * LANDSCAPE_INV_ZSCALE;
+
+			FRoadProfileSampleGPU Sample;
+			Sample.PosS = FVector4f(
+				static_cast<float>(Center.X),
+				static_cast<float>(Center.Y),
+				PackedHeight,
+				static_cast<float>(S));
+			Sample.RightLR = FVector4f(
+				static_cast<float>(Right2D.X),
+				static_cast<float>(Right2D.Y),
+				static_cast<float>(FMath::Max(FVector::Dist2D(Left, Center), 1.0)),
+				static_cast<float>(FMath::Max(FVector::Dist2D(Right, Center), 1.0)));
+			Sample.Falloff = FVector4f(
+				SideOffsetCm,
+				SideFalloffCm,
+				PackedHeightOffset,
+				0.0f);
+			Sample.Extra = FVector4f(
+				0.0f,
+				static_cast<float>(SpanId),
+				LayerFactor,
+				static_cast<float>(Center.Z));
+			OutSamples.Add(Sample);
+		}
+		++SpanId;
+		if (OutSamples.Num() >= GRoadProfileMaxSamples)
+		{
+			break;
+		}
+	}
+
+	return OutSamples.Num() >= 2;
+}
+
+static const FRoadFalloffSettings& ResolveStampFalloff(const FSplineRoadHeightmapSettings& HeightmapSettings)
+{
+	return GHasLandscapeKeyFalloffOverride ? GLandscapeKeyFalloffOverride : HeightmapSettings.FalloffSettings;
+}
+
+static bool LandscapeFalloffsNearlyEqual(const FRoadFalloffSettings& A, const FRoadFalloffSettings& B)
+{
+	return A.FalloffMode == B.FalloffMode
+		&& FMath::IsNearlyEqual(A.FalloffWidth, B.FalloffWidth, 1.0f)
+		&& FMath::IsNearlyEqual(A.EdgeOffset, B.EdgeOffset, 1.0f)
+		&& FMath::IsNearlyEqual(A.ZOffset, B.ZOffset, 0.5f)
+		&& FMath::IsNearlyEqual(A.FalloffAngle, B.FalloffAngle, 0.5f);
+}
+
+static bool LandscapeTrackFalloffIsUniform(const FMetaLandRoadLaneAttribute& Track)
+{
+	FRoadFalloffSettings First;
+	if (!Track.GetKeyFalloff(0, First))
+	{
+		return true;
+	}
+
+	for (int32 KeyIndex = 1; KeyIndex < Track.Keys.Num(); ++KeyIndex)
+	{
+		FRoadFalloffSettings Other;
+		if (!Track.GetKeyFalloff(KeyIndex, Other) || !LandscapeFalloffsNearlyEqual(First, Other))
+		{
+			return false;
+		}
+	}
+	return true;
+}
+
+static void CollectLandscapeHeightSlices(AMoKuEditSplineActor* Road, TArray<FLandscapeHeightSlice>& OutSlices)
+{
+	OutSlices.Reset();
+	if (!Road)
+	{
+		return;
+	}
+
+	UMetaLandRoadSplineComponent* Spline = Road->GetSplineComponent();
+	if (!Spline)
+	{
+		return;
+	}
+
+	// One stamp per key span — not 128cm clips. Short clips made Offset/Width look
+	// dead (DF of a 1.3m stick) and made actor 3000/3500 rebuilds take minutes.
+	const TArray<FMetaLandRoadLaneSection>& Sections = Spline->GetLaneSections();
+	for (int32 SectionIndex = 0; SectionIndex < Sections.Num(); ++SectionIndex)
+	{
+		const FMetaLandRoadLaneSection& Section = Sections[SectionIndex];
+		const FMetaLandRoadLaneAttribute* Track = Section.FindAttribute(FMetaLandRoadAttributeRegistry::TypeLandscape);
+		if (!Track || Track->Keys.Num() < 2 || LandscapeTrackFalloffIsUniform(*Track))
+		{
+			continue;
+		}
+
+		for (int32 KeyIndex = 0; KeyIndex < Track->Keys.Num() - 1; ++KeyIndex)
+		{
+			const double Local0 = Track->Keys[KeyIndex].SOffset;
+			const double Local1 = Track->Keys[KeyIndex + 1].SOffset;
+			const double Span = Local1 - Local0;
+			if (Span <= 1.0)
+			{
+				continue;
+			}
+
+			FRoadFalloffSettings Falloff0;
+			FRoadFalloffSettings Falloff1;
+			const bool bHaveEnds = Track->GetKeyFalloff(KeyIndex, Falloff0)
+				&& Track->GetKeyFalloff(KeyIndex + 1, Falloff1);
+			const float FalloffDelta = bHaveEnds
+				? (FMath::Abs(Falloff0.FalloffWidth - Falloff1.FalloffWidth)
+					+ FMath::Abs(Falloff0.EdgeOffset - Falloff1.EdgeOffset))
+				: 0.0f;
+			const int32 Num = FMath::Clamp(FMath::CeilToInt(FalloffDelta / 400.0f), 1, 6);
+			for (int32 StepIndex = 0; StepIndex < Num; ++StepIndex)
+			{
+				const double A0 = Local0 + Span * (static_cast<double>(StepIndex) / static_cast<double>(Num));
+				const double A1 = Local0 + Span * (static_cast<double>(StepIndex + 1) / static_cast<double>(Num));
+				FLandscapeHeightSlice Slice;
+				Slice.S0 = Section.SOffset + A0;
+				Slice.S1 = Section.SOffset + A1;
+				if (!Section.EvalLandscapeAt((A0 + A1) * 0.5, Slice.Value))
+				{
+					continue;
+				}
+				Slice.Value.MigrateLegacyFields();
+				OutSlices.Add(Slice);
+			}
+		}
+	}
+}
+
+static float FindSplineInputKeyClosestXY(const USplineComponent* Spline, const FVector& WorldPos)
+{
+	if (!Spline || Spline->GetNumberOfSplinePoints() < 2)
+	{
+		return 0.0f;
+	}
+
+	const float Length = Spline->GetSplineLength();
+	if (Length <= KINDA_SMALL_NUMBER)
+	{
+		return 0.0f;
+	}
+
+	const int32 NumSamples = FMath::Clamp(FMath::CeilToInt(Length / 50.0f), 16, 256);
+	float BestKey = 0.0f;
+	double BestDistSq = TNumericLimits<double>::Max();
+	for (int32 SampleIndex = 0; SampleIndex <= NumSamples; ++SampleIndex)
+	{
+		const float Distance = Length * (static_cast<float>(SampleIndex) / static_cast<float>(NumSamples));
+		const float Key = Spline->GetInputKeyValueAtDistanceAlongSpline(Distance);
+		const FVector Sample = Spline->GetLocationAtDistanceAlongSpline(Distance, ESplineCoordinateSpace::World);
+		const double DistSq = FVector::DistSquared2D(Sample, WorldPos);
+		if (DistSq < BestDistSq)
+		{
+			BestDistSq = DistSq;
+			BestKey = Key;
+		}
+	}
+
+	const float RefineSpan = Length / static_cast<float>(NumSamples);
+	const float BestDistance = Spline->GetDistanceAlongSplineAtSplineInputKey(BestKey);
+	for (int32 RefineIndex = -4; RefineIndex <= 4; ++RefineIndex)
+	{
+		const float Distance = FMath::Clamp(BestDistance + RefineSpan * 0.25f * RefineIndex, 0.0f, Length);
+		const float Key = Spline->GetInputKeyValueAtDistanceAlongSpline(Distance);
+		const FVector Sample = Spline->GetLocationAtDistanceAlongSpline(Distance, ESplineCoordinateSpace::World);
+		const double DistSq = FVector::DistSquared2D(Sample, WorldPos);
+		if (DistSq < BestDistSq)
+		{
+			BestDistSq = DistSq;
+			BestKey = Key;
+		}
+	}
+	return BestKey;
+}
+
+static bool ClipCaptureMeshToSRange(
+	UDynamicMeshComponent* MeshComp,
+	UMetaLandRoadSplineComponent* Spline,
+	double S0,
+	double S1,
+	TArray<FVector3d>& OutSavedLocal)
+{
+	if (!MeshComp || !Spline || S1 <= S0)
+	{
+		return false;
+	}
+
+	UDynamicMesh* DynMesh = MeshComp->GetDynamicMesh();
+	if (!DynMesh || DynMesh->GetTriangleCount() <= 0)
+	{
+		return false;
+	}
+
+	const FTransform CompToWorld = MeshComp->GetComponentTransform();
+	int32 Moved = 0;
+
+	DynMesh->EditMesh(
+		[&](FDynamicMesh3& Mesh)
+		{
+			OutSavedLocal.SetNum(Mesh.MaxVertexID());
+			for (int32 Vid : Mesh.VertexIndicesItr())
+			{
+				const FVector3d Local = Mesh.GetVertex(Vid);
+				OutSavedLocal[Vid] = Local;
+
+				const FVector World = CompToWorld.TransformPosition(FVector(Local));
+				const float InputKey = FindSplineInputKeyClosestXY(Spline, World);
+				const double WorldS = Spline->GetDistanceAlongSplineAtSplineInputKey(InputKey);
+				if (WorldS >= S0 && WorldS <= S1)
+				{
+					continue;
+				}
+
+				const double ClampedS = FMath::Clamp(WorldS, S0, S1);
+				const FVector OldClosest = Spline->GetLocationAtDistanceAlongSpline(WorldS, ESplineCoordinateSpace::World);
+				const FVector NewClosest = Spline->GetLocationAtDistanceAlongSpline(ClampedS, ESplineCoordinateSpace::World);
+				const FVector NewWorld = NewClosest + (World - OldClosest);
+				Mesh.SetVertex(Vid, FVector3d(CompToWorld.InverseTransformPosition(NewWorld)));
+				++Moved;
+			}
+		},
+		EDynamicMeshChangeType::DeformationEdit,
+		EDynamicMeshAttributeChangeFlags::Unknown,
+		true);
+
+	if (Moved > 0)
+	{
+		MeshComp->NotifyMeshUpdated();
+		FlushRenderingCommands();
+	}
+	return Moved > 0;
+}
+
+static bool DilateCaptureMeshLateral(
+	UDynamicMeshComponent* MeshComp,
+	UMetaLandRoadSplineComponent* Spline,
+	float DilateCm)
+{
+	if (!MeshComp || !Spline || FMath::Abs(DilateCm) < 0.5f)
+	{
+		return false;
+	}
+
+	UDynamicMesh* DynMesh = MeshComp->GetDynamicMesh();
+	if (!DynMesh || DynMesh->GetTriangleCount() <= 0)
+	{
+		return false;
+	}
+
+	const FTransform CompToWorld = MeshComp->GetComponentTransform();
+	int32 Moved = 0;
+
+	DynMesh->EditMesh(
+		[&](FDynamicMesh3& Mesh)
+		{
+			for (int32 Vid : Mesh.VertexIndicesItr())
+			{
+				const FVector3d Local = Mesh.GetVertex(Vid);
+				const FVector World = CompToWorld.TransformPosition(FVector(Local));
+				const float InputKey = Spline->FindInputKeyClosestToWorldLocation(World);
+				const double WorldS = Spline->GetDistanceAlongSplineAtSplineInputKey(InputKey);
+				const FVector Center = Spline->GetLocationAtDistanceAlongSpline(WorldS, ESplineCoordinateSpace::World);
+				FVector Right = Spline->GetRightVectorAtDistanceAlongSpline(WorldS, ESplineCoordinateSpace::World);
+				Right.Z = 0.0f;
+				if (!Right.Normalize())
+				{
+					continue;
+				}
+
+				const float Side = static_cast<float>(FVector::DotProduct(World - Center, Right));
+				if (FMath::Abs(Side) < 1.0f)
+				{
+					continue;
+				}
+
+				float ApplyCm = DilateCm;
+				if (ApplyCm < 0.0f)
+				{
+					ApplyCm = FMath::Max(ApplyCm, -(FMath::Abs(Side) - 1.0f));
+					if (ApplyCm >= -0.5f)
+					{
+						continue;
+					}
+				}
+
+				const FVector NewWorld = World + Right * FMath::Sign(Side) * ApplyCm;
+				Mesh.SetVertex(Vid, FVector3d(CompToWorld.InverseTransformPosition(NewWorld)));
+				++Moved;
+			}
+		},
+		EDynamicMeshChangeType::DeformationEdit,
+		EDynamicMeshAttributeChangeFlags::Unknown,
+		true);
+
+	if (Moved > 0)
+	{
+		MeshComp->NotifyMeshUpdated();
+		FlushRenderingCommands();
+	}
+	return Moved > 0;
+}
+
+static bool FlattenCaptureMeshToSplineZ(
+	UDynamicMeshComponent* MeshComp,
+	UMetaLandRoadSplineComponent* Spline)
+{
+	if (!MeshComp || !Spline)
+	{
+		return false;
+	}
+
+	UDynamicMesh* DynMesh = MeshComp->GetDynamicMesh();
+	if (!DynMesh || DynMesh->GetTriangleCount() <= 0)
+	{
+		return false;
+	}
+
+	const FTransform CompToWorld = MeshComp->GetComponentTransform();
+	int32 Moved = 0;
+
+	DynMesh->EditMesh(
+		[&](FDynamicMesh3& Mesh)
+		{
+			for (int32 Vid : Mesh.VertexIndicesItr())
+			{
+				const FVector World = CompToWorld.TransformPosition(FVector(Mesh.GetVertex(Vid)));
+				const float InputKey = FindSplineInputKeyClosestXY(Spline, World);
+				const double WorldS = Spline->GetDistanceAlongSplineAtSplineInputKey(InputKey);
+				const FVector Center = Spline->GetLocationAtDistanceAlongSpline(WorldS, ESplineCoordinateSpace::World);
+				const float RelZ = World.Z - Center.Z;
+				const float TargetZ = (RelZ < -8.0f) ? (Center.Z - 4.0f) : Center.Z;
+				if (FMath::Abs(World.Z - TargetZ) < 0.5f)
+				{
+					continue;
+				}
+
+				FVector NewWorld = World;
+				NewWorld.Z = TargetZ;
+				Mesh.SetVertex(Vid, FVector3d(CompToWorld.InverseTransformPosition(NewWorld)));
+				++Moved;
+			}
+		},
+		EDynamicMeshChangeType::DeformationEdit,
+		EDynamicMeshAttributeChangeFlags::Unknown,
+		true);
+
+	if (Moved > 0)
+	{
+		MeshComp->NotifyMeshUpdated();
+		FlushRenderingCommands();
+	}
+	return Moved > 0;
+}
+
+static float SampleFalloffGroundZ(UWorld* World, AActor* IgnoreActor, const FVector& WorldXY, float FallbackZ);
+
+static bool AppendCaptureFalloffSkirt(
+	UDynamicMeshComponent* MeshComp,
+	UMetaLandRoadSplineComponent* Spline,
+	AActor* IgnoreActor,
+	float FalloffCm)
+{
+	if (!MeshComp || !Spline || FalloffCm < 1.0f)
+	{
+		return false;
+	}
+
+	UDynamicMesh* DynMesh = MeshComp->GetDynamicMesh();
+	if (!DynMesh || DynMesh->GetTriangleCount() <= 0)
+	{
+		return false;
+	}
+
+	UWorld* World = MeshComp->GetWorld();
+	const FTransform CompToWorld = MeshComp->GetComponentTransform();
+	int32 Added = 0;
+
+	DynMesh->EditMesh(
+		[&](FDynamicMesh3& Mesh)
+		{
+			TArray<float> Sides;
+			Sides.SetNum(Mesh.MaxVertexID());
+			float MaxAbsSide = 0.0f;
+			for (int32 Vid : Mesh.VertexIndicesItr())
+			{
+				const FVector WorldPos = CompToWorld.TransformPosition(FVector(Mesh.GetVertex(Vid)));
+				const float InputKey = Spline->FindInputKeyClosestToWorldLocation(WorldPos);
+				const double WorldS = Spline->GetDistanceAlongSplineAtSplineInputKey(InputKey);
+				const FVector Center = Spline->GetLocationAtDistanceAlongSpline(WorldS, ESplineCoordinateSpace::World);
+				FVector Right = Spline->GetRightVectorAtDistanceAlongSpline(WorldS, ESplineCoordinateSpace::World);
+				Right.Z = 0.0f;
+				Right.Normalize();
+				const float Side = Right.IsNearlyZero()
+					? 0.0f
+					: static_cast<float>(FVector::DotProduct(WorldPos - Center, Right));
+				Sides[Vid] = Side;
+				MaxAbsSide = FMath::Max(MaxAbsSide, FMath::Abs(Side));
+			}
+
+			if (MaxAbsSide < 2.0f)
+			{
+				return;
+			}
+
+			const float OuterThresh = MaxAbsSide * 0.88f;
+			TMap<int32, int32> OuterToSkirt;
+			for (int32 Vid : Mesh.VertexIndicesItr())
+			{
+				const float Side = Sides.IsValidIndex(Vid) ? Sides[Vid] : 0.0f;
+				if (FMath::Abs(Side) < OuterThresh)
+				{
+					continue;
+				}
+
+				const FVector WorldPos = CompToWorld.TransformPosition(FVector(Mesh.GetVertex(Vid)));
+				const float InputKey = Spline->FindInputKeyClosestToWorldLocation(WorldPos);
+				const double WorldS = Spline->GetDistanceAlongSplineAtSplineInputKey(InputKey);
+				const FVector Center = Spline->GetLocationAtDistanceAlongSpline(WorldS, ESplineCoordinateSpace::World);
+				FVector Right = Spline->GetRightVectorAtDistanceAlongSpline(WorldS, ESplineCoordinateSpace::World);
+				Right.Z = 0.0f;
+				if (!Right.Normalize())
+				{
+					continue;
+				}
+
+				FVector NewWorld = Center + Right * (FMath::Sign(Side) * (FMath::Abs(Side) + FalloffCm));
+				// Probe past the old carve so 500 vs 1000 both drop to the same ground Z.
+				const FVector Probe = Center + Right * (FMath::Sign(Side) * (FMath::Abs(Side) + FalloffCm + 3000.0f));
+				NewWorld.Z = SampleFalloffGroundZ(World, IgnoreActor, Probe, Center.Z);
+				const int32 NewVid = Mesh.AppendVertex(FVector3d(CompToWorld.InverseTransformPosition(NewWorld)));
+				OuterToSkirt.Add(Vid, NewVid);
+				++Added;
+			}
+
+			for (const int32 Eid : Mesh.EdgeIndicesItr())
+			{
+				if (!Mesh.IsBoundaryEdge(Eid))
+				{
+					continue;
+				}
+				const UE::Geometry::FIndex2i EdgeV = Mesh.GetEdgeV(Eid);
+				const int32* SkirtA = OuterToSkirt.Find(EdgeV.A);
+				const int32* SkirtB = OuterToSkirt.Find(EdgeV.B);
+				if (!SkirtA || !SkirtB)
+				{
+					continue;
+				}
+
+				const FVector3d PA = Mesh.GetVertex(EdgeV.A);
+				const FVector3d PB = Mesh.GetVertex(EdgeV.B);
+				const FVector3d PC = Mesh.GetVertex(*SkirtB);
+				const FVector3d Cross = (PB - PA).Cross(PC - PA);
+				if (Cross.Z >= 0.0)
+				{
+					Mesh.AppendTriangle(EdgeV.A, EdgeV.B, *SkirtB);
+					Mesh.AppendTriangle(EdgeV.A, *SkirtB, *SkirtA);
+				}
+				else
+				{
+					Mesh.AppendTriangle(EdgeV.A, *SkirtB, EdgeV.B);
+					Mesh.AppendTriangle(EdgeV.A, *SkirtA, *SkirtB);
+				}
+			}
+		},
+		EDynamicMeshChangeType::GeneralEdit,
+		EDynamicMeshAttributeChangeFlags::Unknown,
+		true);
+
+	if (Added > 0)
+	{
+		MeshComp->NotifyMeshUpdated();
+		FlushRenderingCommands();
+	}
+	return Added > 0;
+}
+
+static float SampleFalloffGroundZ(UWorld* World, AActor* IgnoreActor, const FVector& WorldXY, float FallbackZ)
+{
+	if (!World)
+	{
+		return FallbackZ;
+	}
+
+	FCollisionQueryParams Params(NAME_None, false, IgnoreActor);
+	FHitResult Hit;
+	const FVector Start(WorldXY.X, WorldXY.Y, WorldXY.Z + 8000.0f);
+	const FVector End(WorldXY.X, WorldXY.Y, WorldXY.Z - 20000.0f);
+	if (World->LineTraceSingleByChannel(Hit, Start, End, ECC_Visibility, Params))
+	{
+		return Hit.Location.Z;
+	}
+	if (World->LineTraceSingleByChannel(Hit, Start, End, ECC_WorldStatic, Params))
+	{
+		return Hit.Location.Z;
+	}
+	return FallbackZ;
+}
+
+static bool SlopeCaptureMeshFalloff(
+	UDynamicMeshComponent* MeshComp,
+	UMetaLandRoadSplineComponent* Spline,
+	AActor* IgnoreActor,
+	float FalloffCm)
+{
+	if (!MeshComp || !Spline || FalloffCm < 1.0f)
+	{
+		return false;
+	}
+
+	UDynamicMesh* DynMesh = MeshComp->GetDynamicMesh();
+	if (!DynMesh || DynMesh->GetTriangleCount() <= 0)
+	{
+		return false;
+	}
+
+	UWorld* World = MeshComp->GetWorld();
+	const FTransform CompToWorld = MeshComp->GetComponentTransform();
+	int32 Moved = 0;
+
+	DynMesh->EditMesh(
+		[&](FDynamicMesh3& Mesh)
+		{
+			TArray<float> Sides;
+			Sides.SetNum(Mesh.MaxVertexID());
+			float MaxAbsSide = 0.0f;
+			for (int32 Vid : Mesh.VertexIndicesItr())
+			{
+				const FVector WorldPos = CompToWorld.TransformPosition(FVector(Mesh.GetVertex(Vid)));
+				const float InputKey = Spline->FindInputKeyClosestToWorldLocation(WorldPos);
+				const double WorldS = Spline->GetDistanceAlongSplineAtSplineInputKey(InputKey);
+				const FVector Center = Spline->GetLocationAtDistanceAlongSpline(WorldS, ESplineCoordinateSpace::World);
+				FVector Right = Spline->GetRightVectorAtDistanceAlongSpline(WorldS, ESplineCoordinateSpace::World);
+				Right.Z = 0.0f;
+				Right.Normalize();
+				const float Side = Right.IsNearlyZero()
+					? 0.0f
+					: static_cast<float>(FVector::DotProduct(WorldPos - Center, Right));
+				Sides[Vid] = Side;
+				MaxAbsSide = FMath::Max(MaxAbsSide, FMath::Abs(Side));
+			}
+
+			if (MaxAbsSide < 2.0f)
+			{
+				return;
+			}
+
+			const float OuterThresh = MaxAbsSide * 0.88f;
+			for (int32 Vid : Mesh.VertexIndicesItr())
+			{
+				const float Side = Sides.IsValidIndex(Vid) ? Sides[Vid] : 0.0f;
+				if (FMath::Abs(Side) < OuterThresh)
+				{
+					continue;
+				}
+
+				const FVector WorldPos = CompToWorld.TransformPosition(FVector(Mesh.GetVertex(Vid)));
+				const float InputKey = Spline->FindInputKeyClosestToWorldLocation(WorldPos);
+				const double WorldS = Spline->GetDistanceAlongSplineAtSplineInputKey(InputKey);
+				const FVector Center = Spline->GetLocationAtDistanceAlongSpline(WorldS, ESplineCoordinateSpace::World);
+				FVector Right = Spline->GetRightVectorAtDistanceAlongSpline(WorldS, ESplineCoordinateSpace::World);
+				Right.Z = 0.0f;
+				if (!Right.Normalize())
+				{
+					continue;
+				}
+
+				const FVector NewXY = Center + Right * (FMath::Sign(Side) * (FMath::Abs(Side) + FalloffCm));
+				FVector NewWorld = WorldPos;
+				NewWorld.X = NewXY.X;
+				NewWorld.Y = NewXY.Y;
+				NewWorld.Z = SampleFalloffGroundZ(World, IgnoreActor, NewWorld, Center.Z);
+				Mesh.SetVertex(Vid, FVector3d(CompToWorld.InverseTransformPosition(NewWorld)));
+				++Moved;
+			}
+		},
+		EDynamicMeshChangeType::DeformationEdit,
+		EDynamicMeshAttributeChangeFlags::Unknown,
+		true);
+
+	if (Moved > 0)
+	{
+		MeshComp->NotifyMeshUpdated();
+		FlushRenderingCommands();
+	}
+	return Moved > 0;
+}
+
+static bool ExtendCaptureMeshTips(
+	UDynamicMeshComponent* MeshComp,
+	UMetaLandRoadSplineComponent* Spline,
+	float ExtendCm)
+{
+	if (!MeshComp || !Spline || ExtendCm < 1.0f)
+	{
+		return false;
+	}
+
+	UDynamicMesh* DynMesh = MeshComp->GetDynamicMesh();
+	if (!DynMesh || DynMesh->GetTriangleCount() <= 0)
+	{
+		return false;
+	}
+
+	const float SplineLen = Spline->GetSplineLength();
+	if (SplineLen <= ExtendCm * 2.0f)
+	{
+		return false;
+	}
+
+	const FTransform CompToWorld = MeshComp->GetComponentTransform();
+	int32 Moved = 0;
+
+	DynMesh->EditMesh(
+		[&](FDynamicMesh3& Mesh)
+		{
+			for (int32 Vid : Mesh.VertexIndicesItr())
+			{
+				const FVector3d Local = Mesh.GetVertex(Vid);
+				const FVector World = CompToWorld.TransformPosition(FVector(Local));
+				const float InputKey = Spline->FindInputKeyClosestToWorldLocation(World);
+				const double WorldS = Spline->GetDistanceAlongSplineAtSplineInputKey(InputKey);
+				FVector Tangent = Spline->GetTangentAtDistanceAlongSpline(
+					static_cast<float>(WorldS), ESplineCoordinateSpace::World);
+				if (!Tangent.Normalize())
+				{
+					continue;
+				}
+
+				FVector NewWorld = World;
+				if (WorldS <= ExtendCm)
+				{
+					NewWorld -= Tangent * ExtendCm;
+				}
+				else if (WorldS >= SplineLen - ExtendCm)
+				{
+					NewWorld += Tangent * ExtendCm;
+				}
+				else
+				{
+					continue;
+				}
+
+				Mesh.SetVertex(Vid, FVector3d(CompToWorld.InverseTransformPosition(NewWorld)));
+				++Moved;
+			}
+		},
+		EDynamicMeshChangeType::DeformationEdit,
+		EDynamicMeshAttributeChangeFlags::Unknown,
+		true);
+
+	if (Moved > 0)
+	{
+		MeshComp->NotifyMeshUpdated();
+		FlushRenderingCommands();
+	}
+	return Moved > 0;
+}
+
+static void RestoreCaptureMeshVerts(UDynamicMeshComponent* MeshComp, const TArray<FVector3d>& SavedLocal)
+{
+	if (!MeshComp || SavedLocal.Num() == 0)
+	{
+		return;
+	}
+
+	UDynamicMesh* DynMesh = MeshComp->GetDynamicMesh();
+	if (!DynMesh)
+	{
+		return;
+	}
+
+	DynMesh->EditMesh(
+		[&](FDynamicMesh3& Mesh)
+		{
+			for (int32 Vid : Mesh.VertexIndicesItr())
+			{
+				if (SavedLocal.IsValidIndex(Vid))
+				{
+					Mesh.SetVertex(Vid, SavedLocal[Vid]);
+				}
+			}
+		},
+		EDynamicMeshChangeType::DeformationEdit,
+		EDynamicMeshAttributeChangeFlags::Unknown,
+		true);
+	MeshComp->NotifyMeshUpdated();
+}
+
+static bool ApplyRoadLandscapeKeysToBrushSettings(AMoKuEditBaseActor* Actor)
+{
+	if (GSkipAutoLandscapeKeyApply)
+	{
+		return false;
+	}
+
+	FMetaLandRoadLandscapeAttributeValue LandscapeValue;
+	if (!SampleRoadLandscapeAttribute(Actor, LandscapeValue))
+	{
+		return false;
+	}
+
+	SetLandscapeKeyFalloffOverride(LandscapeValue);
+	return true;
+}
+
 namespace MetaLandRoadBrushMaterials
 {
-	// Local copies (duplicate from Water/Landmass via CopyBrushMaterialsToMetaLandRoad.py).
+	// Height falloff stays on official Water MeshBrush. LandmassBrush_Width is not a
+	// drop-in: different height packing / landscape UV sampling, and it rewrote the
+	// entire WorldEditor layer (spikes / flattened void). Offset+Width semantics
+	// cannot be fixed by swapping that material into this pipeline.
 	static const TCHAR* BrushAngleLocal = TEXT("/MetaLandRoad/Material/Landscape/Brush/MeshBrush_Angle.MeshBrush_Angle");
 	static const TCHAR* BrushWidthLocal = TEXT("/MetaLandRoad/Material/Landscape/Brush/MeshBrush_Width.MeshBrush_Width");
-	// Local forks still embed /TestMode/ → Landscape stuck on "Waiting for edit layer resources".
-	// Always prefer official Water MeshBrush; CapShapeInterior is set from C++ either way.
 	static const TCHAR* BrushWeightmapLocal = TEXT("/MetaLandRoad/Material/Landscape/Brush/MeshBrush_Weightmap.MeshBrush_Weightmap");
 	static const TCHAR* CacheDistanceFieldLocal = TEXT("/MetaLandRoad/Material/Landscape/CacheDistanceField.CacheDistanceField");
 	static const TCHAR* CompositeBodyLocal = TEXT("/MetaLandRoad/Material/Landscape/Brush/CompositeMeshBodyTexture.CompositeMeshBodyTexture");
@@ -36,7 +980,6 @@ namespace MetaLandRoadBrushMaterials
 	static const TCHAR* FindEdgesLocal = TEXT("/MetaLandRoad/Material/Landscape/DistanceFields/DetectEdges.DetectEdges");
 	static const TCHAR* MPCLocal = TEXT("/MetaLandRoad/Landscape/BlueprintBrushes/MPC/MPC_Landscape.MPC_Landscape");
 
-	// Official fallbacks until local copies exist.
 	static const TCHAR* BrushAngleOfficial = TEXT("/Water/Materials/Brushes/MeshBrush_Angle.MeshBrush_Angle");
 	static const TCHAR* BrushWidthOfficial = TEXT("/Water/Materials/Brushes/MeshBrush_Width.MeshBrush_Width");
 	static const TCHAR* BrushWeightmapOfficial = TEXT("/Water/Materials/Brushes/MeshBrush_Weightmap.MeshBrush_Weightmap");
@@ -288,23 +1231,11 @@ bool AWorldSceneManagement::AllocateRTs()
 		bSuccess = false;
 	}
 
-	// Water always binds CurveRT; keep a linear 0→1 ramp so MeshBrush / CacheDistanceField never sample null.
+	// Solid 1.0 — a 0→1 ramp here faded weight/height from spline head to tail.
 	DefaultCurveRT = FWaterUtils::GetOrCreateTransientRenderTarget2D(DefaultCurveRT, TEXT("RoadDefaultCurveRT"), FIntPoint(256, 1), RTF_R16f);
 	if (DefaultCurveRT != nullptr)
 	{
-		UCanvas* Canvas = nullptr;
-		FVector2D CanvasSize;
-		FDrawToRenderTargetContext Context;
-		UKismetRenderingLibrary::BeginDrawCanvasToRenderTarget(this, DefaultCurveRT, Canvas, CanvasSize, Context);
-		if (Canvas)
-		{
-			for (int32 i = 0; i < 256; ++i)
-			{
-				const float V = static_cast<float>(i) / 255.0f;
-				Canvas->K2_DrawBox(FVector2D(static_cast<float>(i), 0.0f), FVector2D(1.0f, 2.0f), 1.0f, FLinearColor(V, V, V));
-			}
-		}
-		UKismetRenderingLibrary::EndDrawCanvasToRenderTarget(this, Context);
+		UKismetRenderingLibrary::ClearRenderTarget2D(this, DefaultCurveRT, FLinearColor::White);
 	}
 	else
 	{
@@ -355,9 +1286,79 @@ void AWorldSceneManagement::DebugForceAllocateRenderTargets()
 	LogRT(TEXT("CombinedShapeAndHeightRTB"), CombinedShapeAndHeightRTB);
 	LogRT(TEXT("WeightmapRTA"), WeightmapRTA);
 	LogRT(TEXT("WeightmapRTB"), WeightmapRTB);
+	LogRT(TEXT("CSCombinedWriteRT"), CSCombinedWriteRT);
+	LogRT(TEXT("CSCombinedWriteRTB"), CSCombinedWriteRTB);
 
 	// Log-only preview: opening Transient RTs in AssetEditor during Live Coding is unsafe.
 	UE_LOG(LogTemp, Log, TEXT("[RoadLandscape] RT slots may still show None in Details (Transient). Use Log sizes above; content fills after WorldEditor paint."));
+}
+
+void AWorldSceneManagement::DebugOpenHeightFalloffRT()
+{
+	if (!IsValid(this)
+		|| HasAnyFlags(RF_ClassDefaultObject | RF_ArchetypeObject | RF_BeginDestroyed)
+		|| IsTemplate())
+	{
+		return;
+	}
+
+	AllocateRTs();
+	UTextureRenderTarget2D* SolidRT = RoadDepthRT;
+	UTextureRenderTarget2D* BlendRT = CombinedShapeAndHeightRTA ? CombinedShapeAndHeightRTA : HeightmapRTA;
+	UTextureRenderTarget2D* ProfileRT = CSCombinedWriteRT ? CSCombinedWriteRT : CSCombinedWriteRTB;
+	UE_LOG(LogTemp, Warning, TEXT("[RoadLandscape] Debug RTs on '%s':"), *GetActorLabel());
+	UE_LOG(LogTemp, Warning, TEXT("  SOLID (Edge Offset)    = RoadDepthRT / %s"),
+		SolidRT ? *SolidRT->GetName() : TEXT("None — refresh landscape first"));
+	UE_LOG(LogTemp, Warning, TEXT("  BLEND (Falloff Width)  = CombinedShapeAndHeightRTA / %s"),
+		BlendRT ? *BlendRT->GetName() : TEXT("None — refresh landscape first"));
+	UE_LOG(LogTemp, Warning, TEXT("  PROFILE (height CS)    = %s"),
+		ProfileRT ? *ProfileRT->GetPathName() : TEXT("None — drag a road first"));
+	UE_LOG(LogTemp, Warning, TEXT("  Details path: World Outliner → %s → Render Targets"), *GetActorLabel());
+
+	if (GEditor)
+	{
+		if (UAssetEditorSubsystem* AssetEditors = GEditor->GetEditorSubsystem<UAssetEditorSubsystem>())
+		{
+			if (ProfileRT)
+			{
+				AssetEditors->OpenEditorForAsset(ProfileRT);
+			}
+			if (BlendRT)
+			{
+				AssetEditors->OpenEditorForAsset(BlendRT);
+			}
+			if (SolidRT)
+			{
+				AssetEditors->OpenEditorForAsset(SolidRT);
+			}
+		}
+	}
+}
+
+void AWorldSceneManagement::DebugDumpProfileRT()
+{
+	if (!IsValid(this)
+		|| HasAnyFlags(RF_ClassDefaultObject | RF_ArchetypeObject | RF_BeginDestroyed)
+		|| IsTemplate())
+	{
+		return;
+	}
+
+	UTextureRenderTarget2D* ProfileRT = CSCombinedWriteRT ? CSCombinedWriteRT : CSCombinedWriteRTB;
+	if (!ProfileRT)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[RoadLandscape] DebugDumpProfileRT: no profile RT yet. Drag a road, then click again."));
+		return;
+	}
+	UE_LOG(LogTemp, Warning, TEXT("[RoadLandscape] Live profile RT = %s  (%dx%d)"),
+		*ProfileRT->GetPathName(), ProfileRT->SizeX, ProfileRT->SizeY);
+	if (GEditor)
+	{
+		if (UAssetEditorSubsystem* AssetEditors = GEditor->GetEditorSubsystem<UAssetEditorSubsystem>())
+		{
+			AssetEditors->OpenEditorForAsset(ProfileRT);
+		}
+	}
 }
 #endif
 
@@ -726,6 +1727,141 @@ void AWorldSceneManagement::OctreeRemoveRoad(AMoKuEditSplineActor* InElement)
 	//}
 
 }
+
+static FBox ComputeRoadHeightInfluenceBounds(AMoKuEditBaseActor* Actor)
+{
+	if (!Actor)
+	{
+		return FBox(ForceInit);
+	}
+
+	FBox Box = Actor->GetComponentsBoundingBox(/*bNonColliding=*/true, /*bIncludeFromChildActors=*/false);
+	if (!Box.IsValid)
+	{
+		return Box;
+	}
+
+	float PadCm = 8000.0f;
+	if (AMoKuEditSplineActor* Road = Cast<AMoKuEditSplineActor>(Actor))
+	{
+		FMetaLandRoadLandscapeAttributeValue LandscapeValue;
+		if (SampleRoadLandscapeAttribute(Road, LandscapeValue))
+		{
+			PadCm = FMath::Max(
+				FMath::Max(LandscapeValue.SideOffset, 0.0f) + FMath::Max(LandscapeValue.SideFalloff, 0.0f),
+				PadCm);
+		}
+		const float HeightSpanCm = FMath::Max(static_cast<float>(Box.GetExtent().Z) * 2.0f, 0.0f);
+		PadCm = FMath::Max(PadCm, HeightSpanCm / 0.268f);
+		PadCm += 400.0f;
+	}
+	return Box.ExpandBy(FVector(PadCm, PadCm, 0.0f));
+}
+
+AActor* AWorldSceneManagement::ResolveHeightStampFocusActor() const
+{
+	if (bForceFullHeightStamp)
+	{
+		return nullptr;
+	}
+	return GetLandscapeStampFocusActor();
+}
+
+void AWorldSceneManagement::CollectHeightStampRoads(TArray<AMoKuEditBaseActor*>& InOutRoads) const
+{
+	// Keep every road. Focus filtering left neighbors unstamped and carved cliffs
+	// into Combined. Pixels outside a road's padded AABB early-out in the shader.
+	(void)InOutRoads;
+}
+
+void AWorldSceneManagement::BuildLayerRoadList(
+	bool bHeightmapRender,
+	FName WeightmapLayerName,
+	TArray<AMoKuEditBaseActor*>& OutRoads)
+{
+	OutRoads.Reset();
+	GetRoadActors(AMoKuEditBaseActor::StaticClass(), OutRoads);
+	OutRoads.RemoveAll([](const AMoKuEditBaseActor* Road)
+	{
+		return Road == nullptr;
+	});
+
+	bool bSoftEdgeRepaired = false;
+	for (AMoKuEditBaseActor* Road : OutRoads)
+	{
+		if (Road->EnsureDefaultTerrainInfluenceSettings())
+		{
+			bSoftEdgeRepaired = true;
+		}
+	}
+	if (bSoftEdgeRepaired)
+	{
+		InvalidateBrushDistanceFieldCache();
+		UE_LOG(LogTemp, Log, TEXT("[RoadLandscape] Soft-edge repair applied — distance-field cache invalidated"));
+	}
+
+	if (!bHeightmapRender)
+	{
+		OutRoads.RemoveAll([&WeightmapLayerName](const AMoKuEditBaseActor* Road)
+		{
+			return !Road->GetLayerWeightmapSettings().Contains(WeightmapLayerName);
+		});
+	}
+
+	CollectHeightStampRoads(OutRoads);
+}
+
+FBox AWorldSceneManagement::ComputeHeightStampWorldBounds(const TArray<AMoKuEditBaseActor*>& Roads) const
+{
+	FBox Union(ForceInit);
+	for (AMoKuEditBaseActor* Road : Roads)
+	{
+		const FBox Box = ComputeRoadHeightInfluenceBounds(Road);
+		if (Box.IsValid)
+		{
+			Union += Box;
+		}
+	}
+	return Union;
+}
+
+#if WITH_EDITOR
+TArray<UE::Landscape::EditLayers::FEditLayerRenderItem> AWorldSceneManagement::GetRenderItems(
+	const UE::Landscape::EditLayers::FMergeContext* InMergeContext) const
+{
+	TArray<UE::Landscape::EditLayers::FEditLayerRenderItem> Items = Super::GetRenderItems(InMergeContext);
+	if (!ResolveHeightStampFocusActor())
+	{
+		return Items;
+	}
+
+	TArray<AMoKuEditBaseActor*> Roads;
+	GetRoadActors(AMoKuEditBaseActor::StaticClass(), Roads);
+	CollectHeightStampRoads(Roads);
+	const FBox Bounds = ComputeHeightStampWorldBounds(Roads);
+	if (!Bounds.IsValid)
+	{
+		return Items;
+	}
+
+	const FVector Center = Bounds.GetCenter();
+	const FVector Extent = Bounds.GetExtent();
+	const UE::Landscape::EditLayers::FOOBox2D DirtyBox(
+		FTransform(FQuat::Identity, FVector(Center.X, Center.Y, 0.0), FVector::OneVector),
+		FVector2D(Extent.X, Extent.Y));
+	for (UE::Landscape::EditLayers::FEditLayerRenderItem& Item : Items)
+	{
+		Item.SetInputWorldArea(UE::Landscape::EditLayers::FInputWorldArea::CreateOOBox(DirtyBox));
+	}
+	UE_LOG(LogTemp, Log, TEXT("[RoadLandscape] Height dirty box focus=%s roads=%d extent=%.0fx%.0f"),
+		*GetNameSafe(ResolveHeightStampFocusActor()),
+		Roads.Num(),
+		Extent.X * 2.0,
+		Extent.Y * 2.0);
+	return Items;
+}
+#endif
+
 UTextureRenderTarget2D* AWorldSceneManagement::RenderLayer_Native(const FLandscapeBrushParameters& InParameters)
 {
 
@@ -739,8 +1875,10 @@ UTextureRenderTarget2D* AWorldSceneManagement::RenderLayer_Native(const FLandsca
 	LandscapeRTRef = InParameters.CombinedResult;
 
 	FEditorBrushRenderContext BrushRenderContext;
-	BrushRenderContext.bHeightmapRender = InParameters.LayerType == ELandscapeToolTargetType::Heightmap;
+	BrushRenderContext.bHeightmapRender = bHeightmapRender;
 	BrushRenderContext.WeightmapLayerName = InParameters.WeightmapLayerName;
+	BrushRenderContext.RenderAreaWorldTransform = InParameters.RenderAreaWorldTransform;
+	BrushRenderContext.RenderAreaSize = InParameters.RenderAreaSize;
 
 	if (!BrushRenderSetup())
 	{
@@ -761,67 +1899,47 @@ UTextureRenderTarget2D* AWorldSceneManagement::RenderLayer_Native(const FLandsca
 		UKismetRenderingLibrary::ClearRenderTarget2D(this, WeightmapRTB, FLinearColor::Black);
 	}
 
-	// Refresh tracked roads before weight/height so newly edited actors are included.
 	UpdateActors(/*bInTriggerEvents=*/false);
 	UpdateAffectedWeightmaps();
 
 	TArray<AMoKuEditBaseActor*> RoadList;
-	GetRoadActors(AMoKuEditBaseActor::StaticClass(), RoadList);
+	BuildLayerRoadList(bHeightmapRender, BrushRenderContext.WeightmapLayerName, RoadList);
 
-	// Repair Influence/Curl/Blur; rebuild DF cache when soft-edge params change.
-	bool bSoftEdgeRepaired = false;
-	for (AMoKuEditBaseActor* SingleRoad : RoadList)
-	{
-		if (SingleRoad && SingleRoad->EnsureDefaultTerrainInfluenceSettings())
-		{
-			bSoftEdgeRepaired = true;
-		}
-	}
-	if (bSoftEdgeRepaired)
-	{
-		InvalidateBrushDistanceFieldCache();
-		UE_LOG(LogTemp, Log, TEXT("[RoadLandscape] Soft-edge repair applied — distance-field cache invalidated"));
-	}
-
-	int32 WeightRoadsDrawn = 0;
+	int32 RoadsDrawn = 0;
 	for (AMoKuEditBaseActor* SingleRoad : RoadList)
 	{
 		TRACE_CPUPROFILER_EVENT_SCOPE(SingleRoad);
-		if (!SingleRoad)
-		{
-			continue;
-		}
-		if (!BrushRenderContext.bHeightmapRender)
-		{
-			if (!SingleRoad->GetLayerWeightmapSettings().Contains(BrushRenderContext.WeightmapLayerName))
-			{
-				continue;
-			}
-		}
-		// Height always stamps from road mesh (贴地画线 / Alt+W 挪路后地形跟随).
 		FBrushActorRenderContext BrushActorRenderContext(SingleRoad);
 		const int32 RTBefore = BrushRenderContext.RTIndex;
 		RenderBrushActorContext(BrushRenderContext, BrushActorRenderContext);
-		if (!BrushRenderContext.bHeightmapRender && BrushRenderContext.RTIndex > RTBefore)
+		if (bHeightmapRender || BrushRenderContext.RTIndex > RTBefore)
 		{
-			++WeightRoadsDrawn;
+			++RoadsDrawn;
 		}
 	}
 
-	UTextureRenderTarget2D* ReturnRT = (InParameters.LayerType == ELandscapeToolTargetType::Heightmap) ? HeightPingPongRead(BrushRenderContext) : WeightPingPongRead(BrushRenderContext);
+	UTextureRenderTarget2D* ReturnRT = BrushRenderContext.CSHeightWriteRT
+		? BrushRenderContext.CSHeightWriteRT
+		: (bHeightmapRender
+			? HeightPingPongRead(BrushRenderContext)
+			: WeightPingPongRead(BrushRenderContext));
 	
 	bKillCache = false;
 	UE_LOG(LogTemp, Log, TEXT("[RoadLandscape] RenderLayer END type=%s layer=%s roads=%d drawn=%d return=%s"),
 		bHeightmapRender ? TEXT("Height") : TEXT("Weight"),
 		*InParameters.WeightmapLayerName.ToString(),
 		RoadList.Num(),
-		bHeightmapRender ? RoadList.Num() : WeightRoadsDrawn,
+		RoadsDrawn,
 		ReturnRT ? *ReturnRT->GetName() : TEXT("null"));
-	if (!bHeightmapRender && WeightRoadsDrawn == 0)
+	if (!bHeightmapRender && RoadsDrawn == 0)
 	{
 		UE_LOG(LogTemp, Warning, TEXT("[RoadLandscape] Weight layer '%s' drew 0 roads — Weightmap RT stays black. Check: actors in WorldEditor brush list, bAffectsLandscape, RoadBodyWeightmapSettings has key '%s'."),
 			*InParameters.WeightmapLayerName.ToString(),
 			*InParameters.WeightmapLayerName.ToString());
+	}
+	if (bHeightmapRender)
+	{
+		bForceFullHeightStamp = false;
 	}
 	return ReturnRT;
 }
@@ -850,52 +1968,42 @@ UTextureRenderTarget2D* AWorldSceneManagement::RenderLayer_Native(const FLandsca
 //		Octree.AddElement(NewElement);
 //	}
 //}
-void AWorldSceneManagement::RenderBrushActorContext(FEditorBrushRenderContext& BrushRenderContext, FBrushActorRenderContext& BrushActorRenderContext)
+void AWorldSceneManagement::StampOneRoadBrushPass(
+	FEditorBrushRenderContext& BrushRenderContext,
+	FBrushActorRenderContext& BrushActorRenderContext,
+	bool bForceRecapture)
 {
-	if (!BrushRenderContext.bHeightmapRender)
+	if (BrushActorRenderContext.CacheContainer && !BrushActorRenderContext.CacheContainer->Cache.CacheIsValid)
 	{
-		if (!(BrushActorRenderContext.RoadBrushActor->GetLayerWeightmapSettings().Find(BrushRenderContext.WeightmapLayerName)))
-		{
-			UE_LOG(LogTemp,Warning, TEXT("Actor does NOT affect this layer, Skipping"));
-			return;
-		}
-	}
-
-	URoadBodyBrushCacheContainer* CacheContainer = nullptr;
-	FRoadBodyBrushCache RoadBrushCache;
-	GetRoadCacheKey(BrushActorRenderContext.GetActor(), /*out*/ CacheContainer, /*out*/ RoadBrushCache);
-	BrushActorRenderContext.CacheContainer = CacheContainer;
-	SetBrushMIDParams(BrushRenderContext, BrushActorRenderContext);
-
-	//UE_LOG(LogWaterEditor, Verbose, TEXT("===================================="));
-	//UE_LOG(LogWaterEditor, Verbose, TEXT("Current Actor: %s"), *UKismetSystemLibrary::GetDisplayName(BrushActorRenderContext.WaterBrushActor.GetObject()));
-	//UE_LOG(LogWaterEditor, Verbose, TEXT("Type: %s"), *BrushActorRenderContext.WaterBrushActor.GetObject()->GetClass()->GetName());
-	//UE_LOG(LogWaterEditor, Verbose, TEXT("Cache is Valid: %s"), (BrushActorRenderContext.CacheContainer->Cache.CacheIsValid ? TEXT("true") : TEXT("false")));
-
-	if (BrushActorRenderContext.CacheContainer->Cache.CacheIsValid)
-	{
-		if (bKillCache)
-		{
-			//UE_LOG(LogWaterEditor, Verbose, TEXT("Kill Cache Detected, running full render pass for Brush"));
-		}
-	}
-	else
-	{
-		UseDynamicPreviewRT = true; 
+		UseDynamicPreviewRT = true;
 	}
 
 	AMoKuEditBaseActor* BasicBody = BrushActorRenderContext.TryGetActorAs<AMoKuEditBaseActor>();
-	if (!BrushActorRenderContext.CacheContainer->Cache.CacheIsValid || bKillCache)
+	const bool bNeedCapture = bForceRecapture
+		|| !BrushActorRenderContext.CacheContainer
+		|| !BrushActorRenderContext.CacheContainer->Cache.CacheIsValid
+		|| bKillCache;
+	if (bNeedCapture)
 	{
 		const FSplineRoadHeightmapSettings& HeightmapSettings = BrushActorRenderContext.RoadBrushActor->GetRoadHeightmapSettings();
 		const FRoadBrushEffectCurlNoise& CurlNoise = HeightmapSettings.Effects.CurlNoise;
-		// Water/Landmass pack: (Curl1Tiling, Curl1Amount, Curl2Tiling, Curl2Amount)
-		// DisableBrushTextureEffects kills Curl — that was the speckled road edge noise.
 		const FLinearColor CurlColor = DisableBrushTextureEffects
 			? FLinearColor(CurlNoise.Curl1Tiling, 0.0f, CurlNoise.Curl2Tiling, 0.0f)
 			: FLinearColor(CurlNoise.Curl1Tiling, CurlNoise.Curl1Amount, CurlNoise.Curl2Tiling, CurlNoise.Curl2Amount);
 		if (BasicBody != nullptr)
 		{
+			// Capture the visible mesh Z so the landscape can sit under the road.
+			GCaptureFlattenToSplineZ = false;
+			GCaptureLateralDilateCm = 0.0f;
+			GCaptureFalloffSkirtCm = 0.0f;
+			GCaptureTipExtendCm = 0.0f;
+			ON_SCOPE_EXIT
+			{
+				GCaptureFlattenToSplineZ = false;
+				GCaptureLateralDilateCm = 0.0f;
+				GCaptureFalloffSkirtCm = 0.0f;
+				GCaptureTipExtendCm = 0.0f;
+			};
 			CaptureRoadDepth(BrushActorRenderContext);
 			JumpFloodComponent2D->JumpFlood(DepthAndShapeRT, 50000.0f, CurlColor, true, 0.0f);
 		}
@@ -908,16 +2016,250 @@ void AWorldSceneManagement::RenderBrushActorContext(FEditorBrushRenderContext& B
 		}
 		CacheBrushDistanceField(BrushActorRenderContext);
 	}
+
 	DrawBrushMaterial(BrushRenderContext, BrushActorRenderContext);
-
-	//if (BrushRenderContext.bHeightmapRender)
-	//{
-	//	// TODO [jonathan.bard] : along with MakePreviewRT?
-	//	++HeightOnlyIndex;
-	//}
-
 	++BrushRenderContext.RTIndex;
 	ApplyToCompositeRoadBodyTexture(BrushRenderContext, BrushActorRenderContext);
+}
+
+bool AWorldSceneManagement::StampRoadCenterlineProfileCS(
+	FEditorBrushRenderContext& BrushRenderContext,
+	AMoKuEditSplineActor* Road)
+{
+	TArray<FRoadProfileSampleGPU> Samples;
+	if (!BuildRoadProfileSamples(Road, LandscapeTransform, Samples))
+	{
+		return false;
+	}
+
+	UTextureRenderTarget2D* CombinedRT = LandscapeRTRef;
+	if (!CombinedRT)
+	{
+		CombinedRT = HeightPingPongRead(BrushRenderContext);
+	}
+	if (!CombinedRT || LandscapeRTRes.X <= 0 || LandscapeRTRes.Y <= 0)
+	{
+		return false;
+	}
+
+	const FIntPoint CombinedSize(CombinedRT->SizeX, CombinedRT->SizeY);
+	const FIntPoint Size = (CombinedSize.X > 0 && CombinedSize.Y > 0) ? CombinedSize : LandscapeRTRes;
+
+	UTextureRenderTarget2D* ReadRT = BrushRenderContext.CSHeightWriteRT
+		? BrushRenderContext.CSHeightWriteRT
+		: CombinedRT;
+	TObjectPtr<UTextureRenderTarget2D>& WriteSlot = (ReadRT == CSCombinedWriteRT)
+		? CSCombinedWriteRTB
+		: CSCombinedWriteRT;
+	const TCHAR* WriteName = (ReadRT == CSCombinedWriteRT)
+		? TEXT("RoadCSCombinedWriteB")
+		: TEXT("RoadCSCombinedWrite");
+	WriteSlot = FWaterUtils::GetOrCreateTransientRenderTarget2D(
+		WriteSlot,
+		WriteName,
+		Size,
+		CombinedRT->RenderTargetFormat);
+	if (!WriteSlot || WriteSlot == ReadRT)
+	{
+		return false;
+	}
+
+	FTextureRenderTargetResource* ReadRes = ReadRT->GameThread_GetRenderTargetResource();
+	FTextureRenderTargetResource* WriteRes = WriteSlot->GameThread_GetRenderTargetResource();
+	if (!ReadRes || !WriteRes)
+	{
+		return false;
+	}
+
+	const float ZScale = static_cast<float>(LandscapeTransform.GetScale3D().Z);
+	const float QuadCm = FMath::Max3(
+		FMath::Abs(static_cast<float>(LandscapeTransform.GetScale3D().X)),
+		FMath::Abs(static_cast<float>(LandscapeTransform.GetScale3D().Y)),
+		1.0f);
+
+	const FMatrix44f RenderAreaToWorld = MakeVertexAlignedRenderAreaToWorld(
+		BrushRenderContext.RenderAreaWorldTransform,
+		LandscapeTransform);
+	const FVector RenderOrigin = BrushRenderContext.RenderAreaWorldTransform.TransformPosition(FVector::ZeroVector);
+	const FVector AxisX = LandscapeTransform.TransformVector(FVector::ForwardVector);
+	const FVector AxisY = LandscapeTransform.TransformVector(FVector::RightVector);
+
+	FVector2f RoadMin(TNumericLimits<float>::Max(), TNumericLimits<float>::Max());
+	FVector2f RoadMax(TNumericLimits<float>::Lowest(), TNumericLimits<float>::Lowest());
+	float MaxInfluence = 0.0f;
+	for (const FRoadProfileSampleGPU& Sample : Samples)
+	{
+		RoadMin.X = FMath::Min(RoadMin.X, Sample.PosS.X);
+		RoadMin.Y = FMath::Min(RoadMin.Y, Sample.PosS.Y);
+		RoadMax.X = FMath::Max(RoadMax.X, Sample.PosS.X);
+		RoadMax.Y = FMath::Max(RoadMax.Y, Sample.PosS.Y);
+		MaxInfluence = FMath::Max(
+			MaxInfluence,
+			FMath::Max(Sample.RightLR.Z, Sample.RightLR.W)
+				+ FMath::Max(Sample.Falloff.X, 0.0f)
+				+ FMath::Max(Sample.Falloff.Y, 1.0f));
+	}
+	const FVector2f Pad(MaxInfluence + QuadCm * 2.0f, MaxInfluence + QuadCm * 2.0f);
+	RoadMin -= Pad;
+	RoadMax += Pad;
+
+	const uint32 SampleCount = static_cast<uint32>(Samples.Num());
+	const FRoadProfileSampleGPU Sample0 = Samples[0];
+	const bool bUseRenderArea = BrushRenderContext.RenderAreaSize.X > 0
+		&& BrushRenderContext.RenderAreaSize.X < (MAX_int32 / 4);
+	const FIntPoint StampSize = bUseRenderArea
+		? FIntPoint(
+			FMath::Min(BrushRenderContext.RenderAreaSize.X, Size.X),
+			FMath::Min(BrushRenderContext.RenderAreaSize.Y, Size.Y))
+		: Size;
+	UE_LOG(LogTemp, Log, TEXT("[RoadLandscape] Profile road=%s samples=%u PackedH=%.0f WorldZ=%.1f PackedOff=%.1f Layer=%.2f Offset=%.1f Falloff=%.1f SolidThenFade=%.1f SlopePad=%.1f ZScale=%.1f Quad=%.1f Axis=%.1fx%.1f Origin=(%.0f,%.0f) RenderArea=%s %dx%d Stamp=%dx%d Combined=%dx%d fmt=%d"),
+		*Road->GetName(),
+		SampleCount,
+		Sample0.PosS.Z,
+		Sample0.Extra.W,
+		Sample0.Falloff.Z,
+		Sample0.Extra.Z,
+		Sample0.Falloff.X,
+		Sample0.Falloff.Y,
+		Sample0.Falloff.X + Sample0.Falloff.Y,
+		Sample0.Falloff.W,
+		ZScale,
+		QuadCm,
+		AxisX.Size(),
+		AxisY.Size(),
+		RenderOrigin.X,
+		RenderOrigin.Y,
+		bUseRenderArea ? TEXT("yes") : TEXT("full"),
+		BrushRenderContext.RenderAreaSize.X,
+		BrushRenderContext.RenderAreaSize.Y,
+		StampSize.X,
+		StampSize.Y,
+		Size.X,
+		Size.Y,
+		static_cast<int32>(CombinedRT->RenderTargetFormat));
+
+	ENQUEUE_RENDER_COMMAND(RoadLandscapeProfilePS)(
+		[ReadRes, WriteRes, Samples = MoveTemp(Samples), SampleCount, Size, StampSize, RenderAreaToWorld, ZScale, QuadCm, RoadMin, RoadMax]
+		(FRHICommandListImmediate& RHICmdList)
+		{
+			if (!ReadRes->GetRenderTargetTexture() || !WriteRes->GetRenderTargetTexture() || SampleCount < 2)
+			{
+				return;
+			}
+
+			FRDGBuilder GraphBuilder(RHICmdList, RDG_EVENT_NAME("RoadLandscapeProfile"));
+			FRDGTextureRef Combined = RegisterExternalTexture(GraphBuilder, ReadRes->GetRenderTargetTexture(), TEXT("RoadProfile.Combined"));
+			FRDGTextureRef Dest = RegisterExternalTexture(GraphBuilder, WriteRes->GetRenderTargetTexture(), TEXT("RoadProfile.Dest"));
+			const FIntPoint DispatchSize = Combined->Desc.Extent.X > 0 ? Combined->Desc.Extent : Size;
+			if (DispatchSize.X <= 0 || DispatchSize.Y <= 0)
+			{
+				return;
+			}
+
+			const uint32 SampleBytes = SampleCount * sizeof(FRoadProfileSampleGPU);
+			FRDGBufferRef SampleBuffer = GraphBuilder.CreateBuffer(
+				FRDGBufferDesc::CreateStructuredDesc(sizeof(FRoadProfileSampleGPU), SampleCount),
+				TEXT("RoadProfile.Samples"));
+			GraphBuilder.QueueBufferUpload(SampleBuffer, Samples.GetData(), SampleBytes);
+
+			TShaderMapRef<FRoadLandscapeProfilePS> PixelShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+			FRoadLandscapeProfilePS::FParameters* PassParameters = GraphBuilder.AllocParameters<FRoadLandscapeProfilePS::FParameters>();
+			PassParameters->T_Combined = Combined;
+			PassParameters->Samples = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(SampleBuffer));
+			PassParameters->NumSamples = SampleCount;
+			PassParameters->RTSize = DispatchSize;
+			PassParameters->StampSize = StampSize;
+			PassParameters->RenderAreaToWorld = RenderAreaToWorld;
+			PassParameters->LandscapeZScale = ZScale;
+			PassParameters->LandscapeCmPerQuad = QuadCm;
+			PassParameters->RoadBoundsMin = RoadMin;
+			PassParameters->RoadBoundsMax = RoadMax;
+			PassParameters->RenderTargets[0] = FRenderTargetBinding(Dest, ERenderTargetLoadAction::ENoAction);
+
+			FPixelShaderUtils::AddFullscreenPass(
+				GraphBuilder,
+				GetGlobalShaderMap(GMaxRHIFeatureLevel),
+				RDG_EVENT_NAME("RoadLandscapeProfilePS"),
+				PixelShader,
+				PassParameters,
+				FIntRect(0, 0, DispatchSize.X, DispatchSize.Y));
+
+			GraphBuilder.Execute();
+		});
+
+	BrushRenderContext.CSHeightWriteRT = WriteSlot;
+	return true;
+}
+
+void AWorldSceneManagement::RenderBrushActorContext(FEditorBrushRenderContext& BrushRenderContext, FBrushActorRenderContext& BrushActorRenderContext)
+{
+	if (!BrushRenderContext.bHeightmapRender)
+	{
+		if (!(BrushActorRenderContext.RoadBrushActor->GetLayerWeightmapSettings().Find(BrushRenderContext.WeightmapLayerName)))
+		{
+			UE_LOG(LogTemp,Warning, TEXT("Actor does NOT affect this layer, Skipping"));
+			return;
+		}
+	}
+
+	if (BrushRenderContext.bHeightmapRender)
+	{
+		if (AMoKuEditSplineActor* ProfileRoad = BrushActorRenderContext.TryGetActorAs<AMoKuEditSplineActor>())
+		{
+			if (!StampRoadCenterlineProfileCS(BrushRenderContext, ProfileRoad))
+			{
+				UE_LOG(LogTemp, Warning, TEXT("[RoadLandscape] Profile stamp failed for %s — height passthrough (no Landmass)"), *ProfileRoad->GetName());
+			}
+			return;
+		}
+	}
+
+	URoadBodyBrushCacheContainer* CacheContainer = nullptr;
+	FRoadBodyBrushCache RoadBrushCache;
+	GetRoadCacheKey(BrushActorRenderContext.GetActor(), /*out*/ CacheContainer, /*out*/ RoadBrushCache);
+	BrushActorRenderContext.CacheContainer = CacheContainer;
+
+	TArray<FLandscapeHeightSlice> HeightSlices;
+	AMoKuEditSplineActor* Road = BrushActorRenderContext.TryGetActorAs<AMoKuEditSplineActor>();
+	if (BrushRenderContext.bHeightmapRender && Road)
+	{
+		CollectLandscapeHeightSlices(Road, HeightSlices);
+	}
+
+	if (BrushRenderContext.bHeightmapRender && HeightSlices.Num() > 1)
+	{
+		UE_LOG(LogTemp, Log, TEXT("[RoadLandscape] HEIGHT segmented stamps=%d (one per differing key span)"), HeightSlices.Num());
+		GSkipAutoLandscapeKeyApply = true;
+		GCaptureClipEnabled = true;
+		ON_SCOPE_EXIT
+		{
+			GSkipAutoLandscapeKeyApply = false;
+			GCaptureClipEnabled = false;
+			ClearLandscapeKeyFalloffOverride();
+		};
+
+		for (const FLandscapeHeightSlice& Slice : HeightSlices)
+		{
+			SetLandscapeKeyFalloffOverride(Slice.Value);
+			GCaptureClipS0 = Slice.S0;
+			GCaptureClipS1 = Slice.S1;
+			if (BrushActorRenderContext.CacheContainer)
+			{
+				BrushActorRenderContext.CacheContainer->Cache.CacheIsValid = false;
+			}
+			SetBrushMIDParams(BrushRenderContext, BrushActorRenderContext);
+			StampOneRoadBrushPass(BrushRenderContext, BrushActorRenderContext, /*bForceRecapture=*/true);
+		}
+		return;
+	}
+
+	if (BrushActorRenderContext.CacheContainer)
+	{
+		BrushActorRenderContext.CacheContainer->Cache.CacheIsValid = false;
+	}
+	SetBrushMIDParams(BrushRenderContext, BrushActorRenderContext);
+	StampOneRoadBrushPass(BrushRenderContext, BrushActorRenderContext, /*bForceRecapture=*/true);
+	ClearLandscapeKeyFalloffOverride();
 }
 
 
@@ -1089,7 +2431,7 @@ void AWorldSceneManagement::ApplyToCompositeRoadBodyTexture(FEditorBrushRenderCo
 		CompositeRoadBodyTextureMID->SetTextureParameterValue(FName(TEXT("CombinedShapeAndHeight")), RoadDepthPingPongRead(BrushRenderContext));
 		CompositeRoadBodyTextureMID->SetTextureParameterValue(FName(TEXT("LandscapeHeight")), HeightPingPongRead(BrushRenderContext));
 		// Clamp: user/serialized ZOffset of tens of thousands breaks Min blend (terrain collapses → road looks floating).
-		const float SafeZOffset = FMath::Clamp(HeightmapSettings.FalloffSettings.ZOffset, -2000.f, 2000.f);
+		const float SafeZOffset = FMath::Clamp(ResolveStampFalloff(HeightmapSettings).ZOffset, -2000.f, 2000.f);
 		CompositeRoadBodyTextureMID->SetScalarParameterValue(FName(TEXT("ZOffset")), SafeZOffset);
 		//CompositeWaterBodyTextureMID->SetScalarParameterValue(FName(TEXT("Shape Dilation")), RoadBody->GetWaterBodyComponent()->ShapeDilation);
 		CompositeRoadBodyTextureMID->SetTextureParameterValue(FName(TEXT("RoadDepthRT")), RoadDepthRT);
@@ -1112,11 +2454,23 @@ void AWorldSceneManagement::ApplyToCompositeRoadBodyTexture(FEditorBrushRenderCo
 
 void AWorldSceneManagement::SetBrushMIDParams(const FEditorBrushRenderContext& BrushRenderContext, FBrushActorRenderContext& BrushActorRenderContext)
 {
+	if (BrushRenderContext.bHeightmapRender)
+	{
+		ApplyRoadLandscapeKeysToBrushSettings(BrushActorRenderContext.TryGetActorAs<AMoKuEditBaseActor>());
+	}
 	const FSplineRoadHeightmapSettings&  HeightmapSettings = BrushActorRenderContext.RoadBrushActor->GetRoadHeightmapSettings();
+	const FRoadFalloffSettings& StampFalloff = ResolveStampFalloff(HeightmapSettings);
 	if (JumpFloodComponent2D != nullptr)
 	{
-		// Blur + Curl are the main "噪点" sources on weight/height RTs.
-		if (DisableBrushTextureEffects)
+		if (BrushRenderContext.bHeightmapRender)
+		{
+			// Height only: a few blur passes kill landscape-quad stair-steps on the falloff.
+			// Weight stays sharp — blur there was the speckled pavement edge.
+			JumpFloodComponent2D->UseBlur = true;
+			JumpFloodComponent2D->BlurPasses = FMath::Clamp(
+				FMath::Max(HeightmapSettings.Effects.Blurring.Radius, 3), 3, 8);
+		}
+		else if (DisableBrushTextureEffects)
 		{
 			JumpFloodComponent2D->UseBlur = false;
 			JumpFloodComponent2D->BlurPasses = 0;
@@ -1129,7 +2483,7 @@ void AWorldSceneManagement::SetBrushMIDParams(const FEditorBrushRenderContext& B
 	}
 	if (BrushActorRenderContext.TryGetActorAs<AMoKuEditBaseActor>() != nullptr)
 	{
-		if (HeightmapSettings.FalloffSettings.FalloffMode == ERoadBrushFalloffMode::Angle)
+		if (StampFalloff.FalloffMode == ERoadBrushFalloffMode::Angle)
 		{
 			BrushActorRenderContext.MID = BrushAngleFalloffMID;
 		}
@@ -1224,7 +2578,7 @@ void AWorldSceneManagement::DistanceFieldCaching(const FBrushActorRenderContext&
 		: FLinearColor(CurlNoise.Curl1Tiling, CurlNoise.Curl1Amount, CurlNoise.Curl2Tiling, CurlNoise.Curl2Amount);
 	DistanceFieldCacheMID->SetVectorParameterValue(FName(TEXT("Curl")), NoiseColor);
 
-	const float SafeZOffset = FMath::Clamp(HeightmapSettings.FalloffSettings.ZOffset, -2000.f, 2000.f);
+	const float SafeZOffset = FMath::Clamp(ResolveStampFalloff(HeightmapSettings).ZOffset, -2000.f, 2000.f);
 	DistanceFieldCacheMID->SetScalarParameterValue(FName(TEXT("ZOffset")), SafeZOffset);
 	DistanceFieldCacheMID->SetTextureParameterValue(FName(TEXT("ChannelDepth")), RoadDepthRT);
 
@@ -1238,48 +2592,46 @@ void AWorldSceneManagement::FalloffAndBlendMode(const FBrushActorRenderContext& 
 	check(::IsValid(BrushActorRenderContext.MID));
 
 	const FSplineRoadHeightmapSettings& HeightmapSettings = BrushActorRenderContext.RoadBrushActor->GetRoadHeightmapSettings();
-	const FRoadFalloffSettings& FalloffSettings = HeightmapSettings.FalloffSettings;
+	const FRoadFalloffSettings& FalloffSettings = ResolveStampFalloff(HeightmapSettings);
 
-	float FalloffTangentValue = FMath::Clamp(FalloffSettings.FalloffAngle, 1.0f, 89.0f);
-	FalloffTangentValue = FMath::Tan(FMath::DegreesToRadians(FalloffTangentValue));
+	const bool bWidthMode = FalloffSettings.FalloffMode == ERoadBrushFalloffMode::Width;
+	// Width mode: MeshBrush often does min(EdgeWidth, height/tan). The greyed 35° was
+	// locking the slope. 1° makes the angle limit huge so Width actually changes grade.
+	const float FalloffTangentValue = FMath::Tan(FMath::DegreesToRadians(
+		bWidthMode ? 1.0f : FMath::Clamp(FalloffSettings.FalloffAngle, 1.0f, 89.0f)));
 
-	const float EdgeWidth = FMath::Max(FalloffSettings.FalloffWidth, 0.1f);
+	const float LandscapeCmPerQuad = FMath::Max3(
+		FMath::Abs((float)LandscapeTransform.GetScale3D().X),
+		FMath::Abs((float)LandscapeTransform.GetScale3D().Y),
+		1.0f);
+	const float MinHeightFalloffCm = LandscapeCmPerQuad;
+	const float SolidShoulderCm = FMath::Max(FalloffSettings.EdgeOffset, 0.0f);
+	const float GradientCm = bWidthMode
+		? FMath::Max(FalloffSettings.FalloffWidth, MinHeightFalloffCm)
+		: MinHeightFalloffCm;
 
 	BrushActorRenderContext.MID->SetScalarParameterValue(FName(TEXT("FalloffTangent")), FalloffTangentValue);
 	// Always mesh-depth for height MID — toggling this off produced cliff/wall corruption.
 	BrushActorRenderContext.MID->SetScalarParameterValue(FName(TEXT("UseMeshDepth")), 1.0f);
 	BrushActorRenderContext.MID->SetScalarParameterValue(FName(TEXT("CapShapeInterior")), 1.0f);
-	BrushActorRenderContext.MID->SetScalarParameterValue(FName(TEXT("EdgeWidth")), EdgeWidth);
-
-	const float EdgeCenterOffsetValue = FalloffSettings.EdgeOffset - (SplineMeshExtension / 2.0f);
+	// Water MeshBrush_Width keeps one contour (EdgeCenterOffset) and fades a band
+	// CENTERED on it. CapShapeInterior fills everything inside that contour, so the
+	// inner half of EdgeWidth is hidden. Double the user Width so the visible outer
+	// half equals Falloff Width. Do not move the contour by Width/2 — that grew the cap.
+	const float EdgeWidthValue = bWidthMode ? (GradientCm * 2.0f) : GradientCm;
+	BrushActorRenderContext.MID->SetScalarParameterValue(FName(TEXT("EdgeWidth")), EdgeWidthValue);
+	const float EdgeCenterOffsetValue = SolidShoulderCm - (SplineMeshExtension / 2.0f);
 	BrushActorRenderContext.MID->SetScalarParameterValue(FName(TEXT("EdgeCenterOffset")), EdgeCenterOffsetValue);
 
-	UE_LOG(LogTemp, Log, TEXT("[RoadLandscape] Height FalloffMode=%s EdgeWidth=%.1f EdgeOffset=%.1f ZOffset=%.1f (distance falloff)"),
-		FalloffSettings.FalloffMode == ERoadBrushFalloffMode::Angle ? TEXT("Angle") : TEXT("Width"),
-		EdgeWidth, FalloffSettings.EdgeOffset, FalloffSettings.ZOffset);
-
-	float ModeValue = 3.0f;
-	switch (HeightmapSettings.BlendMode)
-	{
-	case ERoadBrushBlendType::AlphaBlend:
-		ModeValue = 0.0f;
-		break;
-	case ERoadBrushBlendType::Min:
-		ModeValue = 1.0f;
-		break;
-	case ERoadBrushBlendType::Max:
-		ModeValue = 2.0f;
-		break;
-	default:
-		ModeValue = 3.0f;
-		break;
-	}
-
-	if (::IsValid(WeightmapMID))
-	{
-		WeightmapMID->SetScalarParameterValue(FName(TEXT("BlendMode")), ModeValue);
-	}
+	// Height blender: AlphaBlend writes mesh+ZOffset both up and down, with side falloff.
+	// Min/Max here made a pit on the cut end and a floating slab on the raise end.
+	const float ModeValue = 0.0f;
 	BrushActorRenderContext.MID->SetScalarParameterValue(FName(TEXT("BlendMode")), ModeValue);
+
+	UE_LOG(LogTemp, Log, TEXT("[RoadLandscape] HEIGHT actor=%s mode=%s Solid=%.1f OuterGradient=%.1f EdgeWidth=%.1f TotalExtra=%.1f ZOffset=%.1f"),
+		*BrushActorRenderContext.GetActor()->GetName(),
+		bWidthMode ? TEXT("Width") : TEXT("Angle"),
+		SolidShoulderCm, GradientCm, EdgeWidthValue, SolidShoulderCm + GradientCm, FalloffSettings.ZOffset);
 }
 
 void AWorldSceneManagement::CurvesSmoothingAndTerracing(const FBrushActorRenderContext& BrushActorRenderContext)
@@ -1291,7 +2643,7 @@ void AWorldSceneManagement::CurvesSmoothingAndTerracing(const FBrushActorRenderC
 	const FSplineRoadHeightmapSettings& HeightmapSettings = BrushActorRenderContext.RoadBrushActor->GetRoadHeightmapSettings();
 	const FRoadBrushEffectSmoothBlending& SmoothBlending = HeightmapSettings.Effects.SmoothBlending;
 	const FRoadBrushEffectTerracing& Terracing = HeightmapSettings.Effects.Terracing;
-	const FRoadFalloffSettings& FalloffSettings = HeightmapSettings.FalloffSettings;
+	const FRoadFalloffSettings& FalloffSettings = ResolveStampFalloff(HeightmapSettings);
 
 	const FLinearColor SmoothingParamsColor(
 		FMath::Max(SmoothBlending.InnerSmoothDistance, 0.01f),
@@ -1483,12 +2835,15 @@ void AWorldSceneManagement::ApplyWeightmapSettings(const FEditorBrushRenderConte
 	// that turned a whole carriageway into a soft gray mix).
 	const float MinSoftFalloffCm = LandscapeCmPerQuad * (bIsRoadPavement ? 2.0f : 4.0f);
 	const float MaxFalloffCm = bIsRoadPavement ? 600.f : 2500.f;
-	const float SafeFalloffWidth = FMath::Clamp(WMSettings.FalloffWidth, 0.1f, MaxFalloffCm);
+	const float SourceFalloffWidth = WMSettings.FalloffWidth;
+	const float SourceEdgeOffset = WMSettings.EdgeOffset;
+	const float SourceInfluence = WMSettings.TextureInfluence;
+	const float SafeFalloffWidth = FMath::Clamp(SourceFalloffWidth, 0.1f, MaxFalloffCm);
 	const float GradientWidth = FMath::Max(SafeFalloffWidth, MinSoftFalloffCm);
 
 	// Shoulder may use EdgeOffset up to ±Falloff*2 (push Dirty onto side slopes).
 	const float EdgeClamp = bIsShoulder ? (SafeFalloffWidth * 2.0f) : SafeFalloffWidth;
-	float SafeEdgeOffset = FMath::Clamp(WMSettings.EdgeOffset, -EdgeClamp, EdgeClamp);
+	float SafeEdgeOffset = FMath::Clamp(SourceEdgeOffset, -EdgeClamp, EdgeClamp);
 	if (bIsShoulder && FMath::IsNearlyZero(SafeEdgeOffset, 1.0f))
 	{
 		// Same silhouette as Road + CapShapeInterior → Dirty fills pavement (brown arms in screenshot).
@@ -1496,18 +2851,18 @@ void AWorldSceneManagement::ApplyWeightmapSettings(const FEditorBrushRenderConte
 		SafeEdgeOffset = SafeFalloffWidth * 0.5f;
 	}
 
-	const bool bInfluenceBroken = !FMath::IsFinite(WMSettings.TextureInfluence)
-		|| WMSettings.TextureInfluence > 1.0f + KINDA_SMALL_NUMBER
-		|| WMSettings.TextureInfluence < 0.0f;
+	const bool bInfluenceBroken = !FMath::IsFinite(SourceInfluence)
+		|| SourceInfluence > 1.0f + KINDA_SMALL_NUMBER
+		|| SourceInfluence < 0.0f;
 	float SafeInfluence = 0.0f;
 	if (bInfluenceBroken)
 	{
 		UE_LOG(LogTemp, Warning, TEXT("[RoadLandscape] Weightmap Influence=%.1f broken — using 0 (sawtooth / no material). Set 0..1 in Details."),
-			WMSettings.TextureInfluence);
+			SourceInfluence);
 	}
 	else
 	{
-		SafeInfluence = FMath::Clamp(WMSettings.TextureInfluence, 0.0f, 0.35f);
+		SafeInfluence = FMath::Clamp(SourceInfluence, 0.0f, 0.35f);
 	}
 
 	// Road = solid core + edge AA. Dirty = soft band (no Cap) so it cannot paint-over pavement.
@@ -1541,13 +2896,8 @@ void AWorldSceneManagement::ApplyWeightmapSettings(const FEditorBrushRenderConte
 	WeightmapMID->SetTextureParameterValue(FName(TEXT("BrushRT")), ModulationTexture);
 	WeightmapMID->SetScalarParameterValue(FName(TEXT("T")), TextureTiling);
 
-	// None + Influence>0 samples black and kills the mask. Never fall back to Displacement when Influence was broken.
-	float WeightmapInfluenceValue = 0.0f;
-	if (!DisableBrushTextureEffects && ModulationTexture != nullptr && !bInfluenceBroken)
-	{
-		WeightmapInfluenceValue = SafeInfluence;
-	}
-	WeightmapMID->SetScalarParameterValue(FName(TEXT("WeightmapInfluence")), WeightmapInfluenceValue);
+	// No along-spline 0→1 texture blend on the root line. Lateral AA is GradientWidth only.
+	WeightmapMID->SetScalarParameterValue(FName(TEXT("WeightmapInfluence")), 0.0f);
 
 	const float MidpointValue = WMSettings.ModulationTexture.ToSoftObjectPath().IsValid()
 		? WMSettings.Midpoint
@@ -1579,6 +2929,56 @@ void AWorldSceneManagement::CaptureRoadDepth(const FBrushActorRenderContext& Bru
 	UPrimitiveComponent* BrushRenderableComponent = RoadBody->GetBrushRenderableComponents();
 	if (BrushRenderableComponent && SceneCapture)
 	{
+		UDynamicMeshComponent* DynMeshComp = Cast<UDynamicMeshComponent>(BrushRenderableComponent);
+		AMoKuEditSplineActor* Road = Cast<AMoKuEditSplineActor>(RoadBody);
+		UMetaLandRoadSplineComponent* RoadSpline = (Road && Road->GetSplineComponent())
+			? Road->GetSplineComponent()
+			: nullptr;
+		UDynamicMesh* DynMesh = DynMeshComp ? DynMeshComp->GetDynamicMesh() : nullptr;
+		const bool bNeedFlatten = DynMeshComp && RoadSpline && GCaptureFlattenToSplineZ;
+		const bool bNeedDilate = DynMeshComp && RoadSpline && FMath::Abs(GCaptureLateralDilateCm) >= 0.5f;
+		const bool bNeedSkirt = DynMeshComp && RoadSpline && GCaptureFalloffSkirtCm >= 1.0f;
+		const bool bNeedTipExtend = DynMeshComp && RoadSpline && GCaptureTipExtendCm >= 1.0f;
+		FDynamicMesh3 SavedCaptureMesh;
+		bool bSavedFullMesh = false;
+		if (DynMesh && RoadSpline && (GCaptureClipEnabled || bNeedFlatten || bNeedDilate || bNeedSkirt || bNeedTipExtend))
+		{
+			DynMesh->ProcessMesh([&](const FDynamicMesh3& Mesh)
+			{
+				SavedCaptureMesh = Mesh;
+				bSavedFullMesh = true;
+			});
+		}
+		TArray<FVector3d> ClipDummyVerts;
+		const bool bClipped = (GCaptureClipEnabled && DynMeshComp && RoadSpline)
+			? ClipCaptureMeshToSRange(DynMeshComp, RoadSpline, GCaptureClipS0, GCaptureClipS1, ClipDummyVerts)
+			: false;
+		(void)bClipped;
+		if (bNeedFlatten)
+		{
+			FlattenCaptureMeshToSplineZ(DynMeshComp, RoadSpline);
+		}
+		if (bNeedDilate)
+		{
+			DilateCaptureMeshLateral(DynMeshComp, RoadSpline, GCaptureLateralDilateCm);
+		}
+		if (bNeedSkirt)
+		{
+			AppendCaptureFalloffSkirt(DynMeshComp, RoadSpline, RoadBody, GCaptureFalloffSkirtCm);
+		}
+		if (bNeedTipExtend)
+		{
+			ExtendCaptureMeshTips(DynMeshComp, RoadSpline, GCaptureTipExtendCm);
+		}
+		ON_SCOPE_EXIT
+		{
+			if (bSavedFullMesh && DynMesh)
+			{
+				DynMesh->SetMesh(MoveTemp(SavedCaptureMesh));
+				DynMeshComp->NotifyMeshUpdated();
+			}
+		};
+
 		const bool bPreviousVisibility = BrushRenderableComponent->GetVisibleFlag();
 		const bool bPreviousHiddenInGame = BrushRenderableComponent->bHiddenInGame;
 		BrushRenderableComponent->SetVisibility(true);

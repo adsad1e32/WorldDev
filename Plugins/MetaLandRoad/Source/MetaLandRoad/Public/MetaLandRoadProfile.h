@@ -47,6 +47,9 @@ namespace MetaLandRoadProfile
 	/** Apply default lanes when the spline has no sections yet. */
 	METALANDROAD_API void EnsureDefaultRoadProfile(UMetaLandRoadSplineComponent* TargetSpline);
 
+	/** Pin a Landscape attribute track on every section center-line (S=0 key). */
+	METALANDROAD_API void EnsureLandscapeAttributeOnSections(UMetaLandRoadSplineComponent* TargetSpline);
+
 	/**
 	 * [KEY-ALGO] Auto-write Left + Right faces on every road (1 lane or N lanes).
 	 * Total width is preserved (split existing width). Required before Add Left/Right Section.

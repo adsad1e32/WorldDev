@@ -15,7 +15,7 @@
 
 static float GetSplineVisualHeightOffset(const UMetaLandRoadSplineComponent* SplineComp)
 {
-	return SplineComp ? SplineComp->LaneVisualizationHeightOffset + 8.0f : 23.0f;
+	return SplineComp ? SplineComp->GetMainCenterLineHeightOffset() : 2.0f;
 }
 
 static FVector RaiseSplineVisualPoint(const UMetaLandRoadSplineComponent* SplineComp, const FVector& WorldLocation)

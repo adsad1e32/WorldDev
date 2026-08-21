@@ -43,6 +43,8 @@
 
 const FEditorModeID UMetaLandRoadEditorMode::EM_MetaLandRoadEditorModeId = TEXT("EM_MetaLandRoadEditorMode");
 FString UMetaLandRoadEditorMode::InteractiveToolName = SPLINETOOLNAME;
+
+static bool GMetaLandRoadEnteringEditorMode = false;
 FString UMetaLandRoadEditorMode::ShapesGenerationName = SHAPESTOOLNAME;
 
 UMetaLandRoadEditorMode::UMetaLandRoadEditorMode()
@@ -297,6 +299,23 @@ bool UMetaLandRoadEditorMode::TryHandleLaneAnchorPickClick(
 
 void UMetaLandRoadEditorMode::Enter()
 {
+	TWeakObjectPtr<AActor> KeepSelectedRoad;
+	if (GEditor)
+	{
+		if (USelection* SelectedActors = GEditor->GetSelectedActors())
+		{
+			for (FSelectionIterator It(*SelectedActors); It; ++It)
+			{
+				if (AMoKuEditSplineActor* Road = Cast<AMoKuEditSplineActor>(*It))
+				{
+					KeepSelectedRoad = Road;
+					break;
+				}
+			}
+		}
+	}
+
+	GMetaLandRoadEnteringEditorMode = true;
 	Super::Enter();
 	ResetInteractiveJunctionSession();
 	GetToolManager()->GetPairedGizmoManager()->RegisterGizmoType(TEXT("SocketGizmo"), NewObject<USocketMarkbleGizmoBuilder>());
@@ -307,7 +326,6 @@ void UMetaLandRoadEditorMode::Enter()
 
 	if (GEditor)
 	{
-		GEditor->SelectNone(true, true);
 		GEditor->OnLevelActorDeleted().AddUObject(this, &UMetaLandRoadEditorMode::RefreshGizmoVisual);
 	}
 
@@ -336,7 +354,9 @@ void UMetaLandRoadEditorMode::Enter()
 			}
 		}
 
-		// Register default "Road" weightmap on existing roads so WorldEditor paints Road_LayerInfo under meshes.
+		// Register default "Road" weightmap. Do NOT broadcast per-road here:
+		// each OnRoadBodyChanged would set stamp focus to that actor, and the last
+		// road would isolate the height merge (other roads look "reverted").
 		for (TActorIterator<AMoKuEditBaseActor> It(World); It; ++It)
 		{
 			AMoKuEditBaseActor* RoadBody = *It;
@@ -345,14 +365,7 @@ void UMetaLandRoadEditorMode::Enter()
 				continue;
 			}
 			RoadBody->EnsureDefaultTerrainInfluenceSettings();
-			FOnRoadBodyChangedParams Params;
-			Params.PropertyChangedEvent.ChangeType = EPropertyChangeType::ValueSet;
-			Params.bWeightmapSettingsChanged = true;
-			Params.bShapeOrPositionChanged = true;
-			Params.bUserTriggered = false;
-			RoadBody->OnRoadBodyChanged(Params);
 		}
-
 		if (!SceneManagement)
 		{
 			for (TActorIterator<AWorldSceneManagement> It(World); It; ++It)
@@ -364,6 +377,34 @@ void UMetaLandRoadEditorMode::Enter()
 				}
 			}
 		}
+		if (AWorldSceneManagement* Manager = SceneManagement.Get())
+		{
+			Manager->SetLandscapeStampFocusActor(nullptr);
+			Manager->RequestLandscapeUpdate(true);
+		}
+	}
+
+	GMetaLandRoadEnteringEditorMode = false;
+
+	// Draw-tool palette must not stay active on mode enter — it owns viewport clicks
+	// and OnToolStarted would also force-exit Alt+W.
+	if (UInteractiveToolManager* ToolManager = GetToolManager())
+	{
+		if (ToolManager->HasAnyActiveTool())
+		{
+			ToolManager->DeactivateTool(EToolSide::Left, EToolShutdownType::Completed);
+		}
+	}
+	if (FModuleManager::Get().IsModuleLoaded(TEXT("MetaLandRoad")))
+	{
+		FMetaLandRoadModule::Get().RestoreAllRoadActorsViewportSelection();
+	}
+	if (GEditor)
+	{
+		if (AActor* Road = KeepSelectedRoad.Get())
+		{
+			GEditor->SelectActor(Road, true, true, true, true);
+		}
 	}
 }
 
@@ -373,6 +414,7 @@ void UMetaLandRoadEditorMode::Exit()
 	ResetInteractiveJunctionSession();
 	if (FModuleManager::Get().IsModuleLoaded(TEXT("MetaLandRoad")))
 	{
+		FMetaLandRoadModule::Get().HideLandscapeAttributeDisplay();
 		FMetaLandRoadModule::Get().ClearInteractiveSessionLeftovers();
 		FMetaLandRoadModule::Get().SetEditorVisMode(EMetaLandRoadEditorVisMode::Standard);
 	}
@@ -405,7 +447,8 @@ void UMetaLandRoadEditorMode::OnToolStarted(UInteractiveToolManager* Manager, UI
 {
 	Super::OnToolStarted(Manager, Tool);
 
-	if (Tool
+	if (!GMetaLandRoadEnteringEditorMode
+		&& Tool
 		&& (Tool->IsA<UMetaLandRoadInteractiveTool>() || Tool->IsA<UShapesGenerationTool>())
 		&& FModuleManager::Get().IsModuleLoaded(TEXT("MetaLandRoad")))
 	{
@@ -517,7 +560,9 @@ bool UMetaLandRoadEditorMode::InputDelta(
 		if (RoadVis.IsValid())
 		{
 			const FMetaLandRoadModule& Module = FMetaLandRoadModule::Get();
-			if (Module.ShouldShowNativeEditOverlay() || Module.IsLaneEditMode())
+			if (Module.ShouldShowNativeEditOverlay()
+				|| Module.IsLaneEditMode()
+				|| Module.ShouldDrawLandscapeAttributeOverlay())
 			{
 				if (RoadVis->HandleInputDelta(
 					ViewportClient, Viewport, InDelta, InRot, InScale))
@@ -552,6 +597,19 @@ void UMetaLandRoadEditorMode::ModeTick(float DeltaTime)
 
 bool UMetaLandRoadEditorMode::HandleClick(FEditorViewportClient* InViewportClient, HHitProxy* HitProxy, const FViewportClick& Click)
 {
+	if (FModuleManager::Get().IsModuleLoaded(TEXT("MetaLandRoad"))
+		&& FMetaLandRoadModule::Get().ShouldDrawLandscapeAttributeOverlay())
+	{
+		if (const TSharedPtr<FMoKuEditSplinesComponentVisualizer> RoadVis =
+			FMetaLandRoadModule::Get().GetRoadComponentVisualizer())
+		{
+			if (RoadVis->HandleLandscapeAttributeClick(InViewportClient, HitProxy, Click))
+			{
+				return true;
+			}
+		}
+	}
+
 	if (Click.GetKey() == EKeys::LeftMouseButton && !Click.IsControlDown())
 	{
 		UMetaLandRoadInteractiveTool* DrawTool =
@@ -680,6 +738,15 @@ bool UMetaLandRoadEditorMode::UsesTransformWidget() const
 			}
 			return false;
 		}
+		if (Module.ShouldDrawLandscapeAttributeOverlay())
+		{
+			if (const TSharedPtr<FMoKuEditSplinesComponentVisualizer> RoadVis =
+				Module.GetRoadComponentVisualizer())
+			{
+				return RoadVis->HasSelectedLandscapeAttributeKey();
+			}
+			return false;
+		}
 	}
 	return Super::UsesTransformWidget();
 }
@@ -705,6 +772,18 @@ bool UMetaLandRoadEditorMode::UsesTransformWidget(UE::Widget::EWidgetMode CheckM
 			}
 			return false;
 		}
+		if (Module.ShouldDrawLandscapeAttributeOverlay())
+		{
+			if (const TSharedPtr<FMoKuEditSplinesComponentVisualizer> RoadVis =
+				Module.GetRoadComponentVisualizer())
+			{
+				if (RoadVis->HasSelectedLandscapeAttributeKey())
+				{
+					return CheckMode == UE::Widget::WM_Translate || CheckMode == UE::Widget::WM_None;
+				}
+			}
+			return false;
+		}
 	}
 	return Super::UsesTransformWidget(CheckMode);
 }
@@ -717,7 +796,8 @@ FVector UMetaLandRoadEditorMode::GetWidgetLocation() const
 		const FMetaLandRoadModule& Module = FMetaLandRoadModule::Get();
 		if (Module.ShouldShowNativeEditOverlay()
 			|| Module.IsSectionMode()
-			|| Module.IsLaneEditMode())
+			|| Module.IsLaneEditMode()
+			|| Module.ShouldDrawLandscapeAttributeOverlay())
 		{
 			if (const TSharedPtr<FMoKuEditSplinesComponentVisualizer> RoadVis =
 				Module.GetRoadComponentVisualizer())
@@ -749,6 +829,15 @@ bool UMetaLandRoadEditorMode::ShouldDrawWidget() const
 				Module.GetRoadComponentVisualizer())
 			{
 				return RoadVis->HasSelectedLaneWidthKey();
+			}
+			return false;
+		}
+		if (Module.ShouldDrawLandscapeAttributeOverlay())
+		{
+			if (const TSharedPtr<FMoKuEditSplinesComponentVisualizer> RoadVis =
+				Module.GetRoadComponentVisualizer())
+			{
+				return RoadVis->HasSelectedLandscapeAttributeKey();
 			}
 			return false;
 		}
@@ -794,7 +883,37 @@ void UMetaLandRoadEditorMode::UpdateAssetGizmoImpl()
 }
 void UMetaLandRoadEditorMode::Render(const FSceneView* View, FViewport* Viewport, FPrimitiveDrawInterface* PDI)
 {
-	if (!PDI || !View || !Viewport || PDI->IsHitTesting())
+	if (!PDI || !View || !Viewport)
+	{
+		return;
+	}
+
+	if (FModuleManager::Get().IsModuleLoaded(TEXT("MetaLandRoad"))
+		&& FMetaLandRoadModule::Get().ShouldDrawLandscapeAttributeOverlay())
+	{
+		if (const TSharedPtr<FMoKuEditSplinesComponentVisualizer> RoadVis =
+			FMetaLandRoadModule::Get().GetRoadComponentVisualizer())
+		{
+			UMetaLandRoadSplineComponent* OverlaySpline = RoadVis->GetEditedMetaLandRoadSpline();
+			if (!OverlaySpline && GEditor)
+			{
+				for (FSelectionIterator It(GEditor->GetSelectedActorIterator()); It; ++It)
+				{
+					if (AMoKuEditSplineActor* Road = Cast<AMoKuEditSplineActor>(*It))
+					{
+						OverlaySpline = Road->GetSplineComponent();
+						break;
+					}
+				}
+			}
+			if (OverlaySpline)
+			{
+				RoadVis->DrawLandscapeAttributeOverlay(OverlaySpline, PDI, View);
+			}
+		}
+	}
+
+	if (PDI->IsHitTesting())
 	{
 		return;
 	}

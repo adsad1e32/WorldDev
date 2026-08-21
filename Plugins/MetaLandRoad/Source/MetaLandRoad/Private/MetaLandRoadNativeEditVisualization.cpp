@@ -4,8 +4,34 @@
 #include "MetaLandRoadSplineComponent.h"
 #include "MetaLandRoadTypes.h"
 #include "MetaLandRoadVisProxy.h"
+#include "DynamicMeshBuilder.h"
+#include "Engine/Engine.h"
+#include "Materials/Material.h"
+#include "Materials/MaterialInterface.h"
+#include "Materials/MaterialRenderProxy.h"
+#include "RHICommandList.h"
 #include "SceneManagement.h"
 #include "Settings/LevelEditorViewportSettings.h"
+
+class FMetaLandRoadNativeEditColoredMaterialProxy final
+	: public FColoredMaterialRenderProxy
+	, public FDynamicPrimitiveResource
+{
+public:
+	FMetaLandRoadNativeEditColoredMaterialProxy(const FMaterialRenderProxy* InParent, const FLinearColor& InColor)
+		: FColoredMaterialRenderProxy(InParent, InColor)
+	{
+	}
+
+	virtual void InitPrimitiveResource(FRHICommandListBase& RHICmdList) override
+	{
+	}
+
+	virtual void ReleasePrimitiveResource() override
+	{
+		delete this;
+	}
+};
 
 static FVector RaiseNativeEditPoint(const UMetaLandRoadSplineComponent* RoadSpline, const FVector& WorldPos)
 {
@@ -69,6 +95,53 @@ static void DrawNativeEditControlPointRingPDI(
 		32,
 		SDPG_Foreground,
 		RingThickness,
+		0.0f,
+		true);
+}
+
+void MetaLandRoadNativeEditVisualization::DrawNativeEditSolidBoxPDI(
+	FPrimitiveDrawInterface* PDI,
+	const FSceneView* View,
+	const FVector& CenterWorld,
+	bool bSelected,
+	bool bHovered)
+{
+	if (!PDI)
+	{
+		return;
+	}
+
+	FVector RingAxisX = FVector::ForwardVector;
+	FVector RingAxisY = FVector::RightVector;
+	GetNativeEditRingGroundAxes(RingAxisX, RingAxisY);
+
+	const float DesiredPx = (bSelected ? 32.0f : (bHovered ? 28.0f : 24.0f)) * NativeEditRingDisplayScale;
+	const float WorldRadius = View
+		? GetNativeEditRingWorldRadius(View, CenterWorld, RingAxisX, RingAxisY, DesiredPx)
+		: 60.0f;
+	const float Half = WorldRadius * 0.42f;
+
+	const FLinearColor Pink = FLinearColor(FMetaLandRoadEditorColors::SplineColor);
+	const FLinearColor Color = bSelected
+		? FLinearColor::Yellow
+		: (bHovered ? FLinearColor(FMetaLandRoadEditorColors::HoverColor) : Pink);
+
+	UMaterialInterface* ParentMat = GEngine ? GEngine->ArrowMaterial : nullptr;
+	if (ParentMat && ParentMat->GetRenderProxy())
+	{
+		FMetaLandRoadNativeEditColoredMaterialProxy* MaterialProxy =
+			new FMetaLandRoadNativeEditColoredMaterialProxy(ParentMat->GetRenderProxy(), Color);
+		PDI->RegisterDynamicResource(MaterialProxy);
+		DrawBox(PDI, FTransform(CenterWorld).ToMatrixNoScale(), FVector(Half), MaterialProxy, SDPG_Foreground);
+		return;
+	}
+
+	DrawWireBox(
+		PDI,
+		FBox::BuildAABB(CenterWorld, FVector(Half)),
+		Color,
+		SDPG_Foreground,
+		bSelected || bHovered ? 3.0f : 2.0f,
 		0.0f,
 		true);
 }

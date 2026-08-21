@@ -281,6 +281,12 @@ public:
 	// 假如当前道路为DynamicMesh 则需要刷新
 	virtual void RefreshDynamicRoadMesh();
 
+	/** Copy the selected (or Begin) landscape key falloff onto RoadHeightmapSettings. */
+	void SyncHeightmapFalloffFromLandscapeKey(int32 SectionIndex, int32 KeyIndex);
+
+	/** Write RoadHeightmapSettings.FalloffSettings into the selected key, or Begin+End if none. */
+	void PushHeightmapFalloffToLandscapeKeys();
+
 	/**
 	 * Debug: recook Start/End/TrimZone junctions + refresh this road (no redraw).
 	 * Details panel button under MetaLandRoad|Debug.
@@ -659,13 +665,14 @@ private:
 	/** MetaRoad-style mesh: per-lane BuildLinearApproximation strips via GenerateCombinedLaneDynamicMesh. */
 	FDynamicMesh3* GenerateRoadFromLaneLayoutAsDynamicMesh(
 		UMetaLandRoadSplineComponent* RoadSplineComponent,
-		float RoadHeightOffset = 10.0f,
+		float RoadHeightOffset = 0.0f,
 		bool bGenerateUVs = true);
 
 private:
 
 	bool bIsDragging;
 	bool bSkipConstruction;
+	bool bSyncingLandscapeHeightFalloff = false;
 	TSharedPtr<FLegacyEdModeWidgetHelper> WidgetHelper;
 
 	struct FTrunkPathCache

@@ -9,6 +9,7 @@
 #include "EditSplineRoadInfo.h"
 #include "WorldEditorSettings.h"
 #include "Editor.h"
+#include "Containers/Ticker.h"
 
 #include "SplineRoadEditorSubsystem.h"
 
@@ -127,6 +128,14 @@ void AWorldLandscapeBlueprintBrush::BeginDestroy()
 		OnLevelActorDeletedHandle.Reset();
 
 		IRoadBrushActorInterface::GetOnRoadBrushActorChangedEvent().RemoveAll(this);
+
+#if WITH_EDITOR
+		if (OnMapOpenedHandle.IsValid())
+		{
+			FEditorDelegates::OnMapOpened.Remove(OnMapOpenedHandle);
+			OnMapOpenedHandle.Reset();
+		}
+#endif
 	}
 
 	Super::BeginDestroy();
@@ -539,8 +548,32 @@ void AWorldLandscapeBlueprintBrush::RegisterDelegates()
 			{
 				const bool bTriggerEvents = false;
 				UpdateActors(bTriggerEvents);
+				if (World && World->IsEditorWorld())
+				{
+					RequestInitialLandscapeUpdate();
+				}
 			}
 		});
+
+#if WITH_EDITOR
+	if (!OnMapOpenedHandle.IsValid())
+	{
+		OnMapOpenedHandle = FEditorDelegates::OnMapOpened.AddLambda([this](const FString& /*Filename*/, bool /*bAsTemplate*/)
+		{
+			TWeakObjectPtr<AWorldLandscapeBlueprintBrush> WeakBrush(this);
+			FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+				[WeakBrush](float)
+				{
+					if (AWorldLandscapeBlueprintBrush* Brush = WeakBrush.Get())
+					{
+						Brush->RequestInitialLandscapeUpdate();
+					}
+					return false;
+				}),
+				0.25f);
+		});
+	}
+#endif
 
 	OnLevelAddedToWorldHandle = FWorldDelegates::LevelAddedToWorld.AddLambda([this](ULevel* Level, UWorld* World)
 		{
@@ -708,6 +741,18 @@ void AWorldLandscapeBlueprintBrush::PostRegisterAllComponents()
 			}
 
 			UpdateActors();
+
+			TWeakObjectPtr<AWorldLandscapeBlueprintBrush> WeakBrush(this);
+			FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+				[WeakBrush](float)
+				{
+					if (AWorldLandscapeBlueprintBrush* Brush = WeakBrush.Get())
+					{
+						Brush->RequestInitialLandscapeUpdate();
+					}
+					return false;
+				}),
+				0.35f);
 		}
 #endif // WITH_EDITOR
 }
@@ -752,9 +797,41 @@ void AWorldLandscapeBlueprintBrush::UpdateActors(bool bInTriggerEvents)
 }
 
 
+void AWorldLandscapeBlueprintBrush::SetLandscapeStampFocusActor(AActor* Actor)
+{
+	LandscapeStampFocusActor = Actor;
+}
+
+void AWorldLandscapeBlueprintBrush::RequestInitialLandscapeUpdate()
+{
+#if WITH_EDITOR
+	if (IsTemplate() || UE::GetIsEditorLoadingPackage())
+	{
+		return;
+	}
+	if (bDidInitialLandscapeUpdate || !GetOwningLandscape())
+	{
+		return;
+	}
+
+	SetLandscapeStampFocusActor(nullptr);
+	bForceFullHeightStamp = true;
+	UpdateActors(/*bInTriggerEvents=*/false);
+	RequestLandscapeUpdate(/* bInUserTriggered = */ true);
+	bDidInitialLandscapeUpdate = true;
+	UE_LOG(LogTemp, Log, TEXT("[RoadLandscape] Initial full height update landscape=%s roads=%d"),
+		*GetNameSafe(GetOwningLandscape()),
+		ActorsAffectingLandscape.Num());
+#endif
+}
+
 void AWorldLandscapeBlueprintBrush::OnRoadBrushActorChanged(const IRoadBrushActorInterface::FRoadBrushActorChangedEventParams& InParams)
 {
 	AActor* Actor = CastChecked<AActor>(InParams.RoadBrushActor);
+	if (InParams.bShapeOrPositionChanged || InParams.bUserTriggered)
+	{
+		SetLandscapeStampFocusActor(Actor);
+	}
 	const bool bAffectsLandscape = InParams.RoadBrushActor->AffectsLandscape();
 
 	const bool bActorAlreadyAffectingLandscape = ActorsAffectingLandscape.Contains(InParams.RoadBrushActor);

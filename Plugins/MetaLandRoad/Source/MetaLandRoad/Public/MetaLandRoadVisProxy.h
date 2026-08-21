@@ -100,6 +100,28 @@ struct METALANDROAD_API HMetaLandRoadLaneWidthKeyVisProxy : public HMetaLandRoad
 	{}
 };
 
+/** Landscape attribute key on the section center-line (Standard overlay, not Alt+W/E/T). */
+struct METALANDROAD_API HMetaLandRoadAttributeKeyVisProxy : public HMetaLandRoadSectionVisProxy
+{
+	DECLARE_HIT_PROXY();
+
+	HMetaLandRoadAttributeKeyVisProxy(
+		const UMetaLandRoadSplineComponent* InComponent,
+		int InSectionIndex,
+		int InKeyIndex,
+		EHitProxyPriority InPriority = HPP_Foreground)
+		: HMetaLandRoadSectionVisProxy(InComponent, InSectionIndex, InPriority)
+		, KeyIndex(InKeyIndex)
+	{}
+
+	int KeyIndex = INDEX_NONE;
+
+	virtual EMouseCursor::Type GetMouseCursor() override
+	{
+		return EMouseCursor::CardinalCross;
+	}
+};
+
 /** Alt+W native spline edit base — mirrors engine HSplineVisProxy (not shared with section/lane proxies). */
 struct METALANDROAD_API HMetaLandRoadNativeSplineVisProxy : public HComponentVisProxy
 {

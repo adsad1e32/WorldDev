@@ -35,6 +35,14 @@ namespace MetaLandRoadNativeEditVisualization
 		const FIntPoint& MousePos,
 		float MaxPixelDistance = 20.0f);
 
+	/** Solid camera-scaled box (same radius helper as Alt+W / Alt+T rings). */
+	METALANDROAD_API void DrawNativeEditSolidBoxPDI(
+		FPrimitiveDrawInterface* PDI,
+		const FSceneView* View,
+		const FVector& CenterWorld,
+		bool bSelected,
+		bool bHovered);
+
 	METALANDROAD_API void DrawNativeEditSplineOverlay(
 		const UMetaLandRoadSplineComponent* RoadSpline,
 		FPrimitiveDrawInterface* PDI,

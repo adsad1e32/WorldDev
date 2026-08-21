@@ -1,5 +1,6 @@
 #include "ComponentVisualizers/MetaLandRoadSectionComponentVisualizer.h"
 
+#include "MetaLandRoadLaneAttribute.h"
 #include "MetaLandRoadLaneEditPick.h"
 #include "MetaLandRoadLaneVisualization.h"
 
@@ -146,6 +147,7 @@ void UMetaLandRoadSectionComponentVisualizerSelectionState::ResetSelection(bool 
 	bSectionBoundarySelected = false;
 	bLaneFacePrimSelected = false;
 	bLaneWidthMenuContext = false;
+	bAttributeKeySelected = false;
 
 	if (bSaveSplineSelection && SplinePropertyPath.IsValid())
 	{
@@ -206,6 +208,7 @@ void UMetaLandRoadSectionComponentVisualizerSelectionState::SetSelectedSection(i
 	MultiSelectedLanes.Reset();
 	SelectedKeyIndex = INDEX_NONE;
 	bSectionBoundarySelected = false;
+	bAttributeKeySelected = false;
 }
 
 void UMetaLandRoadSectionComponentVisualizerSelectionState::ClearLaneMultiSelection()
@@ -429,6 +432,69 @@ void UMetaLandRoadSectionComponentVisualizerSelectionState::SetWidthKeySelection
 		bLaneWidthMenuContext = true;
 	}
 	bLaneFacePrimSelected = false;
+	bAttributeKeySelected = false;
+}
+
+void UMetaLandRoadSectionComponentVisualizerSelectionState::SetAttributeKeySelection(int32 SectionIndex, int32 KeyIndex)
+{
+	if (!SplinePropertyPath.IsValid() || SectionIndex == INDEX_NONE)
+	{
+		return;
+	}
+
+	UMetaLandRoadSplineComponent* Component = GetSelectedSpline();
+	if (!IsValid(Component) || !Component->GetLaneSections().IsValidIndex(SectionIndex))
+	{
+		return;
+	}
+
+	const FMetaLandRoadLaneAttribute* Track =
+		Component->GetLaneSection(SectionIndex).FindAttribute(FMetaLandRoadAttributeRegistry::TypeLandscape);
+	if (!Track || !Track->Keys.IsValidIndex(KeyIndex))
+	{
+		return;
+	}
+
+	ClearLaneMultiSelection();
+	SelectedSectionIndex = SectionIndex;
+	SelectedLaneIndex = LANE_INDEX_NONE;
+	SelectedKeyIndex = KeyIndex;
+	bAttributeKeySelected = true;
+	bLaneWidthMenuContext = false;
+	bLaneFacePrimSelected = false;
+	bSectionBoundarySelected = false;
+	State = EMetaLandRoadSectionSelectionState::Key;
+}
+
+void UMetaLandRoadSectionComponentVisualizerSelectionState::ClearAttributeKeySelection()
+{
+	if (!bAttributeKeySelected)
+	{
+		return;
+	}
+
+	bAttributeKeySelected = false;
+	SelectedKeyIndex = INDEX_NONE;
+	if (SelectedSectionIndex != INDEX_NONE)
+	{
+		State = EMetaLandRoadSectionSelectionState::Section;
+	}
+	else if (SplinePropertyPath.IsValid())
+	{
+		State = EMetaLandRoadSectionSelectionState::Component;
+	}
+	else
+	{
+		State = EMetaLandRoadSectionSelectionState::None;
+	}
+}
+
+bool UMetaLandRoadSectionComponentVisualizerSelectionState::HasAttributeKeySelection() const
+{
+	return bAttributeKeySelected
+		&& SelectedSectionIndex != INDEX_NONE
+		&& SelectedKeyIndex != INDEX_NONE
+		&& GetStateVerified() >= EMetaLandRoadSectionSelectionState::Key;
 }
 
 void UMetaLandRoadSectionComponentVisualizerSelectionState::ClearWidthKeySelection()
@@ -473,6 +539,18 @@ EMetaLandRoadSectionSelectionState UMetaLandRoadSectionComponentVisualizerSelect
 				{
 					return EMetaLandRoadSectionSelectionState::Lane;
 				}
+			}
+
+			if (bAttributeKeySelected && State >= EMetaLandRoadSectionSelectionState::Key)
+			{
+				const FMetaLandRoadLaneAttribute* Track =
+					Component->GetLaneSection(SelectedSectionIndex).FindAttribute(
+						FMetaLandRoadAttributeRegistry::TypeLandscape);
+				if (!Track || !Track->Keys.IsValidIndex(SelectedKeyIndex))
+				{
+					return EMetaLandRoadSectionSelectionState::Section;
+				}
+				return EMetaLandRoadSectionSelectionState::Key;
 			}
 
 			if (State >= EMetaLandRoadSectionSelectionState::Lane)

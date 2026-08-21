@@ -1,7 +1,6 @@
 #include "MoKuSplineActorCustomization.h"
 #include "DetailLayoutBuilder.h"
 #include "DetailCategoryBuilder.h"
-#include "MoKuEditSplineActor.h"
 
 #define LOCTEXT_NAMESPACE "MoKuSplineActorCustomization"
 

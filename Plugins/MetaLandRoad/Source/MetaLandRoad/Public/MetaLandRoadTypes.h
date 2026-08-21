@@ -232,6 +232,8 @@ enum class EMetaLandRoadEditorVisMode : uint8
 	Connection,
 	/** Alt+T: per-lane boundary edit (no main center line). */
 	Lane,
+	/** Reserved: pin attribute types and edit keys along S. */
+	Attribute,
 };
 
 /** Interactive draw tool: detected junction shape (MetaLandRoad editor mode only). */
@@ -458,6 +460,12 @@ struct METALANDROAD_API FMetaLandRoadLane
 
 	void Trim(bool bFitWidth);
 
+	FMetaLandRoadLaneAttribute* PinAttribute(FName TypeId);
+	bool UnpinAttribute(FName TypeId);
+	FMetaLandRoadLaneAttribute* FindAttribute(FName TypeId);
+	const FMetaLandRoadLaneAttribute* FindAttribute(FName TypeId) const;
+	bool EvalAttributeAt(FName TypeId, double SOffset, TInstancedStruct<FMetaLandRoadLaneAttributeValue>& OutValue) const;
+
 private:
 	TWeakPtr<FMetaLandRoadLayout*> OwnedRoadLayout;
 
@@ -525,6 +533,13 @@ struct METALANDROAD_API FMetaLandRoadLaneSection
 	FMetaLandRoadLane& GetLaneByIndex(int LaneIndex);
 	bool CheckLaneIndex(int LaneIndex) const;
 	void Trim(bool bFitWidth);
+
+	FMetaLandRoadLaneAttribute* PinAttribute(FName TypeId);
+	bool UnpinAttribute(FName TypeId);
+	FMetaLandRoadLaneAttribute* FindAttribute(FName TypeId);
+	const FMetaLandRoadLaneAttribute* FindAttribute(FName TypeId) const;
+	bool EvalAttributeAt(FName TypeId, double InSOffset, TInstancedStruct<FMetaLandRoadLaneAttributeValue>& OutValue) const;
+	bool EvalLandscapeAt(double InSOffset, FMetaLandRoadLandscapeAttributeValue& OutValue) const;
 
 	double EvalLaneROffset(int LaneIndex, double InSOffset, double Alpha = 1.0) const;
 

@@ -203,7 +203,7 @@ public:
 	}
 
 	/** Convert Linear keys to Curve so bends subdivide instead of hard corners. */
-	void EnsureCurvePointTypesForSmoothCorners(const TArray<int32>& KeyIndices)
+	void EnsureCurvePointTypesForSmoothCorners(const TArray<int32>& KeyIndices, bool bUpdateSplineAfter = true)
 	{
 		bool bChanged = false;
 		for (const int32 KeyIdx : KeyIndices)
@@ -219,13 +219,13 @@ public:
 				bChanged = true;
 			}
 		}
-		if (bChanged)
+		if (bChanged && bUpdateSplineAfter)
 		{
 			UpdateSpline();
 		}
 	}
 
-	void EnsureAllCurvePointTypesForSmoothCorners()
+	void EnsureAllCurvePointTypesForSmoothCorners(bool bUpdateSplineAfter = true)
 	{
 		TArray<int32> Keys;
 		const int32 Num = GetNumberOfSplinePoints();
@@ -234,7 +234,7 @@ public:
 		{
 			Keys.Add(i);
 		}
-		EnsureCurvePointTypesForSmoothCorners(Keys);
+		EnsureCurvePointTypesForSmoothCorners(Keys, bUpdateSplineAfter);
 	}
 
 	void BuildLinearApproximation(
@@ -244,56 +244,12 @@ public:
 		double S1,
 		int32 InReparamStepsPerSegment,
 		int32 MinNumSteps,
-		ESplineCoordinateSpace::Type CoordinateSpace) const
-	{
-		OutPoints.Reset();
-
-		const double S0_Param = GetInputKeyValueAtDistanceAlongSpline(S0);
-		const double S1_Param = GetInputKeyValueAtDistanceAlongSpline(S1);
-		if (S1_Param <= S0_Param + KINDA_SMALL_NUMBER)
-		{
-			return;
-		}
-
-		// World-length driven density. Do NOT force MinNumSteps=20 on short spans —
-		// that was ~20 rings on a few meters (lane-extend orange brick of faces).
-		const double SpanLenCm = FMath::Max(S1 - S0, KINDA_SMALL_NUMBER);
-		// Denser rings so Hermite bends read round (300cm was two-chord faceted).
-		constexpr double TargetSampleCm = 140.0;
-		const int32 LengthBasedSteps = FMath::Max(2, FMath::CeilToInt(SpanLenCm / TargetSampleCm));
-		const int32 KeyBasedSteps = FMath::Max(
-			1,
-			static_cast<int32>((S1_Param - S0_Param) * InReparamStepsPerSegment + 0.5));
-		// Prefer denser of length/key so curved 1-span roads keep rings.
-		int32 NumStep = FMath::Max(KeyBasedSteps, LengthBasedSteps);
-		if (SpanLenCm >= static_cast<double>(MinNumSteps) * TargetSampleCm * 0.35)
-		{
-			NumStep = FMath::Max(NumStep, FMath::Min(MinNumSteps, LengthBasedSteps + 2));
-		}
-		NumStep = FMath::Max(NumStep, 2);
-		NumStep += EstimateCornerExtraSteps(S0_Param, S1_Param);
-		NumStep = FMath::Clamp(NumStep, 2, 48);
-
-		const double Step = (S1_Param - S0_Param) / static_cast<double>(NumStep);
-		for (int32 i = 0; i <= NumStep; ++i)
-		{
-			const float Param = static_cast<float>(S0_Param + static_cast<double>(i) * Step);
-			// Match MetaRoad: right vector at the same input key as Position.Eval.
-			const FVector RightVectorLocal = GetRightVectorAtSplineInputKey(Param, ESplineCoordinateSpace::Local);
-			const double RightOffset = RightOffsetFunc(GetDistanceAlongSplineAtSplineInputKey(Param));
-			FVector Point = SplineCurves.Position.Eval(Param, FVector::ZeroVector) + RightVectorLocal * RightOffset;
-			if (CoordinateSpace == ESplineCoordinateSpace::World)
-			{
-				Point = GetComponentTransform().TransformPosition(Point);
-			}
-			OutPoints.Emplace(Point, Param);
-		}
-	}
+		ESplineCoordinateSpace::Type CoordinateSpace) const;
 
 	/** Build a combined road mesh by triangulating each lane separately (MetaRoad-style). */
 	virtual bool GenerateCombinedLaneDynamicMesh(
 		UE::Geometry::FDynamicMesh3& OutMesh,
-		float RoadHeightOffset = 10.0f,
+		float RoadHeightOffset = 0.0f,
 		bool bGenerateUVs = true);
 
 	/** Total half-width (left/right outer edge distance from center) at distance S. */

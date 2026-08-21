@@ -5,6 +5,9 @@
 #include "CoreMinimal.h"
 #include "Toolkits/BaseToolkit.h"
 #include "MetaLandRoadEditorMode.h"
+#include "UObject/UnrealType.h"
+
+class UMetaLandRoadSplineComponent;
 
 
 /**
@@ -40,10 +43,23 @@ private:
 
 
 	FDelegateHandle SelectionDelegateHandle;
+	FString AttributeSearchText;
 
 
 protected:
 	//TSharedPtr<IDetailsView> ModeDetailsView;
 	void UpdateActiveToolProperties();
 	void RefreshDetailsWidget(UObject* SelectedObject);
+	TSharedRef<SWidget> BuildLandscapeAttributePanel();
+	void OnLandscapeAttributeClicked();
+	void OnLandscapeShowClicked();
+	void OnLandscapeHideClicked();
+	UMetaLandRoadSplineComponent* FindSelectedRoadSpline() const;
+	void EnsureLandscapeKeyDetailsView();
+	void RefreshLandscapeKeyDetails();
+	void OnLandscapeKeyDetailsFinished(const FPropertyChangedEvent& PropertyChangedEvent);
+
+	TSharedPtr<class IStructureDetailsView> LandscapeKeyDetailsView;
+	TSharedPtr<class FStructOnScope> LandscapeKeyEditStruct;
+	bool bRefreshingLandscapeKeyDetails = false;
 };

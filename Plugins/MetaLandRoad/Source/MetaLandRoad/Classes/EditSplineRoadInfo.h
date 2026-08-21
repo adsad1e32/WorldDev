@@ -104,6 +104,15 @@ public:
 
 	virtual UTextureRenderTarget2D* RenderLayer_Native(const FLandscapeBrushParameters& InParameters) override;
 
+#if WITH_EDITOR
+	virtual TArray<UE::Landscape::EditLayers::FEditLayerRenderItem> GetRenderItems(const UE::Landscape::EditLayers::FMergeContext* InMergeContext) const override;
+#endif
+
+	AActor* ResolveHeightStampFocusActor() const;
+	void CollectHeightStampRoads(TArray<AMoKuEditBaseActor*>& InOutRoads) const;
+	void BuildLayerRoadList(bool bHeightmapRender, FName WeightmapLayerName, TArray<AMoKuEditBaseActor*>& OutRoads);
+	FBox ComputeHeightStampWorldBounds(const TArray<AMoKuEditBaseActor*>& Roads) const;
+
 	virtual void Initialize_Native(const FTransform& InLandscapeTransform,
 		const FIntPoint& InLandscapeSize,
 		const FIntPoint& InLandscapeRenderTargetSize) override;
@@ -114,6 +123,14 @@ public:
 	/** Allocate RTs + log sizes + open CombinedShapeAndHeight preview when Details shows None. */
 	UFUNCTION(CallInEditor, Category = "Render Targets", meta = (DisplayName = "Debug Allocate And Show RTs"))
 	void DebugForceAllocateRenderTargets();
+
+	/** Open the height blender RT: solid core = Edge Offset, soft rim = Falloff Width. */
+	UFUNCTION(CallInEditor, Category = "Render Targets", meta = (DisplayName = "Debug Open Height Falloff RT"))
+	void DebugOpenHeightFalloffRT();
+
+	/** Open the live profile height RT (no PNG). Drag a road first. */
+	UFUNCTION(CallInEditor, Category = "Render Targets", meta = (DisplayName = "Debug Open Profile RT"))
+	void DebugDumpProfileRT();
 #endif
 
 	UFUNCTION(BlueprintCallable, BlueprintPure, meta = (Category = "Debug"))
@@ -163,6 +180,14 @@ public:
 
 	UPROPERTY(VisibleAnywhere, Transient, meta = (Category = "Render Targets"))
 	TObjectPtr<UTextureRenderTarget2D> WeightmapRTB = nullptr;
+
+	/** Same size as CombinedResult — profile shader writes here so the engine merge gets a new RT, not the input. */
+	UPROPERTY(VisibleAnywhere, Transient, meta = (Category = "Render Targets"))
+	TObjectPtr<UTextureRenderTarget2D> CSCombinedWriteRT = nullptr;
+
+	/** Ping-pong pair for multi-road profile stamps (avoid read/write of the same RT). */
+	UPROPERTY(VisibleAnywhere, Transient, meta = (Category = "Render Targets"))
+	TObjectPtr<UTextureRenderTarget2D> CSCombinedWriteRTB = nullptr;
 
 	/** Flat elevation curve RT (256x1) so CacheDistanceField/MeshBrush CurveRT pins are never unbound. */
 	UPROPERTY(VisibleAnywhere, Transient, meta = (Category = "Render Targets"))
@@ -278,6 +303,20 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, meta=(Category="Debug"))
 	bool DisableBrushTextureEffects = true;
 
+	/**
+	 * Height RT: centerline profile writes CombinedResult from spline Z + landscape keys.
+	 * No Landmass / JumpFlood on the height path. Junctions stay JumpFlood for weight.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, meta = (Category = "Settings"))
+	bool bUseCenterlineProfileCS = true;
+
+	/**
+	 * Kept for existing maps. Height always conforms to the visible road mesh Z;
+	 * CombinedResult is only used to fade the shoulders.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, meta = (Category = "Settings"))
+	bool bRebuildHeightFromSpline = true;
+
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, meta = (Category = "Settings"))
 	float CanvasSegmentSize = 1024.0f;
@@ -297,6 +336,9 @@ private:
 		FName WeightmapLayerName;
 		int32 RTIndex = 0;
 		int32 RoadRTIndex = 0;
+		FTransform RenderAreaWorldTransform;
+		FIntPoint RenderAreaSize = FIntPoint::ZeroValue;
+		UTextureRenderTarget2D* CSHeightWriteRT = nullptr;
 	};
 
 	struct FBrushActorRenderContext
@@ -329,6 +371,8 @@ private:
 	virtual bool BrushRenderSetup();
 	virtual bool CreateMIDs();
 	virtual void RenderBrushActorContext(FEditorBrushRenderContext& BrushRenderContext, FBrushActorRenderContext& BrushActorRenderContext);
+	void StampOneRoadBrushPass(FEditorBrushRenderContext& BrushRenderContext, FBrushActorRenderContext& BrushActorRenderContext, bool bForceRecapture);
+	bool StampRoadCenterlineProfileCS(FEditorBrushRenderContext& BrushRenderContext, AMoKuEditSplineActor* Road);
 	virtual bool SetupRoadSplineRenderMIDs(const FBrushActorRenderContext& BrushActorRenderContext, bool bRestoreMIDs, TArray<UMaterialInterface*>& InOutMIDs);
 	virtual void CacheBrushDistanceField(const FBrushActorRenderContext& BrushActorRenderContext);
 	virtual void CaptureRoadDepth(const FBrushActorRenderContext& BrushActorRenderContext);

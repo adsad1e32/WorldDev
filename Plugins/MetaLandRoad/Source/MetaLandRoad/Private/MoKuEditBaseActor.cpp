@@ -290,6 +290,15 @@ void AMoKuEditBaseActor::UpdateBrushMaterial()
 {
 }
 
+void AMoKuEditBaseActor::InvalidateLandscapeDistanceFieldCache()
+{
+	InitSceneManagement();
+	if (AWorldSceneManagement* Manager = SceneManagement.Get())
+	{
+		Manager->InvalidateBrushDistanceFieldCache();
+	}
+}
+
 void AMoKuEditBaseActor::NotifyLandscapeBrushChanged(bool bShapeOrPositionChanged, bool bWeightmapSettingsChanged, bool bUserTriggered)
 {
 	if (!bAffectsLandscape || bSuppressLandscapeBrushNotify)
@@ -298,6 +307,10 @@ void AMoKuEditBaseActor::NotifyLandscapeBrushChanged(bool bShapeOrPositionChange
 	}
 	EnsureDefaultTerrainInfluenceSettings();
 	InitSceneManagement();
+	if (bShapeOrPositionChanged || bWeightmapSettingsChanged)
+	{
+		InvalidateLandscapeDistanceFieldCache();
+	}
 	FOnRoadBodyChangedParams Params;
 	Params.PropertyChangedEvent.ChangeType = EPropertyChangeType::ValueSet;
 	Params.bShapeOrPositionChanged = bShapeOrPositionChanged;

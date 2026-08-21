@@ -48,6 +48,12 @@ public:
 
     const TArray<TWeakInterfacePtr<IRoadBrushActorInterface>>& GetActorsAffectingLandscape() const { return ActorsAffectingLandscape; }
 
+	/** Last road/junction that requested a landscape update (move / edit). */
+	AActor* GetLandscapeStampFocusActor() const { return LandscapeStampFocusActor.Get(); }
+	void SetLandscapeStampFocusActor(AActor* Actor);
+
+	/** Full-landscape remesh after map open. Saved heightmaps stay flat until this runs. */
+	void RequestInitialLandscapeUpdate();
 
     UFUNCTION(BlueprintCallable, Category = "Cache", meta = (DeterminesOutputType = "CacheClass"))
     UObject* GetActorCache(AActor* InActor, TSubclassOf<UObject> CacheClass) const;
@@ -76,6 +82,7 @@ private:
 #if WITH_EDITOR
     FDelegateHandle OnLoadedActorAddedToLevelEventHandle;
     FDelegateHandle OnLoadedActorRemovedFromLevelEventHandle;
+    FDelegateHandle OnMapOpenedHandle;
 #endif
 
 private:
@@ -96,10 +103,17 @@ protected:
     void UpdateActors(bool bTriggerEvents = true);
     void UpdateAffectedWeightmaps();
 
+	/** When true, GetRenderItems does not shrink to a dirty box (map-open remesh). */
+	bool bForceFullHeightStamp = false;
+	bool bDidInitialLandscapeUpdate = false;
+
 
 
     UPROPERTY(Transient, DuplicateTransient, VisibleAnywhere, AdvancedDisplay, meta = (Category = "Debug"))
 	TMap<TSoftObjectPtr<AActor>, TObjectPtr<UObject>> Cache;
+
+	UPROPERTY(Transient)
+	TWeakObjectPtr<AActor> LandscapeStampFocusActor;
 
 
 

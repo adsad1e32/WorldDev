@@ -1,9 +1,8 @@
 #include "MetaLandRoadEditorColors.h"
-#include "Styling/AppStyle.h"
-#include "Styling/StyleColors.h"
 
 const FColor FMetaLandRoadEditorColors::EmptyColor(106, 145, 196);
-const FColor FMetaLandRoadEditorColors::SelectedColor = FStyleColors::AccentOrange.GetSpecifiedColor().ToFColor(true);
+// Hardcoded — FStyleColors::GetSpecifiedColor walks UPackage during static init and crashes if the module loads early.
+const FColor FMetaLandRoadEditorColors::SelectedColor(255, 117, 56);
 const FColor FMetaLandRoadEditorColors::ReadOnlyColor(255, 0, 255, 255);
 const FColor FMetaLandRoadEditorColors::AccentColorHi(129, 106, 196);
 const FColor FMetaLandRoadEditorColors::AccentColorLow(64, 53, 98);

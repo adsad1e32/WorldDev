@@ -37,16 +37,23 @@ struct FRoadFalloffSettings
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = FalloffSettings, meta = (EditCondition = "FalloffMode == ERoadBrushFalloffMode::Angle"))
 	float FalloffAngle;
 
+	/**
+	 * Gradient only (cm). Starts at the outer edge of Edge Offset and grows outward.
+	 * Offset=700 and Width=500 → 500cm of fade beyond the 700cm solid, not inside it.
+	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = FalloffSettings, meta = (ClampMin = "0.1", EditCondition = "FalloffMode == ERoadBrushFalloffMode::Width"))
 	float FalloffWidth;
 
-	/** Shifts the height soft-rim relative to the mesh silhouette (cm). Fully editable. */
+	/**
+	 * Solid plateau beyond the road mesh (cm). Full road-surface height, no fade.
+	 * Falloff Width is added outside this band. Total extra = Offset + Width.
+	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = FalloffSettings)
 	float EdgeOffset;
 
 	/**
-	 * Extra height bias on landscape stamp (cm), added on top of road mesh depth.
-	 * Terrain always follows the road mesh; raise ZOffset for taller embankment.
+	 * Extra height bias (cm) on top of road mesh depth. Height uses AlphaBlend:
+	 * positive raises, negative cuts, sides fall off with Falloff Width.
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = FalloffSettings)
 	float ZOffset;

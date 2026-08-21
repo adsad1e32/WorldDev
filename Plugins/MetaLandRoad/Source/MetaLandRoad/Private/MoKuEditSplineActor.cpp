@@ -12,6 +12,10 @@
 #include "MoKuEditSplinesComponent.h"
 #include "MetaLandRoadProfile.h"
 #include "MetaLandRoadSplineComponent.h"
+#include "MetaLandRoadModule.h"
+#include "ComponentVisualizers/MetaLandRoadSectionComponentVisualizer.h"
+#include "MetaLandRoadModule.h"
+#include "ComponentVisualizers/MetaLandRoadSectionComponentVisualizer.h"
 #include "DynamicMesh/DynamicMesh3.h"
 #include "DynamicMesh/MeshNormals.h"
 #include "EditSplineRoadInfo.h"
@@ -1094,7 +1098,7 @@ void AMoKuEditSplineActor::RefreshDynamicRoadMesh()
 			JunctionConnections["Start"].Empty();
 			JunctionConnections["End"].Empty();
 
-			if (FDynamicMesh3* ResultMesh = GenerateRoadFromLaneLayoutAsDynamicMesh(SplineComponent, 10.0f, true))
+			if (FDynamicMesh3* ResultMesh = GenerateRoadFromLaneLayoutAsDynamicMesh(SplineComponent, 0.0f, true))
 			{
 				DynamicMesh->SetMesh(MoveTemp(*ResultMesh));
 
@@ -1147,11 +1151,7 @@ void AMoKuEditSplineActor::RefreshDynamicRoadMesh()
 
 		if (!UE::GetIsEditorLoadingPackage())
 		{
-			FOnRoadBodyChangedParams Params;
-			Params.bShapeOrPositionChanged = true;
-			Params.bUserTriggered = false;
-			Params.PropertyChangedEvent.ChangeType = EPropertyChangeType::ValueSet;
-			OnRoadBodyChanged(Params);
+			NotifyLandscapeBrushChanged(true, false, true);
 		}
 	}
 
@@ -1322,6 +1322,13 @@ void AMoKuEditSplineActor::UpdateOctreeInfo()
 void AMoKuEditSplineActor::PostEditChangeChainProperty(FPropertyChangedChainEvent& PropertyChangedEvent)
  {
 	 Super::PostEditChangeChainProperty(PropertyChangedEvent);
+	 if (PropertyChangedEvent.MemberProperty
+		 && PropertyChangedEvent.MemberProperty->GetFName() == GET_MEMBER_NAME_CHECKED(AMoKuEditBaseActor, RoadHeightmapSettings)
+		 && PropertyChangedEvent.ChangeType != EPropertyChangeType::Interactive)
+	 {
+		 PushHeightmapFalloffToLandscapeKeys();
+		 NotifyLandscapeBrushChanged(true, false, true);
+	 }
 	 //通过反射获取当前参数信息修改屏幕Gizmo显示
 	 FProperty* PropertyThatChanged = PropertyChangedEvent.MemberProperty;
 	 const FEditPropertyChain& PropertyChain = PropertyChangedEvent.PropertyChain;
@@ -1412,6 +1419,86 @@ void AMoKuEditSplineActor::PostEditChangeChainProperty(FPropertyChangedChainEven
 	 
 
  }
+
+void AMoKuEditSplineActor::SyncHeightmapFalloffFromLandscapeKey(int32 SectionIndex, int32 KeyIndex)
+{
+	if (bSyncingLandscapeHeightFalloff || !SplineComponent)
+	{
+		return;
+	}
+
+	if (!SplineComponent->GetLaneSections().IsValidIndex(SectionIndex))
+	{
+		return;
+	}
+
+	const FMetaLandRoadLaneAttribute* Track =
+		SplineComponent->GetLaneSection(SectionIndex).FindAttribute(FMetaLandRoadAttributeRegistry::TypeLandscape);
+	FRoadFalloffSettings Falloff;
+	if (!Track || !Track->GetKeyFalloff(KeyIndex, Falloff))
+	{
+		return;
+	}
+
+	bSyncingLandscapeHeightFalloff = true;
+	RoadHeightmapSettings.FalloffSettings = Falloff;
+	bSyncingLandscapeHeightFalloff = false;
+}
+
+void AMoKuEditSplineActor::PushHeightmapFalloffToLandscapeKeys()
+{
+	if (bSyncingLandscapeHeightFalloff || !SplineComponent)
+	{
+		return;
+	}
+
+	MetaLandRoadProfile::EnsureLandscapeAttributeOnSections(SplineComponent);
+	SplineComponent->Modify();
+
+	int32 TargetSection = 0;
+	int32 TargetKey = INDEX_NONE;
+	if (const TSharedPtr<FMoKuEditSplinesComponentVisualizer> RoadVis =
+		FMetaLandRoadModule::Get().GetRoadComponentVisualizer())
+	{
+		if (RoadVis->HasSelectedLandscapeAttributeKey()
+			&& RoadVis->GetEditedMetaLandRoadSpline() == SplineComponent)
+		{
+			TargetSection = RoadVis->GetSelectedSectionIndex();
+			TargetKey = RoadVis->GetSelectedLandscapeKeyDisplayIndex();
+		}
+	}
+
+	bSyncingLandscapeHeightFalloff = true;
+	ON_SCOPE_EXIT { bSyncingLandscapeHeightFalloff = false; };
+
+	TArray<FMetaLandRoadLaneSection>& Sections = SplineComponent->GetLaneSectionsMutable();
+	if (Sections.IsValidIndex(TargetSection) && TargetKey != INDEX_NONE)
+	{
+		if (FMetaLandRoadLaneAttribute* Track =
+			Sections[TargetSection].FindAttribute(FMetaLandRoadAttributeRegistry::TypeLandscape))
+		{
+			Track->ApplyFalloffToKey(TargetKey, RoadHeightmapSettings.FalloffSettings);
+		}
+		return;
+	}
+
+	for (FMetaLandRoadLaneSection& Section : Sections)
+	{
+		if (FMetaLandRoadLaneAttribute* Track =
+			Section.FindAttribute(FMetaLandRoadAttributeRegistry::TypeLandscape))
+		{
+			if (Track->Keys.Num() == 0)
+			{
+				continue;
+			}
+			Track->ApplyFalloffToKey(0, RoadHeightmapSettings.FalloffSettings);
+			if (Track->Keys.Num() >= 2)
+			{
+				Track->ApplyFalloffToKey(Track->Keys.Num() - 1, RoadHeightmapSettings.FalloffSettings);
+			}
+		}
+	}
+}
 
 void AMoKuEditSplineActor::RefreshExtraMeshViaIndex(int Index)
 {

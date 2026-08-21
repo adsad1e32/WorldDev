@@ -13,6 +13,16 @@
 #include "ScopedTransaction.h"
 #endif
 
+static FVector FlattenHorizontalRight(const FVector& Right)
+{
+	FVector Flat(Right.X, Right.Y, 0.0);
+	if (!Flat.Normalize())
+	{
+		return FVector::YAxisVector;
+	}
+	return Flat;
+}
+
 static float SumFaceWidths(const TArray<float>& Widths)
 {
 	float Sum = 0.0f;
@@ -830,6 +840,7 @@ void UMetaLandRoadSplineComponent::PostLoad()
 
 void UMetaLandRoadSplineComponent::UpdateSpline()
 {
+	EnsureAllCurvePointTypesForSmoothCorners(false);
 	FixUpSegments();
 	UpdateAutoTangents();
 	Super::UpdateSpline();
@@ -900,7 +911,7 @@ void UMetaLandRoadSplineComponent::BuildCenterLineWorldPolyline(
 
 float UMetaLandRoadSplineComponent::GetMainCenterLineHeightOffset() const
 {
-	return LaneVisualizationHeightOffset + 8.0f;
+	return 2.0f;
 }
 
 void UMetaLandRoadSplineComponent::DrawMainCenterLinePDI(
@@ -931,6 +942,7 @@ void UMetaLandRoadSplineComponent::DrawMainCenterLinePDI(
 
 void UMetaLandRoadSplineComponent::UpdateSpline(int32 EditingPointIndex)
 {
+	EnsureAllCurvePointTypesForSmoothCorners(false);
 	FixUpSegments();
 	UpdateAutoTangents(EditingPointIndex);
 	Super::UpdateSpline();
@@ -1030,7 +1042,7 @@ bool UMetaLandRoadSplineComponent::GetRoadEdgePointsAtS(
 
 	OutCenter = EvalLanePosition(SectionIndex, LANE_INDEX_NONE, S, 0.0, CoordinateSpace);
 	const float Key = GetInputKeyValueAtDistanceAlongSpline(S);
-	const FVector RightVector = GetRightVectorAtSplineInputKey(Key, CoordinateSpace);
+	const FVector RightVector = FlattenHorizontalRight(GetRightVectorAtSplineInputKey(Key, CoordinateSpace));
 	const double FallbackHalfWidth = MetaLandRoad::DefaultRoadLaneWidth * 2.0;
 
 	// Always resolve Left AND Right faces via FindSideSection. Dual-lane L|R markers
@@ -1474,6 +1486,26 @@ bool UMetaLandRoadSplineComponent::GenerateCombinedLaneDynamicMesh(
 
 		BuildFaceSpans(/*bLeftFace=*/false, /*LaneSign=*/+1);
 		BuildFaceSpans(/*bLeftFace=*/true, /*LaneSign=*/-1);
+	}
+
+	if (OutMesh.TriangleCount() > 0)
+	{
+		if (AMoKuEditSplineActor* RoadActor = Cast<AMoKuEditSplineActor>(GetOwner()))
+		{
+			if (UDynamicMeshComponent* MeshComp = RoadActor->DynamicMeshComponent)
+			{
+				MeshComp->SetRelativeLocation(FVector::ZeroVector);
+				MeshComp->SetRelativeRotation(FRotator::ZeroRotator);
+				const FTransform SplineToMesh = MeshComp->GetComponentTransform().Inverse() * GetComponentTransform();
+				if (!SplineToMesh.Equals(FTransform::Identity, 0.05))
+				{
+					for (const int32 Vid : OutMesh.VertexIndicesItr())
+					{
+						OutMesh.SetVertex(Vid, SplineToMesh.TransformPosition(OutMesh.GetVertex(Vid)));
+					}
+				}
+			}
+		}
 	}
 
 	return OutMesh.TriangleCount() > 0;
@@ -2260,6 +2292,55 @@ bool UMetaLandRoadSplineComponent::ConnectRoadToDrawAnchor(
 	return bAnyConnected;
 }
 
+void UMetaLandRoadSplineComponent::BuildLinearApproximation(
+	TArray<FMetaLandRoadSplinePositionLinearApproximation>& OutPoints,
+	const TFunction<double(double)>& RightOffsetFunc,
+	double S0,
+	double S1,
+	int32 InReparamStepsPerSegment,
+	int32 MinNumSteps,
+	ESplineCoordinateSpace::Type CoordinateSpace) const
+{
+	OutPoints.Reset();
+
+	const double S0_Param = GetInputKeyValueAtDistanceAlongSpline(S0);
+	const double S1_Param = GetInputKeyValueAtDistanceAlongSpline(S1);
+	if (S1_Param <= S0_Param + KINDA_SMALL_NUMBER)
+	{
+		return;
+	}
+
+	const double SpanLenCm = FMath::Max(S1 - S0, KINDA_SMALL_NUMBER);
+	constexpr double TargetSampleCm = 90.0;
+	const int32 LengthBasedSteps = FMath::Max(2, FMath::CeilToInt(SpanLenCm / TargetSampleCm));
+	const int32 KeyBasedSteps = FMath::Max(
+		1,
+		static_cast<int32>((S1_Param - S0_Param) * InReparamStepsPerSegment + 0.5));
+	int32 NumStep = FMath::Max(KeyBasedSteps, LengthBasedSteps);
+	if (SpanLenCm >= static_cast<double>(MinNumSteps) * TargetSampleCm * 0.35)
+	{
+		NumStep = FMath::Max(NumStep, FMath::Min(MinNumSteps, LengthBasedSteps + 2));
+	}
+	NumStep = FMath::Max(NumStep, 2);
+	NumStep += EstimateCornerExtraSteps(S0_Param, S1_Param);
+	NumStep = FMath::Clamp(NumStep, 2, 96);
+
+	const double Step = (S1_Param - S0_Param) / static_cast<double>(NumStep);
+	for (int32 i = 0; i <= NumStep; ++i)
+	{
+		const float Param = static_cast<float>(S0_Param + static_cast<double>(i) * Step);
+		const FVector RightVectorLocal = FlattenHorizontalRight(
+			GetRightVectorAtSplineInputKey(Param, ESplineCoordinateSpace::Local));
+		const double RightOffset = RightOffsetFunc(GetDistanceAlongSplineAtSplineInputKey(Param));
+		FVector Point = SplineCurves.Position.Eval(Param, FVector::ZeroVector) + RightVectorLocal * RightOffset;
+		if (CoordinateSpace == ESplineCoordinateSpace::World)
+		{
+			Point = GetComponentTransform().TransformPosition(Point);
+		}
+		OutPoints.Emplace(Point, Param);
+	}
+}
+
 FVector UMetaLandRoadSplineComponent::EvalLanePosition(int SectionIndex, int LaneIndex, double S, double Alpha, ESplineCoordinateSpace::Type CoordinateSpace) const
 {
 	const float SParam = GetInputKeyValueAtDistanceAlongSpline(S);
@@ -2273,9 +2354,7 @@ FVector UMetaLandRoadSplineComponent::EvalLanePosition(int SectionIndex, int Lan
 
 	const FMetaLandRoadLaneSection& Section = RoadLayout.Sections[SectionIndex];
 	(void)Section;
-	// Always evaluate RightVector at sample S — freezing at Section.SOffset skews lane/
-	// section guides on curves (junction mouths looked axis-aligned / 切线不对).
-	const FVector RVector = GetRightVectorAtDistanceAlongSpline(S, CoordinateSpace);
+	const FVector RVector = FlattenHorizontalRight(GetRightVectorAtDistanceAlongSpline(S, CoordinateSpace));
 	return Loc + RVector * ROffset;
 }
 

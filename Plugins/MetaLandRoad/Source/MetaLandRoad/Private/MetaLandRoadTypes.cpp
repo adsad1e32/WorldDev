@@ -1,4 +1,5 @@
 #include "MetaLandRoadTypes.h"
+#include "MetaLandRoadLaneAttribute.h"
 #include "MetaLandRoadSplineComponent.h"
 #include "MetaLandRoadLaneEditPick.h"
 
@@ -441,6 +442,47 @@ void FMetaLandRoadLaneSection::Trim(bool bFitWidth)
 	{
 		Attr.Value.Trim(0.0, SOffsetEnd_Cached - SOffset);
 	}
+}
+
+FMetaLandRoadLaneAttribute* FMetaLandRoadLaneSection::PinAttribute(FName TypeId)
+{
+	return FMetaLandRoadLaneAttribute::PinOnMap(Attributes, TypeId, EMetaLandRoadAttributeHost::SectionCenter);
+}
+
+bool FMetaLandRoadLaneSection::UnpinAttribute(FName TypeId)
+{
+	return FMetaLandRoadLaneAttribute::UnpinFromMap(Attributes, TypeId);
+}
+
+FMetaLandRoadLaneAttribute* FMetaLandRoadLaneSection::FindAttribute(FName TypeId)
+{
+	return FMetaLandRoadLaneAttribute::FindOnMap(Attributes, TypeId);
+}
+
+const FMetaLandRoadLaneAttribute* FMetaLandRoadLaneSection::FindAttribute(FName TypeId) const
+{
+	return FMetaLandRoadLaneAttribute::FindOnMap(Attributes, TypeId);
+}
+
+bool FMetaLandRoadLaneSection::EvalAttributeAt(
+	FName TypeId,
+	double InSOffset,
+	TInstancedStruct<FMetaLandRoadLaneAttributeValue>& OutValue) const
+{
+	if (const FMetaLandRoadLaneAttribute* Track = FindAttribute(TypeId))
+	{
+		return Track->EvalAt(InSOffset, OutValue);
+	}
+	return false;
+}
+
+bool FMetaLandRoadLaneSection::EvalLandscapeAt(double InSOffset, FMetaLandRoadLandscapeAttributeValue& OutValue) const
+{
+	if (const FMetaLandRoadLaneAttribute* Track = FindAttribute(FMetaLandRoadAttributeRegistry::TypeLandscape))
+	{
+		return Track->EvalAsLandscape(InSOffset, OutValue);
+	}
+	return false;
 }
 
 // =============================================================================
@@ -1078,6 +1120,38 @@ void FMetaLandRoadLane::Trim(bool bFitWidth)
 	{
 		Attr.Value.Trim(0.0, SOffsetEnd);
 	}
+}
+
+FMetaLandRoadLaneAttribute* FMetaLandRoadLane::PinAttribute(FName TypeId)
+{
+	return FMetaLandRoadLaneAttribute::PinOnMap(Attributes, TypeId, EMetaLandRoadAttributeHost::Lane);
+}
+
+bool FMetaLandRoadLane::UnpinAttribute(FName TypeId)
+{
+	return FMetaLandRoadLaneAttribute::UnpinFromMap(Attributes, TypeId);
+}
+
+FMetaLandRoadLaneAttribute* FMetaLandRoadLane::FindAttribute(FName TypeId)
+{
+	return FMetaLandRoadLaneAttribute::FindOnMap(Attributes, TypeId);
+}
+
+const FMetaLandRoadLaneAttribute* FMetaLandRoadLane::FindAttribute(FName TypeId) const
+{
+	return FMetaLandRoadLaneAttribute::FindOnMap(Attributes, TypeId);
+}
+
+bool FMetaLandRoadLane::EvalAttributeAt(
+	FName TypeId,
+	double SOffset,
+	TInstancedStruct<FMetaLandRoadLaneAttributeValue>& OutValue) const
+{
+	if (const FMetaLandRoadLaneAttribute* Track = FindAttribute(TypeId))
+	{
+		return Track->EvalAt(SOffset, OutValue);
+	}
+	return false;
 }
 
 UMetaLandRoadSplineComponent* UMetaLandRoadConnection::GetOwnedRoadSpline() const

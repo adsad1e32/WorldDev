@@ -34,6 +34,13 @@ namespace MetaLandRoadSettingsPaths
 			return true;
 		}
 
+		// LandmassBrush_* is not compatible with this stamp pipeline (rewrites whole layer).
+		if (Path.Contains(TEXT("LandmassBrush_Width"))
+			|| Path.Contains(TEXT("LandmassBrush_Angle")))
+		{
+			return true;
+		}
+
 		// Soft path set but asset missing → Project Settings shows None and Save clears it.
 		if (SoftPtr.LoadSynchronous() == nullptr)
 		{

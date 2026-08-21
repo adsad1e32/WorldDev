@@ -65,6 +65,9 @@ public:
 	/** Width-key only — keeps lane context for gizmo but clears lane-face multi-select. */
 	void SetWidthKeySelection(int32 SectionIndex, int32 LaneIndex, int32 KeyIndex);
 	void ClearWidthKeySelection();
+	void SetAttributeKeySelection(int32 SectionIndex, int32 KeyIndex);
+	void ClearAttributeKeySelection();
+	bool HasAttributeKeySelection() const;
 
 	/** Ctrl+LMB lane face fill — not set for boundary/width RMB context. */
 	bool IsLaneFacePrimSelected() const { return bLaneFacePrimSelected; }
@@ -145,6 +148,9 @@ protected:
 	bool bLaneWidthMenuContext = false;
 
 	UPROPERTY()
+	bool bAttributeKeySelected = false;
+
+	UPROPERTY()
 	EMetaLandRoadSectionSelectionState State = EMetaLandRoadSectionSelectionState::None;
 };
 
@@ -191,6 +197,11 @@ public:
 	/** Alt+W hover segment (when not hovering a key). */
 	mutable int32 CachedNativeHoveredSegment = INDEX_NONE;
 
+	/** Landscape overlay hover — reused native screen pick. */
+	mutable int32 CachedLandscapeHoveredSectionIndex = INDEX_NONE;
+	mutable int32 CachedLandscapeHoveredKeyIndex = INDEX_NONE;
+	mutable bool bCachedLandscapeHoveredLine = false;
+
 	/** Alt+T hover lane — updated from viewport screen pick each tick. */
 	mutable int32 CachedLaneHoveredSectionIndex = INDEX_NONE;
 	mutable int32 CachedLaneHoveredLaneIndex = LANE_INDEX_NONE;
@@ -222,9 +233,26 @@ public:
 	void ClearNativeKeySelection();
 	void SelectNativeEditKey(int32 KeyIndex, FEditorViewportClient* ViewportClient = nullptr);
 	bool TryHandleNativeEditMousePress(FEditorViewportClient* ViewportClient, FViewport* Viewport);
+	int32 GetSelectedSectionIndex() const;
 
 	static void EnsureNativeEditTranslateWidget(FEditorViewportClient* ViewportClient = nullptr);
 	bool HasSelectedLaneWidthKey() const;
+	bool HasSelectedLandscapeAttributeKey() const;
+	void DrawLandscapeAttributeOverlay(
+		const UMetaLandRoadSplineComponent* SplineComp,
+		FPrimitiveDrawInterface* PDI,
+		const FSceneView* View = nullptr) const;
+	bool HandleLandscapeAttributeClick(
+		FEditorViewportClient* InViewportClient,
+		HHitProxy* HitProxy,
+		const FViewportClick& Click);
+	void ClearLandscapeAttributeKeySelection();
+	bool GetSelectedLandscapeKeyValue(FMetaLandRoadLandscapeAttributeValue& OutValue, double& OutSOffset) const;
+	bool SetSelectedLandscapeKeyValue(const FMetaLandRoadLandscapeAttributeValue& InValue);
+	bool SetSelectedLandscapeKeySOffset(double InSOffset);
+	int32 GetSelectedLandscapeKeyDisplayIndex() const;
+	FText GetSelectedLandscapeKeyTitle() const;
+	bool SelectLandscapeAttributeKey(int32 SectionIndex, int32 KeyIndex);
 
 	/** Alt+E: true when main center line or selected lane strips allow Add Section. */
 	bool HasMainLineSectionMenuContext() const;
@@ -322,10 +350,29 @@ protected:
 	void OnDeleteLane();
 	void OnAddWidthKey();
 	void OnDeleteWidthKey();
+	void OnAddLandscapeKey();
+	void OnDeleteLandscapeKey();
+	bool VisProxyHandleAttributeKeyClick(FEditorViewportClient* InViewportClient, HComponentVisProxy* VisProxy, const FViewportClick& Click);
+	bool TryHandleLandscapeAttributePickClick(FEditorViewportClient* InViewportClient, HComponentVisProxy* VisProxy, const FViewportClick& Click);
+	void NotifyLandscapeAttributeChanged(UMetaLandRoadSplineComponent* SplineComp) const;
+	void ApplyLandscapeAttributeKeySelection(
+		UMetaLandRoadSplineComponent* SplineComp,
+		int32 SectionIndex,
+		int32 KeyIndex);
+	void RefreshLandscapeKeyCachedWidget(
+		UMetaLandRoadSplineComponent* SplineComp,
+		int32 SectionIndex,
+		int32 KeyIndex) const;
+	double GetLandscapeSectionLocalLength(
+		const UMetaLandRoadSplineComponent* SplineComp,
+		int32 SectionIndex) const;
+	void GenerateLandscapeAttributeContextMenuSections(FMenuBuilder& InMenuBuilder) const;
 	/** Fill segment + click position for add-point. Does not select a key. */
 	bool EnsureKeySelectionForSegmentSplit();
 	void OnSafeAddKeyToSegment();
 	bool CanAddSplinePointOnCurve() const;
+	void OnDeleteSelectedSplinePoints();
+	bool CanDeleteSelectedSplinePoints() const;
 	USplineComponent* ResolveSplineForAddPoint() const;
 	/** Insert on the existing cubic (De Casteljau) so lane-extend Bezier shape is kept. */
 	bool TryInsertSplinePointPreservingCurve();
@@ -351,5 +398,6 @@ protected:
 	bool TickEditorViewport(float DeltaTime);
 	void TickNativeEditHover();
 	void TickLaneEditHover();
+	void TickLandscapeAttributeHover();
 	void UpdateNativeHoverCacheFromViewport();
 };

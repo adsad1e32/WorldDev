@@ -38,6 +38,20 @@ public:
 	bool IsSectionMode() const { return EditorVisMode == EMetaLandRoadEditorVisMode::Section; }
 	bool IsConnectionMode() const { return EditorVisMode == EMetaLandRoadEditorVisMode::Connection; }
 	bool IsLaneEditMode() const { return EditorVisMode == EMetaLandRoadEditorVisMode::Lane; }
+	bool IsAttributeMode() const { return EditorVisMode == EMetaLandRoadEditorVisMode::Attribute; }
+
+	bool IsLandscapeAttributeSelected() const { return bLandscapeAttributeSelected; }
+	void SetLandscapeAttributeSelected(bool bSelected);
+	bool IsLandscapeAttributeOverlayRequested() const { return bShowLandscapeAttributeOverlay; }
+	void SetLandscapeAttributeOverlayVisible(bool bVisible);
+	/** Exit Alt+W / Alt+E / Alt+T so Landscape overlay can draw on the current main line. */
+	void EnterLandscapeAttributeOverlay();
+	/** Hide Landscape keys/curve and clear the Landscape selection. */
+	void HideLandscapeAttributeDisplay();
+	void BroadcastLandscapeKeyEditorRefresh();
+	FSimpleMulticastDelegate LandscapeKeyEditorRefresh;
+	/** Show is on, and not Alt+W / Alt+E / Alt+T / draw tool. */
+	bool ShouldDrawLandscapeAttributeOverlay() const;
 
 	bool IsRoadSectionLineVisMode() const { return IsSectionMode(); }
 	bool IsNativeSplineEditMode() const { return IsNativeEditMode(); }
@@ -73,6 +87,7 @@ public:
 	TSharedPtr<FMoKuEditSplinesComponentVisualizer> GetRoadComponentVisualizer() const;
 
 private:
+	void RegisterEditorFeatures();
 	void OnLevelActorAddedToWorld(AActor* Actor);
 	void OnEditorActorPicked(AActor* PickedActor);
 	void RegisterComponentVisualizer(FName ComponentClassName, TSharedPtr<FComponentVisualizer> Visualizer);
@@ -89,6 +104,8 @@ private:
 
 	TArray<FName> RegisteredComponentClassNames;
 	FDelegateHandle PostEngineInitHandle;
+	FDelegateHandle EditorFeaturesInitHandle;
+	bool bEditorFeaturesRegistered = false;
 	FDelegateHandle ActorPickerHandle;
 	FDelegateHandle LevelEditorModuleChangedHandle;
 	FDelegateHandle EditorSelectionChangedHandle;
@@ -97,6 +114,8 @@ private:
 	bool bComponentVisualizersRegistered = false;
 	bool bSectionLineHotkeyMapped = false;
 	EMetaLandRoadEditorVisMode EditorVisMode = EMetaLandRoadEditorVisMode::Standard;
+	bool bLandscapeAttributeSelected = false;
+	bool bShowLandscapeAttributeOverlay = false;
 	TWeakObjectPtr<UMetaLandRoadSplineComponent> ActiveNativeEditSpline;
 	TOptional<bool> SavedShowSelectionSubcomponents;
 	TSharedPtr<FMoKuEditSplinesComponentVisualizer> RoadComponentVisualizer;

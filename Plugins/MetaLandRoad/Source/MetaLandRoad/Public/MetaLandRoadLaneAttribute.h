@@ -26,6 +26,19 @@ enum class EMetaLandRoadAttributeHost : uint8
 	SectionCenter,
 };
 
+/** Descriptor for one attribute type. Same track API; different Value struct. */
+struct METALANDROAD_API FMetaLandRoadAttributeTypeDesc
+{
+	FName TypeId;
+	FText DisplayName;
+	FName Category;
+	FName IconName;
+	const UScriptStruct* ValueStruct = nullptr;
+	EMetaLandRoadAttributeEvalMode EvalMode = EMetaLandRoadAttributeEvalMode::Stepped;
+	bool bAllowOnLane = true;
+	bool bAllowOnSectionCenter = false;
+};
+
 /** Base value type for lane attributes along SOffset. */
 USTRUCT(BlueprintType)
 struct METALANDROAD_API FMetaLandRoadLaneAttributeValue
@@ -76,6 +89,8 @@ struct METALANDROAD_API FMetaLandRoadLandscapeAttributeValue : public FMetaLandR
 		const FMetaLandRoadLandscapeAttributeValue& P2,
 		const FMetaLandRoadLandscapeAttributeValue& P3,
 		float T);
+
+	static FMetaLandRoadAttributeTypeDesc GetTypeDesc();
 };
 
 /** Details-template edit proxy so new Landscape UPROPERTY fields appear automatically. */
@@ -97,6 +112,16 @@ struct METALANDROAD_API FMetaLandRoadLandscapeKeyDetails
 	bool bCanEditSOffset = true;
 };
 
+/** Mode panel when a junction is selected (no road key / SOffset). */
+USTRUCT()
+struct METALANDROAD_API FMetaLandRoadJunctionLandscapeDetails
+{
+	GENERATED_BODY()
+
+	UPROPERTY(EditAnywhere, Category = "Landscape", meta = (ShowOnlyInnerProperties))
+	FMetaLandRoadLandscapeAttributeValue Landscape;
+};
+
 /** Stepped speed-limit metadata. Unit is caller-defined. */
 USTRUCT(BlueprintType)
 struct METALANDROAD_API FMetaLandRoadSpeedAttributeValue : public FMetaLandRoadLaneAttributeValue
@@ -105,6 +130,8 @@ struct METALANDROAD_API FMetaLandRoadSpeedAttributeValue : public FMetaLandRoadL
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Speed)
 	float MaxSpeed = 15.0f;
+
+	static FMetaLandRoadAttributeTypeDesc GetTypeDesc();
 };
 
 /** Stepped road-mark profile name. Empty = no mark on that stretch. */
@@ -115,6 +142,8 @@ struct METALANDROAD_API FMetaLandRoadMarkAttributeValue : public FMetaLandRoadLa
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Mark)
 	FName Profile;
+
+	static FMetaLandRoadAttributeTypeDesc GetTypeDesc();
 };
 
 /** Stepped curb-cut payload at the key (cut center). */
@@ -149,6 +178,8 @@ struct METALANDROAD_API FMetaLandRoadCurbCutAttributeValue : public FMetaLandRoa
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = CurbCut)
 	bool bSmooth = false;
+
+	static FMetaLandRoadAttributeTypeDesc GetTypeDesc();
 };
 
 /** Stepped 2D overlay. Profile is a name until polygon assets exist. */
@@ -162,6 +193,8 @@ struct METALANDROAD_API FMetaLandRoadPolygonAttributeValue : public FMetaLandRoa
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Polygon, meta = (ClampMin = "0.1", ClampMax = "1.0"))
 	float Alpha = 0.5f;
+
+	static FMetaLandRoadAttributeTypeDesc GetTypeDesc();
 };
 
 /** Sidewalk vertex Z offset along S. */
@@ -174,6 +207,8 @@ struct METALANDROAD_API FMetaLandRoadSidewalkHeightAttributeValue : public FMeta
 	float Height = 0.0f;
 
 	virtual void InterpolateWith(const FMetaLandRoadLaneAttributeValue& Other, float Alpha) override;
+
+	static FMetaLandRoadAttributeTypeDesc GetTypeDesc();
 };
 
 USTRUCT(BlueprintType)
@@ -188,18 +223,6 @@ struct METALANDROAD_API FMetaLandRoadLaneAttributeKey
 	TInstancedStruct<FMetaLandRoadLaneAttributeValue> Value;
 
 	bool operator<(const FMetaLandRoadLaneAttributeKey& Other) const;
-};
-
-/** Descriptor for one attribute type. Same track API; different Value struct. */
-struct METALANDROAD_API FMetaLandRoadAttributeTypeDesc
-{
-	FName TypeId;
-	FText DisplayName;
-	FName Category;
-	const UScriptStruct* ValueStruct = nullptr;
-	EMetaLandRoadAttributeEvalMode EvalMode = EMetaLandRoadAttributeEvalMode::Stepped;
-	bool bAllowOnLane = true;
-	bool bAllowOnSectionCenter = false;
 };
 
 /** Built-in + future custom types. Register once; Pin/AddKey/Eval stay the same. */

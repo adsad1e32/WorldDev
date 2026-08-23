@@ -12,6 +12,7 @@
 
 #include "EditSplineRoadInfo.generated.h"
 class AMoKuEditSplineActor;
+class AMoKuEditIntersectionActor;
 class AMoKuEditBaseActor;
 class UFloodComponent2D;
 
@@ -94,8 +95,6 @@ public:
 
 	void OctreeAddRoad(AMoKuEditSplineActor* InElement);
 	void OctreeRemoveRoad(AMoKuEditSplineActor* InElement);
-	void DestroyRoad(AMoKuEditSplineActor* Road) {};
-	//void OctreeAddElement(UMoKuEditSplinesComponent* InElement);
 	virtual void PostLoad() override;
 	virtual void BeginDestroy() override;
 
@@ -304,8 +303,8 @@ public:
 	bool DisableBrushTextureEffects = true;
 
 	/**
-	 * Height RT: centerline profile writes CombinedResult from spline Z + landscape keys.
-	 * No Landmass / JumpFlood on the height path. Junctions stay JumpFlood for weight.
+	 * Height and weight both stamp via centerline profile CS.
+	 * JumpFlood is not used on either path.
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, meta = (Category = "Settings"))
 	bool bUseCenterlineProfileCS = true;
@@ -323,9 +322,8 @@ public:
 
 	bool DeprecateWorldLandscapeInfo(FVector& OutRTWorldLocation, FVector& OutRTWorldSizeVector);
 	void SetupDefaultMaterials();
-	void SyncJumpFloodMaterials();
 
-	/** Force JumpFlood / DF cache rebuild on next RenderLayer (weight FalloffWidth / landscape scale changes). */
+	/** Force DF cache rebuild on next RenderLayer (weight / landscape scale changes). */
 	void InvalidateBrushDistanceFieldCache() { bKillCache = true; }
 
 private:
@@ -339,6 +337,7 @@ private:
 		FTransform RenderAreaWorldTransform;
 		FIntPoint RenderAreaSize = FIntPoint::ZeroValue;
 		UTextureRenderTarget2D* CSHeightWriteRT = nullptr;
+		UTextureRenderTarget2D* CSWeightWriteRT = nullptr;
 	};
 
 	struct FBrushActorRenderContext
@@ -372,7 +371,16 @@ private:
 	virtual bool CreateMIDs();
 	virtual void RenderBrushActorContext(FEditorBrushRenderContext& BrushRenderContext, FBrushActorRenderContext& BrushActorRenderContext);
 	void StampOneRoadBrushPass(FEditorBrushRenderContext& BrushRenderContext, FBrushActorRenderContext& BrushActorRenderContext, bool bForceRecapture);
-	bool StampRoadCenterlineProfileCS(FEditorBrushRenderContext& BrushRenderContext, AMoKuEditSplineActor* Road);
+	bool StampRoadCenterlineProfileCS(
+		FEditorBrushRenderContext& BrushRenderContext,
+		AMoKuEditSplineActor* Road,
+		uint32 WeightMode = 0,
+		const FRoadBodyWeightmapSettings* WMSettings = nullptr);
+	bool StampJunctionProfileCS(
+		FEditorBrushRenderContext& BrushRenderContext,
+		AMoKuEditIntersectionActor* Junction,
+		uint32 WeightMode = 0,
+		const FRoadBodyWeightmapSettings* WMSettings = nullptr);
 	virtual bool SetupRoadSplineRenderMIDs(const FBrushActorRenderContext& BrushActorRenderContext, bool bRestoreMIDs, TArray<UMaterialInterface*>& InOutMIDs);
 	virtual void CacheBrushDistanceField(const FBrushActorRenderContext& BrushActorRenderContext);
 	virtual void CaptureRoadDepth(const FBrushActorRenderContext& BrushActorRenderContext);

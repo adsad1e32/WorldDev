@@ -1,4 +1,4 @@
-﻿# Visual Studio
+# Visual Studio
 .vs/
 *.VC.db
 *.opendb
@@ -40,3 +40,7 @@ _finish_*.txt
 _rename_*.ps1
 _finish_*.ps1
 RENAME_SUMMARY.txt
+
+# Cursor / agent transcript scratch (not project source)
+_transcript_extract/
+_extract_module_cpp_sr_*.txt

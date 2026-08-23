@@ -56,10 +56,14 @@ protected:
 	void OnLandscapeHideClicked();
 	UMetaLandRoadSplineComponent* FindSelectedRoadSpline() const;
 	void EnsureLandscapeKeyDetailsView();
+	void EnsureJunctionLandscapeDetailsView();
 	void RefreshLandscapeKeyDetails();
 	void OnLandscapeKeyDetailsFinished(const FPropertyChangedEvent& PropertyChangedEvent);
+	void OnJunctionLandscapeDetailsFinished(const FPropertyChangedEvent& PropertyChangedEvent);
 
 	TSharedPtr<class IStructureDetailsView> LandscapeKeyDetailsView;
 	TSharedPtr<class FStructOnScope> LandscapeKeyEditStruct;
+	TSharedPtr<class IStructureDetailsView> JunctionLandscapeDetailsView;
+	TSharedPtr<class FStructOnScope> JunctionLandscapeEditStruct;
 	bool bRefreshingLandscapeKeyDetails = false;
 };

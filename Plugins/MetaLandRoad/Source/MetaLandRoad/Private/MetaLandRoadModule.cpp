@@ -11,6 +11,7 @@
 #include "PropertyEditorModule.h"
 #include "MoKuSplineActorCustomization.h"
 #include "MoKuEditSplineActor.h"
+#include "MoKuEditIntersectionActor.h"
 #include "MoKuEditSplinesComponent.h"
 #include "ComponentVisualizers/MetaLandRoadSectionComponentVisualizer.h"
 #include "Utils/MetaLandRoadCompVisUtils.h"
@@ -817,7 +818,144 @@ void FMetaLandRoadModule::EnterLandscapeAttributeOverlay()
 
 void FMetaLandRoadModule::HideLandscapeAttributeDisplay()
 {
+	LandscapeOverlayJunction.Reset();
 	SetLandscapeAttributeSelected(false);
+}
+
+void FMetaLandRoadModule::DismissLandscapeOverlayKeepAttribute()
+{
+	LandscapeOverlayJunction.Reset();
+	SetLandscapeAttributeOverlayVisible(false);
+	BroadcastLandscapeKeyEditorRefresh();
+}
+
+bool FMetaLandRoadModule::ShouldShowLandscapeDetailsPanel() const
+{
+	if (!bLandscapeAttributeSelected || !bShowLandscapeAttributeOverlay)
+	{
+		return false;
+	}
+
+	if (!GEditor)
+	{
+		return false;
+	}
+
+	if (LandscapeOverlayJunction.IsValid())
+	{
+		return GEditor->GetSelectedActors()
+			&& GEditor->GetSelectedActors()->IsSelected(LandscapeOverlayJunction.Get());
+	}
+
+	bool bHasRoad = false;
+	for (FSelectionIterator It(GEditor->GetSelectedActorIterator()); It; ++It)
+	{
+		if (Cast<AMoKuEditSplineActor>(*It))
+		{
+			bHasRoad = true;
+		}
+		else if (Cast<AActor>(*It))
+		{
+			return false;
+		}
+	}
+	return bHasRoad;
+}
+
+AMoKuEditIntersectionActor* FMetaLandRoadModule::GetLandscapeContextJunction() const
+{
+	return LandscapeOverlayJunction.Get();
+}
+
+void FMetaLandRoadModule::ShowLandscapeOverlayForActor(AActor* Actor)
+{
+	if (!Actor)
+	{
+		return;
+	}
+
+	if (AMoKuEditIntersectionActor* Junction = Cast<AMoKuEditIntersectionActor>(Actor))
+	{
+		LandscapeOverlayJunction = Junction;
+		if (RoadComponentVisualizer.IsValid())
+		{
+			RoadComponentVisualizer->ClearLandscapeAttributeKeySelection();
+		}
+		EnterLandscapeAttributeOverlay();
+		SetLandscapeAttributeOverlayVisible(true);
+		Junction->RefreshJunctionSampleFromGeometryIfNeeded();
+		Junction->NotifyLandscapeBrushChanged(true, true, true);
+		if (Junction->JunctionData)
+		{
+			for (AMoKuEditSplineActor* LinkedRoad : Junction->JunctionData->LinkedRoadActors)
+			{
+				if (LinkedRoad)
+				{
+					LinkedRoad->NotifyLandscapeBrushChanged(true, false, true);
+				}
+			}
+		}
+		BroadcastLandscapeKeyEditorRefresh();
+		if (GEditor)
+		{
+			GEditor->RedrawLevelEditingViewports(true);
+		}
+		return;
+	}
+
+	LandscapeOverlayJunction.Reset();
+	UMetaLandRoadSplineComponent* Spline = nullptr;
+	if (AMoKuEditSplineActor* Road = Cast<AMoKuEditSplineActor>(Actor))
+	{
+		Spline = Road->GetSplineComponent();
+	}
+	if (!Spline)
+	{
+		return;
+	}
+
+	EnterLandscapeAttributeOverlay();
+	Spline->EnsureAllCurvePointTypesForSmoothCorners(false);
+	MetaLandRoadProfile::PrepareLandscapeKeys(Spline, true);
+	Spline->UpdateRoadLayout();
+
+	if (RoadComponentVisualizer.IsValid())
+	{
+		RoadComponentVisualizer->SetActiveForSpline(Spline);
+		int32 SelectSection = INDEX_NONE;
+		int32 SelectKey = INDEX_NONE;
+		if (const AMoKuEditSplineActor* RoadOwner = Cast<AMoKuEditSplineActor>(Spline->GetOwner()))
+		{
+			MetaLandRoadProfile::ForEachVisibleLandscapeKey(
+				Spline,
+				RoadOwner,
+				[&SelectSection, &SelectKey](int32 SectionIndex, int32 KeyIndex, double)
+				{
+					SelectSection = SectionIndex;
+					SelectKey = KeyIndex;
+					return false;
+				});
+		}
+		if (SelectSection != INDEX_NONE)
+		{
+			RoadComponentVisualizer->SelectLandscapeAttributeKey(SelectSection, SelectKey);
+		}
+		else
+		{
+			RoadComponentVisualizer->ClearLandscapeAttributeKeySelection();
+		}
+	}
+
+	if (AMoKuEditSplineActor* RoadOwner = Cast<AMoKuEditSplineActor>(Spline->GetOwner()))
+	{
+		RoadOwner->NotifyLandscapeBrushChanged(true, false, true);
+	}
+	SetLandscapeAttributeOverlayVisible(true);
+	BroadcastLandscapeKeyEditorRefresh();
+	if (GEditor)
+	{
+		GEditor->RedrawLevelEditingViewports(true);
+	}
 }
 
 void FMetaLandRoadModule::SetLandscapeAttributeOverlayVisible(bool bVisible)
@@ -843,6 +981,7 @@ void FMetaLandRoadModule::BroadcastLandscapeKeyEditorRefresh()
 bool FMetaLandRoadModule::ShouldDrawLandscapeAttributeOverlay() const
 {
 	return bShowLandscapeAttributeOverlay
+		&& !LandscapeOverlayJunction.IsValid()
 		&& IsStandardMode()
 		&& !IsLiveSplineDrawSession();
 }

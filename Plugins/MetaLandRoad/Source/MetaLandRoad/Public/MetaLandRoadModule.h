@@ -48,6 +48,13 @@ public:
 	void EnterLandscapeAttributeOverlay();
 	/** Hide Landscape keys/curve and clear the Landscape selection. */
 	void HideLandscapeAttributeDisplay();
+	/** Hide keys and the details panel, keep Landscape selected so Show/Hide stay visible. */
+	void DismissLandscapeOverlayKeepAttribute();
+	/** True after Show — Junction Landscape / Landscape Key panel. */
+	bool ShouldShowLandscapeDetailsPanel() const;
+	/** Enter Landscape overlay for the selected road, or the first road linked to a junction. */
+	void ShowLandscapeOverlayForActor(AActor* Actor);
+	class AMoKuEditIntersectionActor* GetLandscapeContextJunction() const;
 	void BroadcastLandscapeKeyEditorRefresh();
 	FSimpleMulticastDelegate LandscapeKeyEditorRefresh;
 	/** Show is on, and not Alt+W / Alt+E / Alt+T / draw tool. */
@@ -116,6 +123,7 @@ private:
 	EMetaLandRoadEditorVisMode EditorVisMode = EMetaLandRoadEditorVisMode::Standard;
 	bool bLandscapeAttributeSelected = false;
 	bool bShowLandscapeAttributeOverlay = false;
+	TWeakObjectPtr<class AMoKuEditIntersectionActor> LandscapeOverlayJunction;
 	TWeakObjectPtr<UMetaLandRoadSplineComponent> ActiveNativeEditSpline;
 	TOptional<bool> SavedShowSelectionSubcomponents;
 	TSharedPtr<FMoKuEditSplinesComponentVisualizer> RoadComponentVisualizer;

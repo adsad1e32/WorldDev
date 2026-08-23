@@ -125,11 +125,29 @@ class  AMoKuEditIntersectionActor : public AMoKuEditBaseActor
 		/** Recalculate arm cuts from linked road geometry and rebuild fill mesh. */
 		void RecookFromLinkedRoads();
 
+		/** Write NewAnchor into JunctionNode.AnchorWorld (no spline-point edits). */
+		void ApplyAuthoringAnchorDelta(const FVector& OldAnchor, const FVector& NewAnchor);
+
+		/** Rebuild linked road meshes so EvalLanePosition picks up this hub Z. */
+		void RefreshLinkedRoadMeshesForAuthoring();
+
 		/**
 		 * Copy Height/Weight falloff from the first linked road when this junction still has
 		 * empty / seed defaults — keeps Terrain settings on the shared base actor in sync.
 		 */
 		void SyncTerrainInfluenceFromLinkedRoads();
+
+		/** Seed hub skirt: solid pad + fade (cm). Used when Terrain is still the actor seed. */
+		static float GetDefaultTerrainEdgeOffsetCm();
+		static float GetDefaultTerrainFalloffWidthCm();
+		void ApplyJunctionTerrainDefaultsIfSeed();
+
+		/** Offset / falloff from adjacent-arm angle and mouth width. */
+		bool ComputeJunctionSampleFromGeometry(float& OutOffsetCm, float& OutFalloffCm) const;
+		void RefreshJunctionSampleFromGeometryIfNeeded();
+		void ApplyJunctionLandscapeValue(const FMetaLandRoadLandscapeAttributeValue& Value, bool bPushToLinkedRoads = true);
+		void PushJunctionLandscapeToLinkedRoads();
+		bool bSyncingJunctionLandscape = false;
 
 		/** Debug: full junction recook + linked road refresh (Details button). */
 		UFUNCTION(CallInEditor, Category = "MetaLandRoad|Debug", meta = (DisplayName = "Recook Junction"))
@@ -137,6 +155,8 @@ class  AMoKuEditIntersectionActor : public AMoKuEditBaseActor
 
 #if WITH_EDITOR
 		virtual void PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent) override;
+		virtual void PostEditMove(bool bFinished) override;
+		virtual void EditorApplyTranslation(const FVector& DeltaTranslation, bool bAltDown, bool bShiftDown, bool bCtrlDown) override;
 #endif
 
 		/** Drop previous cover DynamicMesh + ring caches (Recook / T→N must not keep 重面). */
@@ -149,10 +169,30 @@ class  AMoKuEditIntersectionActor : public AMoKuEditBaseActor
 		UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "MetaLandRoad|Junction", meta = (ClampMin = "0.9", ClampMax = "1.5", UIMin = "0.9", UIMax = "1.5"))
 		float CutExpandScale = 1.15f;
 
+		/**
+		 * Solid extra width beyond the hub mesh (cm). Junction stamp: mouth→hub samples
+		 * use road half-width + distance-to-mouth, then this pad, then Falloff Width fades out.
+		 */
+		UPROPERTY()
+		float JunctionSampleEdgeOffset = 40.0f;
+
+		UPROPERTY()
+		float JunctionSampleFalloffWidth = 280.0f;
+
+		/** True after the artist edits Sample Offset / Falloff in Details or the Landscape panel. */
+		UPROPERTY()
+		bool bJunctionSampleUserOverride = false;
+
 		bool IsInit = false;
 
 		/** Re-entrancy guard: Purge/SplitSection must not nest Recook during map load. */
 		bool bIsRecookInProgress = false;
+
+		/** Gizmo drag: skip per-tick recook; cover mesh rides the actor. */
+		bool bJunctionAuthoringDrag = false;
+		FVector JunctionDragStartAnchor = FVector::ZeroVector;
+		/** After a Z drag, do not rebuild cover from road samples (that shears the hub). */
+		bool bHoldCoverAfterAuthoringMove = false;
 		//void SPawnGizmoInfo(const FVector& InRefVector);
 		UPROPERTY(TextExportTransient)
 		TObjectPtr<UMoKuEditSplinesComponent> SplineComp;

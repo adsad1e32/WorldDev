@@ -1,5 +1,6 @@
 #include "EditSplineRoadInfo.h"
 #include "MoKuEditSplineActor.h"
+#include "MoKuEditIntersectionActor.h"
 #include "MetaLandRoadLaneAttribute.h"
 #include "MetaLandRoadSplineComponent.h"
 #include "Components/DynamicMeshComponent.h"
@@ -149,6 +150,7 @@ public:
 		SHADER_PARAMETER(float, LandscapeCmPerQuad)
 		SHADER_PARAMETER(FVector2f, RoadBoundsMin)
 		SHADER_PARAMETER(FVector2f, RoadBoundsMax)
+		SHADER_PARAMETER(uint32, WeightMode)
 		RENDER_TARGET_BINDING_SLOTS()
 	END_SHADER_PARAMETER_STRUCT()
 
@@ -176,6 +178,45 @@ static FMatrix44f MakeVertexAlignedRenderAreaToWorld(
 	WorldFromTexel.SetAxis(2, FVector::UpVector);
 	WorldFromTexel.SetOrigin(Origin);
 	return FMatrix44f(WorldFromTexel);
+}
+
+static FIntRect ComputeWorldBoxPixelRect(
+	const FVector2f& WorldMin,
+	const FVector2f& WorldMax,
+	const FMatrix44f& RenderAreaToWorld,
+	const FIntPoint& ClampSize)
+{
+	if (ClampSize.X <= 0 || ClampSize.Y <= 0)
+	{
+		return FIntRect();
+	}
+
+	const FMatrix44f WorldToTexel = RenderAreaToWorld.Inverse();
+	const FVector3f Corners[4] = {
+		FVector3f(WorldMin.X, WorldMin.Y, 0.0f),
+		FVector3f(WorldMax.X, WorldMin.Y, 0.0f),
+		FVector3f(WorldMax.X, WorldMax.Y, 0.0f),
+		FVector3f(WorldMin.X, WorldMax.Y, 0.0f)
+	};
+
+	float MinX = TNumericLimits<float>::Max();
+	float MinY = TNumericLimits<float>::Max();
+	float MaxX = TNumericLimits<float>::Lowest();
+	float MaxY = TNumericLimits<float>::Lowest();
+	for (const FVector3f& Corner : Corners)
+	{
+		const FVector3f Texel = WorldToTexel.TransformPosition(Corner);
+		MinX = FMath::Min(MinX, Texel.X);
+		MinY = FMath::Min(MinY, Texel.Y);
+		MaxX = FMath::Max(MaxX, Texel.X);
+		MaxY = FMath::Max(MaxY, Texel.Y);
+	}
+
+	const int32 X0 = FMath::Clamp(FMath::FloorToInt(MinX), 0, ClampSize.X);
+	const int32 Y0 = FMath::Clamp(FMath::FloorToInt(MinY), 0, ClampSize.Y);
+	const int32 X1 = FMath::Clamp(FMath::CeilToInt(MaxX) + 1, 0, ClampSize.X);
+	const int32 Y1 = FMath::Clamp(FMath::CeilToInt(MaxY) + 1, 0, ClampSize.Y);
+	return FIntRect(X0, Y0, X1, Y1);
 }
 
 static bool BuildRoadProfileSamples(
@@ -286,6 +327,246 @@ static bool BuildRoadProfileSamples(
 		{
 			break;
 		}
+	}
+
+	return OutSamples.Num() >= 2;
+}
+
+static void ApplyWeightmapToProfileSamples(
+	TArray<FRoadProfileSampleGPU>& Samples,
+	const FRoadBodyWeightmapSettings& WMSettings)
+{
+	const float Offset = FMath::Max(WMSettings.EdgeOffset, 0.0f);
+	const float Falloff = FMath::Max(WMSettings.FalloffWidth, 1.0f);
+	const float Opacity = FMath::Clamp(WMSettings.FinalOpacity, 0.0f, 1.0f);
+	for (FRoadProfileSampleGPU& Sample : Samples)
+	{
+		Sample.Falloff.X = Offset;
+		Sample.Falloff.Y = Falloff;
+		Sample.Extra.Z = Opacity;
+	}
+}
+
+static uint32 GetProfileWeightMode(FName LayerName)
+{
+	const UWorldEditorSettings* Settings = GetDefault<UWorldEditorSettings>();
+	const FName RoadLayer = Settings ? Settings->GetDefaultRoadWeightmapLayerName() : FName(TEXT("Road"));
+	return (LayerName == RoadLayer) ? 1u : 2u;
+}
+
+static void AppendProfileSampleFromWorld(
+	TArray<FRoadProfileSampleGPU>& OutSamples,
+	const FTransform& LandscapeTransform,
+	const FVector& Center,
+	const FVector2D& Right2D,
+	float HalfL,
+	float HalfR,
+	float SideOffsetCm,
+	float SideFalloffCm,
+	float HeightOffsetCm,
+	float LayerFactor,
+	float S,
+	float SpanId,
+	float SoftArc = 1.0f)
+{
+	const float ZScale = FMath::Max(FMath::Abs(static_cast<float>(LandscapeTransform.GetScale3D().Z)), 0.0001f);
+	const float LocalZ = static_cast<float>(LandscapeTransform.InverseTransformPosition(Center).Z);
+	const float PackedHeight = static_cast<float>(LandscapeDataAccess::GetTexHeight(LocalZ));
+	const float PackedHeightOffset = (HeightOffsetCm / ZScale) * LANDSCAPE_INV_ZSCALE;
+
+	FRoadProfileSampleGPU Sample;
+	Sample.PosS = FVector4f(
+		static_cast<float>(Center.X),
+		static_cast<float>(Center.Y),
+		PackedHeight,
+		S);
+	Sample.RightLR = FVector4f(
+		static_cast<float>(Right2D.X),
+		static_cast<float>(Right2D.Y),
+		FMath::Max(HalfL, 1.0f),
+		FMath::Max(HalfR, 1.0f));
+	Sample.Falloff = FVector4f(SideOffsetCm, SideFalloffCm, PackedHeightOffset, 0.0f);
+	Sample.Extra = FVector4f(SoftArc, SpanId, LayerFactor, static_cast<float>(Center.Z));
+	OutSamples.Add(Sample);
+}
+
+static bool BuildJunctionProfileSamples(
+	AMoKuEditIntersectionActor* Junction,
+	const FTransform& LandscapeTransform,
+	TArray<FRoadProfileSampleGPU>& OutSamples)
+{
+	OutSamples.Reset();
+	if (!Junction || !Junction->JunctionData)
+	{
+		return false;
+	}
+
+	const FMetaLandRoadJunctionNode& Node = Junction->JunctionData->JunctionNode;
+	FVector Hub = Node.AnchorWorld;
+	if (Hub.IsNearlyZero())
+	{
+		Hub = Junction->GetActorLocation();
+	}
+
+	const FRoadFalloffSettings& HubFalloff = Junction->RoadHeightmapSettings.FalloffSettings;
+	const float SideOffsetCm = FMath::Max(Junction->JunctionSampleEdgeOffset, 0.0f);
+	const float SideFalloffCm = FMath::Max(Junction->JunctionSampleFalloffWidth, 1.0f);
+	const float HeightOffsetCm = FMath::Clamp(HubFalloff.ZOffset, -2000.0f, 2000.0f);
+	const FVector HubPos(Hub.X, Hub.Y, Junction->GetActorLocation().Z);
+
+	struct FJunctionStampArm
+	{
+		UMetaLandRoadSplineComponent* Spline = nullptr;
+		FVector Mouth = FVector::ZeroVector;
+		FVector2D Dir = FVector2D::ZeroVector;
+		FVector2D Right = FVector2D::ZeroVector;
+		float HalfL = 1.0f;
+		float HalfR = 1.0f;
+		float CutS = 0.0f;
+		float Polar = 0.0f;
+	};
+
+	TArray<FJunctionStampArm> StampArms;
+	auto TryAddStampArm = [&](UMetaLandRoadSplineComponent* Spline, double CutS)
+	{
+		if (!Spline || CutS < 0.0)
+		{
+			return;
+		}
+		FVector Left;
+		FVector Right;
+		FVector Center;
+		if (!Spline->GetRoadEdgePointsAtS(CutS, Left, Right, Center, ESplineCoordinateSpace::World))
+		{
+			return;
+		}
+		FVector2D Right2D(Right.X - Center.X, Right.Y - Center.Y);
+		if (!Right2D.Normalize())
+		{
+			Right2D = FVector2D(1.0, 0.0);
+		}
+		FVector2D Dir(Center.X - Hub.X, Center.Y - Hub.Y);
+		if (!Dir.Normalize())
+		{
+			return;
+		}
+		FJunctionStampArm Arm;
+		Arm.Spline = Spline;
+		Arm.Mouth = Center;
+		Arm.Dir = Dir;
+		Arm.Right = Right2D;
+		Arm.HalfL = static_cast<float>(FMath::Max(FVector::Dist2D(Left, Center), 1.0));
+		Arm.HalfR = static_cast<float>(FMath::Max(FVector::Dist2D(Right, Center), 1.0));
+		Arm.CutS = static_cast<float>(CutS);
+		Arm.Polar = FMath::Atan2(Dir.Y, Dir.X);
+		StampArms.Add(Arm);
+	};
+
+	for (const FMetaLandRoadJunctionArmRef& Arm : Node.Arms)
+	{
+		UMetaLandRoadSplineComponent* Spline = Arm.Spline.Get();
+		TryAddStampArm(Spline, Arm.CutDistanceS);
+		if (Arm.bThroughArm
+			&& Arm.DepartCutS > KINDA_SMALL_NUMBER
+			&& !FMath::IsNearlyEqual(Arm.DepartCutS, Arm.CutDistanceS, 10.0))
+		{
+			TryAddStampArm(Spline, Arm.DepartCutS);
+		}
+	}
+
+	if (StampArms.Num() == 0)
+	{
+		for (AMoKuEditSplineActor* Linked : Junction->JunctionData->LinkedRoadActors)
+		{
+			if (!Linked || !Linked->GetSplineComponent())
+			{
+				continue;
+			}
+
+			double CutS = -1.0;
+			if (Linked->EndOfJunction.Get() == Junction)
+			{
+				CutS = Linked->EndJunctionMeshTrimS;
+			}
+			else if (Linked->StartOfJunction.Get() == Junction)
+			{
+				CutS = Linked->StartJunctionMeshTrimS;
+			}
+			else
+			{
+				for (const FMetaLandRoadJunctionTrimZone& Zone : Linked->JunctionTrimZones)
+				{
+					if (Zone.Junction.Get() == Junction)
+					{
+						CutS = Zone.ApproachCutS >= 0.0 ? Zone.ApproachCutS : Zone.DepartCutS;
+						break;
+					}
+				}
+			}
+			TryAddStampArm(Linked->GetSplineComponent(), CutS);
+		}
+	}
+
+	StampArms.Sort([](const FJunctionStampArm& A, const FJunctionStampArm& B)
+	{
+		return A.Polar < B.Polar;
+	});
+
+	int32 SpanId = 0;
+	auto ResolveMouthLandscape = [&](UMetaLandRoadSplineComponent* Spline, float CutS, float& OutOffset, float& OutFalloff)
+	{
+		OutOffset = SideOffsetCm;
+		OutFalloff = SideFalloffCm;
+		FMetaLandRoadLandscapeAttributeValue RoadVal;
+		if (Spline && EvalRoadLandscapeAtWorldS(Spline, CutS, RoadVal))
+		{
+			OutOffset = FMath::Max(RoadVal.SideOffset, 0.0f);
+			OutFalloff = FMath::Max(RoadVal.SideFalloff, 1.0f);
+		}
+	};
+
+	for (const FJunctionStampArm& Arm : StampArms)
+	{
+		if (OutSamples.Num() + 2 > GRoadProfileMaxSamples)
+		{
+			break;
+		}
+		float MouthOffset = SideOffsetCm;
+		float MouthFalloff = SideFalloffCm;
+		ResolveMouthLandscape(Arm.Spline, Arm.CutS, MouthOffset, MouthFalloff);
+		const FVector2D HubRight(-Arm.Dir.Y, Arm.Dir.X);
+		AppendProfileSampleFromWorld(
+			OutSamples, LandscapeTransform, Arm.Mouth, Arm.Right, Arm.HalfL, Arm.HalfR,
+			MouthOffset, MouthFalloff, HeightOffsetCm, 1.0f, Arm.CutS, static_cast<float>(SpanId));
+		AppendProfileSampleFromWorld(
+			OutSamples, LandscapeTransform, HubPos, HubRight, Arm.HalfL, Arm.HalfR,
+			SideOffsetCm, SideFalloffCm, HeightOffsetCm, 1.0f, Arm.CutS, static_cast<float>(SpanId));
+		++SpanId;
+	}
+
+	if (Junction->EdgePath.Num() >= 3)
+	{
+		const FVector2D Hub2D(HubPos.X, HubPos.Y);
+		const int32 RingCount = Junction->EdgePath.Num();
+		for (int32 Index = 0; Index <= RingCount; ++Index)
+		{
+			if (OutSamples.Num() >= GRoadProfileMaxSamples)
+			{
+				break;
+			}
+			const FVector3d& P = Junction->EdgePath[Index % RingCount];
+			const FVector Center(P.X, P.Y, HubPos.Z);
+			FVector2D Radial(P.X - Hub2D.X, P.Y - Hub2D.Y);
+			if (!Radial.Normalize())
+			{
+				Radial = FVector2D(1.0f, 0.0f);
+			}
+			const float InW = FMath::Max(FVector2D::Distance(FVector2D(P.X, P.Y), Hub2D), 1.0f);
+			AppendProfileSampleFromWorld(
+				OutSamples, LandscapeTransform, Center, Radial, 2.0f, InW,
+				SideOffsetCm, SideFalloffCm, HeightOffsetCm, 1.0f, 0.0f, static_cast<float>(SpanId));
+		}
+		++SpanId;
 	}
 
 	return OutSamples.Num() >= 2;
@@ -1175,23 +1456,8 @@ bool AWorldSceneManagement::AllocateRTs()
 		bSuccess = false;
 	}
 
-	JumpFloodRTA = FWaterUtils::GetOrCreateTransientRenderTarget2D(JumpFloodRTA, TEXT("JumpFloodRTA"), LandscapeRTRes, RTF_RGBA32f);
-	JumpFloodRTB = FWaterUtils::GetOrCreateTransientRenderTarget2D(JumpFloodRTB, TEXT("JumpFloodRTB"), LandscapeRTRes, RTF_RGBA32f);
-	if ((JumpFloodRTA != nullptr) && (JumpFloodRTB != nullptr) && JumpFloodComponent2D != nullptr)
-	{
-		JumpFloodRTA->AddressX = TextureAddress::TA_Clamp;
-		JumpFloodRTA->AddressY = TextureAddress::TA_Clamp;
-
-		JumpFloodRTB->AddressX = TextureAddress::TA_Clamp;
-		JumpFloodRTB->AddressY = TextureAddress::TA_Clamp;
-
-		JumpFloodComponent2D->AssignRenderTargets(JumpFloodRTA, JumpFloodRTB);
-	}
-	else
-	{
-		//UE_LOG(LogWaterEditor, Error, TEXT("Invalid JumpFlood Render Target for Water Brush. Aborting AllocateRTs."));
-		bSuccess = false;
-	}
+	JumpFloodRTA = nullptr;
+	JumpFloodRTB = nullptr;
 	DepthAndShapeRT = FWaterUtils::GetOrCreateTransientRenderTarget2D(DepthAndShapeRT, TEXT("DepthAndShapeRT"), LandscapeRTRes, RTF_RG32f);
 	if (DepthAndShapeRT != nullptr && SceneCapture != nullptr)
 	{
@@ -1397,7 +1663,6 @@ void AWorldSceneManagement::PostLoad()
 	if (GetClass()->ClassGeneratedBy == nullptr)
 	{
 		SetupDefaultMaterials();
-		SyncJumpFloodMaterials();
 	}
 	if (UWorld* World = this->GetWorld())
 	{
@@ -1555,7 +1820,6 @@ bool AWorldSceneManagement::BrushRenderSetup()
 		return false;
 	}
 
-	SyncJumpFloodMaterials();
 	if (::IsValid(DebugDistanceFieldMaterial))
 	{
 		//UStaticMeshComponent* StaticMeshComponent = CastChecked<UStaticMeshComponent>(AActor::AddComponent(FName(TEXT("NODE_AddStaticMeshComponent-0")), false, FTransform(FRotator::ZeroRotator, FVector::ZeroVector, WorldSize), this), ECastCheckedType::NullAllowed);
@@ -1607,7 +1871,6 @@ void AWorldSceneManagement::OnConstruction(const FTransform& Transform)
 	}
 #endif 
 	SetupDefaultMaterials();
-	SyncJumpFloodMaterials();
 	SetMPCParams();
 };
 bool AWorldSceneManagement::CreateMIDs()
@@ -1656,7 +1919,7 @@ bool AWorldSceneManagement::CreateMIDs()
 		UE_LOG(LogTemp, Warning, TEXT("[RoadLandscape] DrawCanvas material unavailable (optional for mesh-based roads)."));
 	}
 
-	return JumpFloodComponent2D->CreateMIDs();
+	return true;
 }
 void AWorldSceneManagement::ModifyCaptureToTerrain(TObjectPtr<ALandscape> InOwningLandscape)
 {
@@ -1687,18 +1950,6 @@ void AWorldSceneManagement::AddDependencyIfValid(UObject* Dependency, TSet<UObje
 	}
 }
 
-void AWorldSceneManagement::SyncJumpFloodMaterials()
-{
-	if (JumpFloodComponent2D == nullptr)
-	{
-		return;
-	}
-
-	JumpFloodComponent2D->JumpStepMaterial = JumpStepMaterial;
-	JumpFloodComponent2D->FindEdgesMaterial = FindEdgesMaterial;
-	JumpFloodComponent2D->BlurEdgesMaterial = BlurEdgesMaterial;
-}
-
 void AWorldSceneManagement::SetupDefaultMaterials()
 {
 	using namespace MetaLandRoadBrushMaterials;
@@ -1713,7 +1964,6 @@ void AWorldSceneManagement::SetupDefaultMaterials()
 	JumpStepMaterial = LoadMaterial(JumpFloodStepLocal, JumpFloodStepOfficial, TEXT("JumpFloodStep"));
 	BlurEdgesMaterial = LoadMaterial(BlurEdgesLocal, BlurEdgesOfficial, TEXT("BlurEdges"));
 	FindEdgesMaterial = LoadMaterial(FindEdgesLocal, FindEdgesOfficial, TEXT("DetectEdges"));
-	SyncJumpFloodMaterials();
 }
 void AWorldSceneManagement::OctreeRemoveRoad(AMoKuEditSplineActor* InElement)
 {
@@ -1741,7 +1991,7 @@ static FBox ComputeRoadHeightInfluenceBounds(AMoKuEditBaseActor* Actor)
 		return Box;
 	}
 
-	float PadCm = 8000.0f;
+	float PadCm = 400.0f;
 	if (AMoKuEditSplineActor* Road = Cast<AMoKuEditSplineActor>(Actor))
 	{
 		FMetaLandRoadLandscapeAttributeValue LandscapeValue;
@@ -1754,6 +2004,12 @@ static FBox ComputeRoadHeightInfluenceBounds(AMoKuEditBaseActor* Actor)
 		const float HeightSpanCm = FMath::Max(static_cast<float>(Box.GetExtent().Z) * 2.0f, 0.0f);
 		PadCm = FMath::Max(PadCm, HeightSpanCm / 0.268f);
 		PadCm += 400.0f;
+	}
+	else if (const AMoKuEditIntersectionActor* Junction = Cast<AMoKuEditIntersectionActor>(Actor))
+	{
+		PadCm = FMath::Max(Junction->JunctionSampleEdgeOffset, 0.0f)
+			+ FMath::Max(Junction->JunctionSampleFalloffWidth, 1.0f)
+			+ 400.0f;
 	}
 	return Box.ExpandBy(FVector(PadCm, PadCm, 0.0f));
 }
@@ -1769,8 +2025,8 @@ AActor* AWorldSceneManagement::ResolveHeightStampFocusActor() const
 
 void AWorldSceneManagement::CollectHeightStampRoads(TArray<AMoKuEditBaseActor*>& InOutRoads) const
 {
-	// Keep every road. Focus filtering left neighbors unstamped and carved cliffs
-	// into Combined. Pixels outside a road's padded AABB early-out in the shader.
+	// Keep every actor in the list. Per-stamp now scissors to influence∩RenderArea
+	// so neighbors still write Combined and do not carve cliffs.
 	(void)InOutRoads;
 }
 
@@ -1829,36 +2085,10 @@ FBox AWorldSceneManagement::ComputeHeightStampWorldBounds(const TArray<AMoKuEdit
 TArray<UE::Landscape::EditLayers::FEditLayerRenderItem> AWorldSceneManagement::GetRenderItems(
 	const UE::Landscape::EditLayers::FMergeContext* InMergeContext) const
 {
-	TArray<UE::Landscape::EditLayers::FEditLayerRenderItem> Items = Super::GetRenderItems(InMergeContext);
-	if (!ResolveHeightStampFocusActor())
-	{
-		return Items;
-	}
-
-	TArray<AMoKuEditBaseActor*> Roads;
-	GetRoadActors(AMoKuEditBaseActor::StaticClass(), Roads);
-	CollectHeightStampRoads(Roads);
-	const FBox Bounds = ComputeHeightStampWorldBounds(Roads);
-	if (!Bounds.IsValid)
-	{
-		return Items;
-	}
-
-	const FVector Center = Bounds.GetCenter();
-	const FVector Extent = Bounds.GetExtent();
-	const UE::Landscape::EditLayers::FOOBox2D DirtyBox(
-		FTransform(FQuat::Identity, FVector(Center.X, Center.Y, 0.0), FVector::OneVector),
-		FVector2D(Extent.X, Extent.Y));
-	for (UE::Landscape::EditLayers::FEditLayerRenderItem& Item : Items)
-	{
-		Item.SetInputWorldArea(UE::Landscape::EditLayers::FInputWorldArea::CreateOOBox(DirtyBox));
-	}
-	UE_LOG(LogTemp, Log, TEXT("[RoadLandscape] Height dirty box focus=%s roads=%d extent=%.0fx%.0f"),
-		*GetNameSafe(ResolveHeightStampFocusActor()),
-		Roads.Num(),
-		Extent.X * 2.0,
-		Extent.Y * 2.0);
-	return Items;
+	// Do not shrink InputWorldArea to the road AABB. That partition leaves Grass
+	// (LB_WEIGHT_BLEND) on one side of the box and a remixed weight on the other —
+	// a hard seam and the wrong grass color. Engine RenderArea per component is enough.
+	return Super::GetRenderItems(InMergeContext);
 }
 #endif
 
@@ -1918,11 +2148,19 @@ UTextureRenderTarget2D* AWorldSceneManagement::RenderLayer_Native(const FLandsca
 		}
 	}
 
-	UTextureRenderTarget2D* ReturnRT = BrushRenderContext.CSHeightWriteRT
-		? BrushRenderContext.CSHeightWriteRT
-		: (bHeightmapRender
-			? HeightPingPongRead(BrushRenderContext)
-			: WeightPingPongRead(BrushRenderContext));
+	UTextureRenderTarget2D* ReturnRT = nullptr;
+	if (bHeightmapRender)
+	{
+		ReturnRT = BrushRenderContext.CSHeightWriteRT
+			? BrushRenderContext.CSHeightWriteRT
+			: HeightPingPongRead(BrushRenderContext);
+	}
+	else
+	{
+		ReturnRT = BrushRenderContext.CSWeightWriteRT
+			? BrushRenderContext.CSWeightWriteRT
+			: WeightPingPongRead(BrushRenderContext);
+	}
 	
 	bKillCache = false;
 	UE_LOG(LogTemp, Log, TEXT("[RoadLandscape] RenderLayer END type=%s layer=%s roads=%d drawn=%d return=%s"),
@@ -1933,9 +2171,9 @@ UTextureRenderTarget2D* AWorldSceneManagement::RenderLayer_Native(const FLandsca
 		ReturnRT ? *ReturnRT->GetName() : TEXT("null"));
 	if (!bHeightmapRender && RoadsDrawn == 0)
 	{
-		UE_LOG(LogTemp, Warning, TEXT("[RoadLandscape] Weight layer '%s' drew 0 roads — Weightmap RT stays black. Check: actors in WorldEditor brush list, bAffectsLandscape, RoadBodyWeightmapSettings has key '%s'."),
-			*InParameters.WeightmapLayerName.ToString(),
+		UE_LOG(LogTemp, Warning, TEXT("[RoadLandscape] Weight layer '%s' drew 0 roads — passthrough Combined (do not zero Grass)."),
 			*InParameters.WeightmapLayerName.ToString());
+		return InParameters.CombinedResult;
 	}
 	if (bHeightmapRender)
 	{
@@ -2005,14 +2243,20 @@ void AWorldSceneManagement::StampOneRoadBrushPass(
 				GCaptureTipExtendCm = 0.0f;
 			};
 			CaptureRoadDepth(BrushActorRenderContext);
-			JumpFloodComponent2D->JumpFlood(DepthAndShapeRT, 50000.0f, CurlColor, true, 0.0f);
+			if (JumpFloodComponent2D != nullptr)
+			{
+				JumpFloodComponent2D->JumpFlood(DepthAndShapeRT, 50000.0f, CurlColor, true, 0.0f);
+			}
 		}
 		else
 		{
 			UE_LOG(LogTemp, Warning, TEXT("Canvas shape render"));
 			DrawCanvasShape(BrushActorRenderContext);
 			UKismetRenderingLibrary::ClearRenderTarget2D(this, DepthAndShapeRT, FLinearColor(1.0f, 0.0f, 0.0f, 1.0f));
-			JumpFloodComponent2D->JumpFlood(DepthAndShapeRT, 50000.0f, CurlColor, false, BrushActorRenderContext.GetActor()->GetActorLocation().Z);
+			if (JumpFloodComponent2D != nullptr)
+			{
+				JumpFloodComponent2D->JumpFlood(DepthAndShapeRT, 50000.0f, CurlColor, false, BrushActorRenderContext.GetActor()->GetActorLocation().Z);
+			}
 		}
 		CacheBrushDistanceField(BrushActorRenderContext);
 	}
@@ -2022,38 +2266,38 @@ void AWorldSceneManagement::StampOneRoadBrushPass(
 	ApplyToCompositeRoadBodyTexture(BrushRenderContext, BrushActorRenderContext);
 }
 
-bool AWorldSceneManagement::StampRoadCenterlineProfileCS(
-	FEditorBrushRenderContext& BrushRenderContext,
-	AMoKuEditSplineActor* Road)
+static bool EnqueueRoadLandscapeProfileStamp(
+	AWorldSceneManagement* Owner,
+	const FTransform& RenderAreaWorldTransform,
+	const FIntPoint& RenderAreaSize,
+	UTextureRenderTarget2D*& InOutWriteRT,
+	TArray<FRoadProfileSampleGPU>&& Samples,
+	const FString& DebugName,
+	uint32 WeightMode = 0)
 {
-	TArray<FRoadProfileSampleGPU> Samples;
-	if (!BuildRoadProfileSamples(Road, LandscapeTransform, Samples))
+	if (!Owner || Samples.Num() < 2)
 	{
 		return false;
 	}
 
-	UTextureRenderTarget2D* CombinedRT = LandscapeRTRef;
-	if (!CombinedRT)
-	{
-		CombinedRT = HeightPingPongRead(BrushRenderContext);
-	}
-	if (!CombinedRT || LandscapeRTRes.X <= 0 || LandscapeRTRes.Y <= 0)
+	UTextureRenderTarget2D* CombinedRT = Owner->LandscapeRTRef;
+	if (!CombinedRT || Owner->LandscapeRTRes.X <= 0 || Owner->LandscapeRTRes.Y <= 0)
 	{
 		return false;
 	}
 
 	const FIntPoint CombinedSize(CombinedRT->SizeX, CombinedRT->SizeY);
-	const FIntPoint Size = (CombinedSize.X > 0 && CombinedSize.Y > 0) ? CombinedSize : LandscapeRTRes;
+	const FIntPoint Size = (CombinedSize.X > 0 && CombinedSize.Y > 0) ? CombinedSize : Owner->LandscapeRTRes;
 
-	UTextureRenderTarget2D* ReadRT = BrushRenderContext.CSHeightWriteRT
-		? BrushRenderContext.CSHeightWriteRT
+	UTextureRenderTarget2D* ReadRT = InOutWriteRT
+		? InOutWriteRT
 		: CombinedRT;
-	TObjectPtr<UTextureRenderTarget2D>& WriteSlot = (ReadRT == CSCombinedWriteRT)
-		? CSCombinedWriteRTB
-		: CSCombinedWriteRT;
-	const TCHAR* WriteName = (ReadRT == CSCombinedWriteRT)
-		? TEXT("RoadCSCombinedWriteB")
-		: TEXT("RoadCSCombinedWrite");
+	TObjectPtr<UTextureRenderTarget2D>& WriteSlot = (WeightMode > 0)
+		? ((ReadRT == Owner->WeightmapRTA) ? Owner->WeightmapRTB : Owner->WeightmapRTA)
+		: ((ReadRT == Owner->CSCombinedWriteRT) ? Owner->CSCombinedWriteRTB : Owner->CSCombinedWriteRT);
+	const TCHAR* WriteName = (WeightMode > 0)
+		? ((ReadRT == Owner->WeightmapRTA) ? TEXT("RoadWeightmapRTB") : TEXT("RoadWeightmapRTA"))
+		: ((ReadRT == Owner->CSCombinedWriteRT) ? TEXT("RoadCSCombinedWriteB") : TEXT("RoadCSCombinedWrite"));
 	WriteSlot = FWaterUtils::GetOrCreateTransientRenderTarget2D(
 		WriteSlot,
 		WriteName,
@@ -2071,18 +2315,15 @@ bool AWorldSceneManagement::StampRoadCenterlineProfileCS(
 		return false;
 	}
 
-	const float ZScale = static_cast<float>(LandscapeTransform.GetScale3D().Z);
+	const float ZScale = static_cast<float>(Owner->LandscapeTransform.GetScale3D().Z);
 	const float QuadCm = FMath::Max3(
-		FMath::Abs(static_cast<float>(LandscapeTransform.GetScale3D().X)),
-		FMath::Abs(static_cast<float>(LandscapeTransform.GetScale3D().Y)),
+		FMath::Abs(static_cast<float>(Owner->LandscapeTransform.GetScale3D().X)),
+		FMath::Abs(static_cast<float>(Owner->LandscapeTransform.GetScale3D().Y)),
 		1.0f);
 
 	const FMatrix44f RenderAreaToWorld = MakeVertexAlignedRenderAreaToWorld(
-		BrushRenderContext.RenderAreaWorldTransform,
-		LandscapeTransform);
-	const FVector RenderOrigin = BrushRenderContext.RenderAreaWorldTransform.TransformPosition(FVector::ZeroVector);
-	const FVector AxisX = LandscapeTransform.TransformVector(FVector::ForwardVector);
-	const FVector AxisY = LandscapeTransform.TransformVector(FVector::RightVector);
+		RenderAreaWorldTransform,
+		Owner->LandscapeTransform);
 
 	FVector2f RoadMin(TNumericLimits<float>::Max(), TNumericLimits<float>::Max());
 	FVector2f RoadMax(TNumericLimits<float>::Lowest(), TNumericLimits<float>::Lowest());
@@ -2104,42 +2345,43 @@ bool AWorldSceneManagement::StampRoadCenterlineProfileCS(
 	RoadMax += Pad;
 
 	const uint32 SampleCount = static_cast<uint32>(Samples.Num());
-	const FRoadProfileSampleGPU Sample0 = Samples[0];
-	const bool bUseRenderArea = BrushRenderContext.RenderAreaSize.X > 0
-		&& BrushRenderContext.RenderAreaSize.X < (MAX_int32 / 4);
+	const bool bUseRenderArea = RenderAreaSize.X > 0
+		&& RenderAreaSize.X < (MAX_int32 / 4);
 	const FIntPoint StampSize = bUseRenderArea
 		? FIntPoint(
-			FMath::Min(BrushRenderContext.RenderAreaSize.X, Size.X),
-			FMath::Min(BrushRenderContext.RenderAreaSize.Y, Size.Y))
+			FMath::Min(RenderAreaSize.X, Size.X),
+			FMath::Min(RenderAreaSize.Y, Size.Y))
 		: Size;
-	UE_LOG(LogTemp, Log, TEXT("[RoadLandscape] Profile road=%s samples=%u PackedH=%.0f WorldZ=%.1f PackedOff=%.1f Layer=%.2f Offset=%.1f Falloff=%.1f SolidThenFade=%.1f SlopePad=%.1f ZScale=%.1f Quad=%.1f Axis=%.1fx%.1f Origin=(%.0f,%.0f) RenderArea=%s %dx%d Stamp=%dx%d Combined=%dx%d fmt=%d"),
-		*Road->GetName(),
+
+	const FIntRect InfluenceRect = ComputeWorldBoxPixelRect(RoadMin, RoadMax, RenderAreaToWorld, StampSize);
+	if (InfluenceRect.IsEmpty())
+	{
+		UE_LOG(LogTemp, Log, TEXT("[RoadLandscape] Profile skip %s — influence box misses RenderArea"), *DebugName);
+		return true;
+	}
+
+	const bool bBoxStamp = InfluenceRect.Width() < StampSize.X || InfluenceRect.Height() < StampSize.Y;
+	const FIntRect DrawRect = bBoxStamp
+		? InfluenceRect
+		: FIntRect(0, 0, StampSize.X, StampSize.Y);
+
+	const FRoadProfileSampleGPU Sample0 = Samples[0];
+	UE_LOG(LogTemp, Log, TEXT("[RoadLandscape] Profile %s samples=%u box=%s rect=%d,%d %dx%d Offset=%.1f Falloff=%.1f ZOff=%.1f Stamp=%dx%d"),
+		*DebugName,
 		SampleCount,
-		Sample0.PosS.Z,
-		Sample0.Extra.W,
-		Sample0.Falloff.Z,
-		Sample0.Extra.Z,
+		bBoxStamp ? TEXT("yes") : TEXT("full"),
+		DrawRect.Min.X,
+		DrawRect.Min.Y,
+		DrawRect.Width(),
+		DrawRect.Height(),
 		Sample0.Falloff.X,
 		Sample0.Falloff.Y,
-		Sample0.Falloff.X + Sample0.Falloff.Y,
-		Sample0.Falloff.W,
-		ZScale,
-		QuadCm,
-		AxisX.Size(),
-		AxisY.Size(),
-		RenderOrigin.X,
-		RenderOrigin.Y,
-		bUseRenderArea ? TEXT("yes") : TEXT("full"),
-		BrushRenderContext.RenderAreaSize.X,
-		BrushRenderContext.RenderAreaSize.Y,
+		Sample0.Falloff.Z,
 		StampSize.X,
-		StampSize.Y,
-		Size.X,
-		Size.Y,
-		static_cast<int32>(CombinedRT->RenderTargetFormat));
+		StampSize.Y);
 
 	ENQUEUE_RENDER_COMMAND(RoadLandscapeProfilePS)(
-		[ReadRes, WriteRes, Samples = MoveTemp(Samples), SampleCount, Size, StampSize, RenderAreaToWorld, ZScale, QuadCm, RoadMin, RoadMax]
+		[ReadRes, WriteRes, Samples = MoveTemp(Samples), SampleCount, Size, StampSize, DrawRect, bBoxStamp, RenderAreaToWorld, ZScale, QuadCm, RoadMin, RoadMax, WeightMode]
 		(FRHICommandListImmediate& RHICmdList)
 		{
 			if (!ReadRes->GetRenderTargetTexture() || !WriteRes->GetRenderTargetTexture() || SampleCount < 2)
@@ -2154,6 +2396,19 @@ bool AWorldSceneManagement::StampRoadCenterlineProfileCS(
 			if (DispatchSize.X <= 0 || DispatchSize.Y <= 0)
 			{
 				return;
+			}
+
+			FIntRect ClipRect = DrawRect;
+			ClipRect.Max.X = FMath::Min(ClipRect.Max.X, DispatchSize.X);
+			ClipRect.Max.Y = FMath::Min(ClipRect.Max.Y, DispatchSize.Y);
+			if (ClipRect.IsEmpty())
+			{
+				return;
+			}
+
+			if (bBoxStamp)
+			{
+				AddCopyTexturePass(GraphBuilder, Combined, Dest);
 			}
 
 			const uint32 SampleBytes = SampleCount * sizeof(FRoadProfileSampleGPU);
@@ -2174,7 +2429,10 @@ bool AWorldSceneManagement::StampRoadCenterlineProfileCS(
 			PassParameters->LandscapeCmPerQuad = QuadCm;
 			PassParameters->RoadBoundsMin = RoadMin;
 			PassParameters->RoadBoundsMax = RoadMax;
-			PassParameters->RenderTargets[0] = FRenderTargetBinding(Dest, ERenderTargetLoadAction::ENoAction);
+			PassParameters->WeightMode = WeightMode;
+			PassParameters->RenderTargets[0] = FRenderTargetBinding(
+				Dest,
+				bBoxStamp ? ERenderTargetLoadAction::ELoad : ERenderTargetLoadAction::ENoAction);
 
 			FPixelShaderUtils::AddFullscreenPass(
 				GraphBuilder,
@@ -2182,13 +2440,69 @@ bool AWorldSceneManagement::StampRoadCenterlineProfileCS(
 				RDG_EVENT_NAME("RoadLandscapeProfilePS"),
 				PixelShader,
 				PassParameters,
-				FIntRect(0, 0, DispatchSize.X, DispatchSize.Y));
+				ClipRect);
 
 			GraphBuilder.Execute();
 		});
 
-	BrushRenderContext.CSHeightWriteRT = WriteSlot;
+	InOutWriteRT = WriteSlot;
 	return true;
+}
+
+bool AWorldSceneManagement::StampRoadCenterlineProfileCS(
+	FEditorBrushRenderContext& BrushRenderContext,
+	AMoKuEditSplineActor* Road,
+	uint32 WeightMode,
+	const FRoadBodyWeightmapSettings* WMSettings)
+{
+	TArray<FRoadProfileSampleGPU> Samples;
+	if (!BuildRoadProfileSamples(Road, LandscapeTransform, Samples))
+	{
+		return false;
+	}
+	if (WeightMode > 0 && WMSettings)
+	{
+		ApplyWeightmapToProfileSamples(Samples, *WMSettings);
+	}
+	UTextureRenderTarget2D*& WriteRT = (WeightMode > 0)
+		? BrushRenderContext.CSWeightWriteRT
+		: BrushRenderContext.CSHeightWriteRT;
+	return EnqueueRoadLandscapeProfileStamp(
+		this,
+		BrushRenderContext.RenderAreaWorldTransform,
+		BrushRenderContext.RenderAreaSize,
+		WriteRT,
+		MoveTemp(Samples),
+		Road->GetName(),
+		WeightMode);
+}
+
+bool AWorldSceneManagement::StampJunctionProfileCS(
+	FEditorBrushRenderContext& BrushRenderContext,
+	AMoKuEditIntersectionActor* Junction,
+	uint32 WeightMode,
+	const FRoadBodyWeightmapSettings* WMSettings)
+{
+	TArray<FRoadProfileSampleGPU> Samples;
+	if (!BuildJunctionProfileSamples(Junction, LandscapeTransform, Samples))
+	{
+		return false;
+	}
+	if (WeightMode > 0 && WMSettings)
+	{
+		ApplyWeightmapToProfileSamples(Samples, *WMSettings);
+	}
+	UTextureRenderTarget2D*& WriteRT = (WeightMode > 0)
+		? BrushRenderContext.CSWeightWriteRT
+		: BrushRenderContext.CSHeightWriteRT;
+	return EnqueueRoadLandscapeProfileStamp(
+		this,
+		BrushRenderContext.RenderAreaWorldTransform,
+		BrushRenderContext.RenderAreaSize,
+		WriteRT,
+		MoveTemp(Samples),
+		Junction->GetName(),
+		WeightMode);
 }
 
 void AWorldSceneManagement::RenderBrushActorContext(FEditorBrushRenderContext& BrushRenderContext, FBrushActorRenderContext& BrushActorRenderContext)
@@ -2202,64 +2516,37 @@ void AWorldSceneManagement::RenderBrushActorContext(FEditorBrushRenderContext& B
 		}
 	}
 
-	if (BrushRenderContext.bHeightmapRender)
+	const uint32 WeightMode = BrushRenderContext.bHeightmapRender
+		? 0u
+		: GetProfileWeightMode(BrushRenderContext.WeightmapLayerName);
+	const FRoadBodyWeightmapSettings* WMSettings = BrushRenderContext.bHeightmapRender
+		? nullptr
+		: BrushActorRenderContext.RoadBrushActor->GetLayerWeightmapSettings().Find(BrushRenderContext.WeightmapLayerName);
+
+	if (AMoKuEditSplineActor* ProfileRoad = BrushActorRenderContext.TryGetActorAs<AMoKuEditSplineActor>())
 	{
-		if (AMoKuEditSplineActor* ProfileRoad = BrushActorRenderContext.TryGetActorAs<AMoKuEditSplineActor>())
+		if (StampRoadCenterlineProfileCS(BrushRenderContext, ProfileRoad, WeightMode, WMSettings))
 		{
-			if (!StampRoadCenterlineProfileCS(BrushRenderContext, ProfileRoad))
-			{
-				UE_LOG(LogTemp, Warning, TEXT("[RoadLandscape] Profile stamp failed for %s — height passthrough (no Landmass)"), *ProfileRoad->GetName());
-			}
-			return;
+			++BrushRenderContext.RTIndex;
 		}
-	}
-
-	URoadBodyBrushCacheContainer* CacheContainer = nullptr;
-	FRoadBodyBrushCache RoadBrushCache;
-	GetRoadCacheKey(BrushActorRenderContext.GetActor(), /*out*/ CacheContainer, /*out*/ RoadBrushCache);
-	BrushActorRenderContext.CacheContainer = CacheContainer;
-
-	TArray<FLandscapeHeightSlice> HeightSlices;
-	AMoKuEditSplineActor* Road = BrushActorRenderContext.TryGetActorAs<AMoKuEditSplineActor>();
-	if (BrushRenderContext.bHeightmapRender && Road)
-	{
-		CollectLandscapeHeightSlices(Road, HeightSlices);
-	}
-
-	if (BrushRenderContext.bHeightmapRender && HeightSlices.Num() > 1)
-	{
-		UE_LOG(LogTemp, Log, TEXT("[RoadLandscape] HEIGHT segmented stamps=%d (one per differing key span)"), HeightSlices.Num());
-		GSkipAutoLandscapeKeyApply = true;
-		GCaptureClipEnabled = true;
-		ON_SCOPE_EXIT
+		else
 		{
-			GSkipAutoLandscapeKeyApply = false;
-			GCaptureClipEnabled = false;
-			ClearLandscapeKeyFalloffOverride();
-		};
-
-		for (const FLandscapeHeightSlice& Slice : HeightSlices)
-		{
-			SetLandscapeKeyFalloffOverride(Slice.Value);
-			GCaptureClipS0 = Slice.S0;
-			GCaptureClipS1 = Slice.S1;
-			if (BrushActorRenderContext.CacheContainer)
-			{
-				BrushActorRenderContext.CacheContainer->Cache.CacheIsValid = false;
-			}
-			SetBrushMIDParams(BrushRenderContext, BrushActorRenderContext);
-			StampOneRoadBrushPass(BrushRenderContext, BrushActorRenderContext, /*bForceRecapture=*/true);
+			UE_LOG(LogTemp, Warning, TEXT("[RoadLandscape] Profile stamp failed for %s"), *ProfileRoad->GetName());
 		}
 		return;
 	}
-
-	if (BrushActorRenderContext.CacheContainer)
+	if (AMoKuEditIntersectionActor* Junction = BrushActorRenderContext.TryGetActorAs<AMoKuEditIntersectionActor>())
 	{
-		BrushActorRenderContext.CacheContainer->Cache.CacheIsValid = false;
+		if (StampJunctionProfileCS(BrushRenderContext, Junction, WeightMode, WMSettings))
+		{
+			++BrushRenderContext.RTIndex;
+		}
+		else
+		{
+			UE_LOG(LogTemp, Warning, TEXT("[RoadLandscape] Junction stamp skipped for %s — no mouth samples"), *Junction->GetName());
+		}
+		return;
 	}
-	SetBrushMIDParams(BrushRenderContext, BrushActorRenderContext);
-	StampOneRoadBrushPass(BrushRenderContext, BrushActorRenderContext, /*bForceRecapture=*/true);
-	ClearLandscapeKeyFalloffOverride();
 }
 
 

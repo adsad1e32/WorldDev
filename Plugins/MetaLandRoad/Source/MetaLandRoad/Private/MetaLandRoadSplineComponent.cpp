@@ -4,6 +4,7 @@
 #include "MetaLandRoadProfile.h"
 #include "MetaLandRoadModule.h"
 #include "MoKuEditSplineActor.h"
+#include "MoKuEditIntersectionActor.h"
 #include "Components/LineBatchComponent.h"
 #include "SceneManagement.h"
 #include "DynamicMesh/DynamicMesh3.h"
@@ -2329,14 +2330,15 @@ void UMetaLandRoadSplineComponent::BuildLinearApproximation(
 	for (int32 i = 0; i <= NumStep; ++i)
 	{
 		const float Param = static_cast<float>(S0_Param + static_cast<double>(i) * Step);
-		const FVector RightVectorLocal = FlattenHorizontalRight(
-			GetRightVectorAtSplineInputKey(Param, ESplineCoordinateSpace::Local));
-		const double RightOffset = RightOffsetFunc(GetDistanceAlongSplineAtSplineInputKey(Param));
-		FVector Point = SplineCurves.Position.Eval(Param, FVector::ZeroVector) + RightVectorLocal * RightOffset;
-		if (CoordinateSpace == ESplineCoordinateSpace::World)
-		{
-			Point = GetComponentTransform().TransformPosition(Point);
-		}
+		const double SampleS = GetDistanceAlongSplineAtSplineInputKey(Param);
+		const FVector Center = GetLocationAtSplineInputKey(Param, CoordinateSpace);
+		const FVector Right = FlattenHorizontalRight(
+			GetRightVectorAtSplineInputKey(Param, CoordinateSpace));
+		const double RightOffset = RightOffsetFunc(SampleS);
+		FVector Point = ApplyLinkedJunctionHeightToPosition(
+			Center + Right * RightOffset,
+			SampleS,
+			CoordinateSpace);
 		OutPoints.Emplace(Point, Param);
 	}
 }
@@ -2355,7 +2357,274 @@ FVector UMetaLandRoadSplineComponent::EvalLanePosition(int SectionIndex, int Lan
 	const FMetaLandRoadLaneSection& Section = RoadLayout.Sections[SectionIndex];
 	(void)Section;
 	const FVector RVector = FlattenHorizontalRight(GetRightVectorAtDistanceAlongSpline(S, CoordinateSpace));
-	return Loc + RVector * ROffset;
+	return ApplyLinkedJunctionHeightToPosition(Loc + RVector * ROffset, S, CoordinateSpace);
+}
+
+static void AppendLinkedJunctionHeightStations(
+	const AMoKuEditSplineActor* Road,
+	const AMoKuEditIntersectionActor* Junction,
+	const UMetaLandRoadSplineComponent* Spline,
+	TArray<double>& OutStations)
+{
+	if (!Road || !Junction)
+	{
+		return;
+	}
+	if (Road->StartOfJunction.Get() == Junction && Road->StartJunctionMeshTrimS >= 0.0)
+	{
+		OutStations.Add(Road->StartJunctionMeshTrimS);
+	}
+	if (Road->EndOfJunction.Get() == Junction && Road->EndJunctionMeshTrimS >= 0.0)
+	{
+		OutStations.Add(Road->EndJunctionMeshTrimS);
+	}
+	for (const FMetaLandRoadJunctionTrimZone& Zone : Road->JunctionTrimZones)
+	{
+		if (Zone.Junction.Get() != Junction)
+		{
+			continue;
+		}
+		if (Zone.ApproachCutS >= 0.0)
+		{
+			OutStations.Add(Zone.ApproachCutS);
+		}
+		if (Zone.DepartCutS >= 0.0)
+		{
+			OutStations.Add(Zone.DepartCutS);
+		}
+	}
+	if (Junction->JunctionData && Spline)
+	{
+		for (const FMetaLandRoadJunctionArmRef& Arm : Junction->JunctionData->JunctionNode.Arms)
+		{
+			if (Arm.Spline.Get() != Spline)
+			{
+				continue;
+			}
+			if (Arm.CutDistanceS >= 0.0)
+			{
+				OutStations.Add(Arm.CutDistanceS);
+			}
+			if (Arm.DepartCutS >= 0.0)
+			{
+				OutStations.Add(Arm.DepartCutS);
+			}
+		}
+	}
+
+	if (Spline)
+	{
+		TArray<TPair<double, double>> Spans;
+		Road->GetJunctionMeshGenerationSpans(Spans);
+		const FVector Hub = Junction->GetActorLocation();
+		double BestTipS = -1.0;
+		double BestDistSq = TNumericLimits<double>::Max();
+		for (const TPair<double, double>& Span : Spans)
+		{
+			const double Tips[2] = { Span.Key, Span.Value };
+			for (const double TipS : Tips)
+			{
+				const FVector Tip = Spline->GetLocationAtDistanceAlongSpline(
+					TipS,
+					ESplineCoordinateSpace::World);
+				const double DistSq = FVector::DistSquared2D(Tip, Hub);
+				if (DistSq < BestDistSq)
+				{
+					BestDistSq = DistSq;
+					BestTipS = TipS;
+				}
+			}
+		}
+		if (BestTipS >= 0.0)
+		{
+			OutStations.Add(BestTipS);
+		}
+	}
+}
+
+static float PerlinSmootherstep01(float T)
+{
+	T = FMath::Clamp(T, 0.0f, 1.0f);
+	return T * T * T * (T * (T * 6.0f - 15.0f) + 10.0f);
+}
+
+bool UMetaLandRoadSplineComponent::FindJunctionHeightBlendEndS(double MouthS, double& OutEndS) const
+{
+	const double Length = GetSplineLength();
+	if (Length <= 50.0)
+	{
+		return false;
+	}
+
+	double AwaySign = 0.0;
+	if (const AMoKuEditSplineActor* Road = Cast<AMoKuEditSplineActor>(GetOwner()))
+	{
+		TArray<TPair<double, double>> Spans;
+		Road->GetJunctionMeshGenerationSpans(Spans);
+		double BestMouthDist = TNumericLimits<double>::Max();
+		for (const TPair<double, double>& Span : Spans)
+		{
+			const double DistKey = FMath::Abs(Span.Key - MouthS);
+			const double DistValue = FMath::Abs(Span.Value - MouthS);
+			if (DistValue <= DistKey && DistValue < BestMouthDist)
+			{
+				BestMouthDist = DistValue;
+				AwaySign = -1.0;
+			}
+			else if (DistKey < BestMouthDist)
+			{
+				BestMouthDist = DistKey;
+				AwaySign = 1.0;
+			}
+		}
+	}
+	if (FMath::IsNearlyZero(AwaySign))
+	{
+		AwaySign = (MouthS > Length * 0.5) ? -1.0 : 1.0;
+	}
+
+	auto Consider = [MouthS, AwaySign](double Candidate, double& InOutBest, double& InOutBestDelta) -> void
+	{
+		const double Delta = (Candidate - MouthS) * AwaySign;
+		if (Delta < 100.0)
+		{
+			return;
+		}
+		if (Delta < InOutBestDelta)
+		{
+			InOutBestDelta = Delta;
+			InOutBest = Candidate;
+		}
+	};
+
+	double BestS = -1.0;
+	double BestDelta = TNumericLimits<double>::Max();
+	for (int32 SectionIndex = 0; SectionIndex < GetLaneSectionsNum(); ++SectionIndex)
+	{
+		const FMetaLandRoadLaneSection& Section = GetLaneSection(SectionIndex);
+		const FMetaLandRoadLaneAttribute* Track = Section.FindAttribute(FMetaLandRoadAttributeRegistry::TypeLandscape);
+		if (!Track)
+		{
+			continue;
+		}
+		for (const FMetaLandRoadLaneAttributeKey& Key : Track->Keys)
+		{
+			Consider(Section.SOffset + Key.SOffset, BestS, BestDelta);
+		}
+	}
+	if (BestS >= 0.0)
+	{
+		OutEndS = BestS;
+		return true;
+	}
+
+	const int32 PointCount = GetNumberOfSplinePoints();
+	for (int32 PointIndex = 0; PointIndex < PointCount; ++PointIndex)
+	{
+		Consider(
+			static_cast<double>(GetDistanceAlongSplineAtSplinePoint(PointIndex)),
+			BestS,
+			BestDelta);
+	}
+	if (BestS >= 0.0)
+	{
+		OutEndS = BestS;
+		return true;
+	}
+
+	OutEndS = FMath::Clamp(MouthS + AwaySign * 2500.0, 0.0, Length);
+	return FMath::Abs(OutEndS - MouthS) >= 100.0;
+}
+
+FVector UMetaLandRoadSplineComponent::ApplyLinkedJunctionHeightToPosition(
+	const FVector& Position,
+	double S,
+	ESplineCoordinateSpace::Type CoordinateSpace) const
+{
+	const AMoKuEditSplineActor* Road = Cast<AMoKuEditSplineActor>(GetOwner());
+	if (!Road)
+	{
+		return Position;
+	}
+
+	TArray<AMoKuEditIntersectionActor*, TInlineAllocator<4>> Junctions;
+	if (AMoKuEditIntersectionActor* StartJunction = Road->StartOfJunction.Get())
+	{
+		Junctions.Add(StartJunction);
+	}
+	if (AMoKuEditIntersectionActor* EndJunction = Road->EndOfJunction.Get())
+	{
+		Junctions.AddUnique(EndJunction);
+	}
+	for (const FMetaLandRoadJunctionTrimZone& Zone : Road->JunctionTrimZones)
+	{
+		if (AMoKuEditIntersectionActor* ZoneJunction = Zone.Junction.Get())
+		{
+			Junctions.AddUnique(ZoneJunction);
+		}
+	}
+	if (Junctions.Num() == 0)
+	{
+		return Position;
+	}
+
+	FVector WorldPos = Position;
+	if (CoordinateSpace == ESplineCoordinateSpace::Local)
+	{
+		WorldPos = GetComponentTransform().TransformPosition(Position);
+	}
+
+	const double CenterlineZ = GetLocationAtDistanceAlongSpline(S, ESplineCoordinateSpace::World).Z;
+
+	float BestAlpha = 0.0f;
+	float TargetZ = static_cast<float>(CenterlineZ);
+	for (const AMoKuEditIntersectionActor* Junction : Junctions)
+	{
+		if (!Junction)
+		{
+			continue;
+		}
+		TArray<double> Stations;
+		AppendLinkedJunctionHeightStations(Road, Junction, this, Stations);
+		if (Stations.Num() == 0)
+		{
+			continue;
+		}
+		double DistToMouth = TNumericLimits<double>::Max();
+		double NearestMouthS = Stations[0];
+		for (const double Station : Stations)
+		{
+			const double Dist = FMath::Abs(S - Station);
+			if (Dist < DistToMouth)
+			{
+				DistToMouth = Dist;
+				NearestMouthS = Station;
+			}
+		}
+		double BlendEndS = NearestMouthS;
+		double BlendCm = 2500.0;
+		if (FindJunctionHeightBlendEndS(NearestMouthS, BlendEndS))
+		{
+			BlendCm = FMath::Max(400.0, FMath::Abs(BlendEndS - NearestMouthS));
+		}
+		const float Alpha = 1.0f - PerlinSmootherstep01(static_cast<float>(DistToMouth / BlendCm));
+		if (Alpha > BestAlpha)
+		{
+			BestAlpha = Alpha;
+			TargetZ = static_cast<float>(Junction->GetActorLocation().Z);
+		}
+	}
+	if (BestAlpha > KINDA_SMALL_NUMBER)
+	{
+		WorldPos.Z = FMath::Lerp(CenterlineZ, static_cast<double>(TargetZ), static_cast<double>(BestAlpha));
+	}
+
+	if (CoordinateSpace == ESplineCoordinateSpace::Local)
+	{
+		const FVector WorldOnPlane(WorldPos.X, WorldPos.Y, WorldPos.Z);
+		return GetComponentTransform().InverseTransformPosition(WorldOnPlane);
+	}
+	return WorldPos;
 }
 
 float UMetaLandRoadSplineComponent::ClosestKeyToSegment(float Key1, float Key2, const FVector& A1, const FVector& A2) const

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "Templates/Function.h"
 #include "MetaLandRoadTypes.h"
 #include "MetaLandRoadProfile.generated.h"
 
@@ -47,8 +48,35 @@ namespace MetaLandRoadProfile
 	/** Apply default lanes when the spline has no sections yet. */
 	METALANDROAD_API void EnsureDefaultRoadProfile(UMetaLandRoadSplineComponent* TargetSpline);
 
-	/** Pin a Landscape attribute track on every section center-line (S=0 key). */
-	METALANDROAD_API void EnsureLandscapeAttributeOnSections(UMetaLandRoadSplineComponent* TargetSpline);
+	/** One door: Begin/End on every section. bIncludeMouthKeys adds CutS keys (Show / junction recook). */
+	METALANDROAD_API void PrepareLandscapeKeys(UMetaLandRoadSplineComponent* TargetSpline, bool bIncludeMouthKeys = false);
+
+	/** True when WorldS is on remaining road mesh (junction trim / CutS inclusive). */
+	METALANDROAD_API bool IsLandscapeOverlayStationVisible(
+		const class AMoKuEditSplineActor* Road,
+		double WorldS,
+		double TolCm = 80.0);
+
+	/** Stored S stays; Begin/End inside the hub draw at the cut. */
+	METALANDROAD_API double GetLandscapeAttributeDisplayS(
+		const class AMoKuEditSplineActor* Road,
+		const struct FMetaLandRoadLaneAttribute* Track,
+		int32 KeyIndex,
+		double StoredWorldS);
+
+	/** Hide hub-interior keys and extra CutS duplicates. Begin/End stay pickable (drawn at cut). */
+	METALANDROAD_API bool ShouldHideLandscapeAttributeKey(
+		const class AMoKuEditSplineActor* Road,
+		const struct FMetaLandRoadLaneAttribute* Track,
+		int32 KeyIndex,
+		double WorldS,
+		double TolCm = 80.0);
+
+	/** Visit drawable Landscape keys (WorldS is display S). Return false from Visit to stop. */
+	METALANDROAD_API void ForEachVisibleLandscapeKey(
+		const UMetaLandRoadSplineComponent* Spline,
+		const class AMoKuEditSplineActor* Road,
+		TFunctionRef<bool(int32 SectionIndex, int32 KeyIndex, double WorldS)> Visit);
 
 	/**
 	 * [KEY-ALGO] Auto-write Left + Right faces on every road (1 lane or N lanes).

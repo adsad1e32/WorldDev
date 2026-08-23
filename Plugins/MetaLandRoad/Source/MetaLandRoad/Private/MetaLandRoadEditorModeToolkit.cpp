@@ -12,6 +12,7 @@
 #include "EditorModeManager.h"
 #include "Tools/EdModeInteractiveToolsContext.h"
 #include "MoKuEditSplineActor.h"
+#include "MoKuEditIntersectionActor.h"
 #include "MetaLandRoadSplineComponent.h"
 #include "MetaLandRoadEditorModeCommands.h"
 #include "MetaLandRoadModule.h"
@@ -214,46 +215,45 @@ UMetaLandRoadSplineComponent* FMetaLandRoadEditorModeToolkit::FindSelectedRoadSp
 
 void FMetaLandRoadEditorModeToolkit::OnLandscapeAttributeClicked()
 {
-	OnLandscapeShowClicked();
+	FMetaLandRoadModule& Module = FMetaLandRoadModule::Get();
+	Module.EnterLandscapeAttributeOverlay();
+	Module.DismissLandscapeOverlayKeepAttribute();
 }
 
 void FMetaLandRoadEditorModeToolkit::OnLandscapeShowClicked()
 {
-	FMetaLandRoadModule& Module = FMetaLandRoadModule::Get();
-	UMetaLandRoadSplineComponent* Spline = FindSelectedRoadSpline();
-	if (!Spline)
-	{
-		Spline = Module.GetActiveNativeEditSpline();
-	}
-
-	Module.EnterLandscapeAttributeOverlay();
-
-	if (Spline)
-	{
-		Spline->EnsureAllCurvePointTypesForSmoothCorners(false);
-		MetaLandRoadProfile::EnsureLandscapeAttributeOnSections(Spline);
-		Spline->UpdateRoadLayout();
-		if (TSharedPtr<FMoKuEditSplinesComponentVisualizer> RoadVis = Module.GetRoadComponentVisualizer())
-		{
-			RoadVis->SetActiveForSpline(Spline);
-			RoadVis->SelectLandscapeAttributeKey(0, 0);
-		}
-		if (AMoKuEditSplineActor* Road = Cast<AMoKuEditSplineActor>(Spline->GetOwner()))
-		{
-			Road->NotifyLandscapeBrushChanged(true, false, true);
-		}
-	}
-	Module.SetLandscapeAttributeOverlayVisible(true);
-	RefreshLandscapeKeyDetails();
+	AActor* Selected = nullptr;
 	if (GEditor)
 	{
-		GEditor->RedrawLevelEditingViewports(true);
+		for (FSelectionIterator It(GEditor->GetSelectedActorIterator()); It; ++It)
+		{
+			AActor* Candidate = Cast<AActor>(*It);
+			if (Cast<AMoKuEditSplineActor>(Candidate) || Cast<AMoKuEditIntersectionActor>(Candidate))
+			{
+				Selected = Candidate;
+				break;
+			}
+		}
+	}
+
+	FMetaLandRoadModule& Module = FMetaLandRoadModule::Get();
+	if (Selected)
+	{
+		Module.ShowLandscapeOverlayForActor(Selected);
+		RefreshLandscapeKeyDetails();
+		return;
+	}
+
+	if (UMetaLandRoadSplineComponent* Spline = Module.GetActiveNativeEditSpline())
+	{
+		Module.ShowLandscapeOverlayForActor(Spline->GetOwner());
+		RefreshLandscapeKeyDetails();
 	}
 }
 
 void FMetaLandRoadEditorModeToolkit::OnLandscapeHideClicked()
 {
-	FMetaLandRoadModule::Get().HideLandscapeAttributeDisplay();
+	FMetaLandRoadModule::Get().DismissLandscapeOverlayKeepAttribute();
 }
 
 void FMetaLandRoadEditorModeToolkit::EnsureLandscapeKeyDetailsView()
@@ -285,14 +285,70 @@ void FMetaLandRoadEditorModeToolkit::EnsureLandscapeKeyDetailsView()
 		this, &FMetaLandRoadEditorModeToolkit::OnLandscapeKeyDetailsFinished);
 }
 
-void FMetaLandRoadEditorModeToolkit::RefreshLandscapeKeyDetails()
+void FMetaLandRoadEditorModeToolkit::EnsureJunctionLandscapeDetailsView()
 {
-	if (!LandscapeKeyDetailsView.IsValid() || !LandscapeKeyEditStruct.IsValid())
+	if (JunctionLandscapeDetailsView.IsValid())
 	{
 		return;
 	}
 
+	FPropertyEditorModule& PropModule = FModuleManager::LoadModuleChecked<FPropertyEditorModule>("PropertyEditor");
+	FDetailsViewArgs DetailsArgs;
+	DetailsArgs.bAllowSearch = false;
+	DetailsArgs.bHideSelectionTip = true;
+	DetailsArgs.bShowScrollBar = false;
+
+	FStructureDetailsViewArgs StructArgs;
+	StructArgs.bShowObjects = true;
+	StructArgs.bShowAssets = true;
+	StructArgs.bShowClasses = true;
+	StructArgs.bShowInterfaces = true;
+
+	JunctionLandscapeEditStruct = MakeShared<FStructOnScope>(FMetaLandRoadJunctionLandscapeDetails::StaticStruct());
+	JunctionLandscapeDetailsView = PropModule.CreateStructureDetailView(
+		DetailsArgs,
+		StructArgs,
+		JunctionLandscapeEditStruct,
+		LOCTEXT("JunctionLandscapeStruct", "Junction Landscape"));
+	JunctionLandscapeDetailsView->GetOnFinishedChangingPropertiesDelegate().AddSP(
+		this, &FMetaLandRoadEditorModeToolkit::OnJunctionLandscapeDetailsFinished);
+}
+
+void FMetaLandRoadEditorModeToolkit::RefreshLandscapeKeyDetails()
+{
+	EnsureLandscapeKeyDetailsView();
+	EnsureJunctionLandscapeDetailsView();
 	bRefreshingLandscapeKeyDetails = true;
+
+	if (AMoKuEditIntersectionActor* Junction = FMetaLandRoadModule::Get().GetLandscapeContextJunction())
+	{
+		if (JunctionLandscapeEditStruct.IsValid())
+		{
+			if (FMetaLandRoadJunctionLandscapeDetails* EditData =
+				reinterpret_cast<FMetaLandRoadJunctionLandscapeDetails*>(
+					JunctionLandscapeEditStruct->GetStructMemory()))
+			{
+				EditData->Landscape.SideOffset = Junction->JunctionSampleEdgeOffset;
+				EditData->Landscape.SideFalloff = Junction->JunctionSampleFalloffWidth;
+				EditData->Landscape.HeightOffset = Junction->RoadHeightmapSettings.FalloffSettings.ZOffset;
+				EditData->Landscape.LayerFactor = 1.0f;
+				EditData->Landscape.SyncFalloffFromMetaRoadFields();
+			}
+			if (JunctionLandscapeDetailsView.IsValid())
+			{
+				JunctionLandscapeDetailsView->SetStructureData(JunctionLandscapeEditStruct);
+			}
+		}
+		bRefreshingLandscapeKeyDetails = false;
+		return;
+	}
+
+	if (!LandscapeKeyDetailsView.IsValid() || !LandscapeKeyEditStruct.IsValid())
+	{
+		bRefreshingLandscapeKeyDetails = false;
+		return;
+	}
+
 	FMetaLandRoadLandscapeKeyDetails* EditData = reinterpret_cast<FMetaLandRoadLandscapeKeyDetails*>(
 		LandscapeKeyEditStruct->GetStructMemory());
 	if (EditData)
@@ -363,9 +419,29 @@ void FMetaLandRoadEditorModeToolkit::OnLandscapeKeyDetailsFinished(const FProper
 	RoadVis->SetSelectedLandscapeKeyValue(Value);
 }
 
+void FMetaLandRoadEditorModeToolkit::OnJunctionLandscapeDetailsFinished(const FPropertyChangedEvent& PropertyChangedEvent)
+{
+	if (bRefreshingLandscapeKeyDetails || !JunctionLandscapeEditStruct.IsValid())
+	{
+		return;
+	}
+
+	AMoKuEditIntersectionActor* Junction = FMetaLandRoadModule::Get().GetLandscapeContextJunction();
+	const FMetaLandRoadJunctionLandscapeDetails* EditData =
+		reinterpret_cast<const FMetaLandRoadJunctionLandscapeDetails*>(
+			JunctionLandscapeEditStruct->GetStructMemory());
+	if (!Junction || !EditData)
+	{
+		return;
+	}
+
+	Junction->ApplyJunctionLandscapeValue(EditData->Landscape);
+}
+
 TSharedRef<SWidget> FMetaLandRoadEditorModeToolkit::BuildLandscapeAttributePanel()
 {
 	EnsureLandscapeKeyDetailsView();
+	EnsureJunctionLandscapeDetailsView();
 
 	auto MatchesSearch = [this](const FText& DisplayName) -> bool
 	{
@@ -376,8 +452,12 @@ TSharedRef<SWidget> FMetaLandRoadEditorModeToolkit::BuildLandscapeAttributePanel
 		return DisplayName.ToString().Contains(AttributeSearchText, ESearchCase::IgnoreCase);
 	};
 
-	auto MakeAttributeRow = [this](FName TypeId, const FText& DisplayName, const FName IconName, bool bPinned) -> TSharedRef<SWidget>
+	auto MakeAttributeRow = [this](const FMetaLandRoadAttributeTypeDesc& Desc, bool bPinned) -> TSharedRef<SWidget>
 	{
+		const FName TypeId = Desc.TypeId;
+		const FText DisplayName = Desc.DisplayName;
+		const FName IconName = Desc.IconName.IsNone() ? FName(TEXT("ClassIcon.Actor")) : Desc.IconName;
+		const FText CategoryText = FText::FromName(Desc.Category);
 		const bool bIsLandscape = TypeId == FMetaLandRoadAttributeRegistry::TypeLandscape;
 		return SNew(SBorder)
 			.BorderImage(FAppStyle::GetBrush("WhiteBrush"))
@@ -433,120 +513,71 @@ TSharedRef<SWidget> FMetaLandRoadEditorModeToolkit::BuildLandscapeAttributePanel
 					+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
 					[
 						SNew(STextBlock)
-						.Text(FText::GetEmpty())
+						.Text(CategoryText)
 						.ColorAndOpacity(FSlateColor::UseSubduedForeground())
 					]
 				]
 			];
 	};
 
-	return SNew(SBorder)
-		.BorderImage(FAppStyle::GetBrush("ToolPanel.GroupBorder"))
-		.Padding(8.0f)
+	TSharedRef<SVerticalBox> Panel = SNew(SVerticalBox)
+		+ SVerticalBox::Slot().AutoHeight().Padding(0.0f, 0.0f, 0.0f, 6.0f)
 		[
-			SNew(SVerticalBox)
-			+ SVerticalBox::Slot().AutoHeight().Padding(0.0f, 0.0f, 0.0f, 6.0f)
-			[
-				SNew(SSearchBox)
-				.HintText(LOCTEXT("SearchAttributes", "Search attributes..."))
-				.OnTextChanged_Lambda([this](const FText& NewText)
+			SNew(SSearchBox)
+			.HintText(LOCTEXT("SearchAttributes", "Search attributes..."))
+			.OnTextChanged_Lambda([this](const FText& NewText)
+			{
+				AttributeSearchText = NewText.ToString();
+				if (ToolkitWidget.IsValid())
 				{
-					AttributeSearchText = NewText.ToString();
-					if (ToolkitWidget.IsValid())
-					{
-						ToolkitWidget->Invalidate(EInvalidateWidgetReason::Paint);
-					}
-				})
-			]
-			+ SVerticalBox::Slot().AutoHeight().Padding(2.0f, 0.0f, 2.0f, 4.0f)
+					ToolkitWidget->Invalidate(EInvalidateWidgetReason::Paint);
+				}
+			})
+		]
+		+ SVerticalBox::Slot().AutoHeight().Padding(2.0f, 0.0f, 2.0f, 4.0f)
+		[
+			SNew(SHorizontalBox)
+			+ SHorizontalBox::Slot().AutoWidth().Padding(0.0f, 0.0f, 22.0f, 0.0f)
 			[
-				SNew(SHorizontalBox)
-				+ SHorizontalBox::Slot().AutoWidth().Padding(0.0f, 0.0f, 22.0f, 0.0f)
-				[
-					SNew(SImage)
-					.Image(FAppStyle::GetBrush("Icons.Pin"))
-					.ColorAndOpacity(FSlateColor::UseSubduedForeground())
-				]
-				+ SHorizontalBox::Slot().FillWidth(1.0f)
-				[
-					SNew(STextBlock)
-					.Text(LOCTEXT("AttributeCol", "Attribute"))
-					.ColorAndOpacity(FSlateColor::UseSubduedForeground())
-				]
-				+ SHorizontalBox::Slot().AutoWidth()
-				[
-					SNew(STextBlock)
-					.Text(LOCTEXT("TypeCol", "Type"))
-					.ColorAndOpacity(FSlateColor::UseSubduedForeground())
-				]
+				SNew(SImage)
+				.Image(FAppStyle::GetBrush("Icons.Pin"))
+				.ColorAndOpacity(FSlateColor::UseSubduedForeground())
 			]
-			+ SVerticalBox::Slot().AutoHeight()
+			+ SHorizontalBox::Slot().FillWidth(1.0f)
+			[
+				SNew(STextBlock)
+				.Text(LOCTEXT("AttributeCol", "Attribute"))
+				.ColorAndOpacity(FSlateColor::UseSubduedForeground())
+			]
+			+ SHorizontalBox::Slot().AutoWidth()
+			[
+				SNew(STextBlock)
+				.Text(LOCTEXT("TypeCol", "Type"))
+				.ColorAndOpacity(FSlateColor::UseSubduedForeground())
+			]
+		];
+
+	for (const FMetaLandRoadAttributeTypeDesc& Desc : FMetaLandRoadAttributeRegistry::GetTypes())
+	{
+		const FText DisplayName = Desc.DisplayName;
+		const bool bPinned = Desc.TypeId == FMetaLandRoadAttributeRegistry::TypeLandscape;
+		Panel->AddSlot()
+			.AutoHeight()
 			[
 				SNew(SBox)
-				.Visibility_Lambda([MatchesSearch]()
+				.Visibility_Lambda([MatchesSearch, DisplayName]()
 				{
-					return MatchesSearch(LOCTEXT("MarkAttr", "Mark")) ? EVisibility::Visible : EVisibility::Collapsed;
+					return MatchesSearch(DisplayName) ? EVisibility::Visible : EVisibility::Collapsed;
 				})
 				[
-					MakeAttributeRow(FMetaLandRoadAttributeRegistry::TypeMark, LOCTEXT("MarkAttr", "Mark"), "ClassIcon.Actor", false)
+					MakeAttributeRow(Desc, bPinned)
 				]
-			]
-			+ SVerticalBox::Slot().AutoHeight()
-			[
-				SNew(SBox)
-				.Visibility_Lambda([MatchesSearch]()
-				{
-					return MatchesSearch(LOCTEXT("SpeedAttr", "Speed")) ? EVisibility::Visible : EVisibility::Collapsed;
-				})
-				[
-					MakeAttributeRow(FMetaLandRoadAttributeRegistry::TypeSpeed, LOCTEXT("SpeedAttr", "Speed"), "ClassIcon.Actor", false)
-				]
-			]
-			+ SVerticalBox::Slot().AutoHeight()
-			[
-				SNew(SBox)
-				.Visibility_Lambda([MatchesSearch]()
-				{
-					return MatchesSearch(LOCTEXT("CurbCutAttr", "Curb Cut")) ? EVisibility::Visible : EVisibility::Collapsed;
-				})
-				[
-					MakeAttributeRow(FMetaLandRoadAttributeRegistry::TypeCurbCut, LOCTEXT("CurbCutAttr", "Curb Cut"), "GraphEditor.Curve_16x", false)
-				]
-			]
-			+ SVerticalBox::Slot().AutoHeight()
-			[
-				SNew(SBox)
-				.Visibility_Lambda([MatchesSearch]()
-				{
-					return MatchesSearch(LOCTEXT("LandscapeAttr", "Landscape")) ? EVisibility::Visible : EVisibility::Collapsed;
-				})
-				[
-					MakeAttributeRow(FMetaLandRoadAttributeRegistry::TypeLandscape, LOCTEXT("LandscapeAttr", "Landscape"), "ClassIcon.Landscape", true)
-				]
-			]
-			+ SVerticalBox::Slot().AutoHeight()
-			[
-				SNew(SBox)
-				.Visibility_Lambda([MatchesSearch]()
-				{
-					return MatchesSearch(LOCTEXT("PolygonAttr", "Polygon")) ? EVisibility::Visible : EVisibility::Collapsed;
-				})
-				[
-					MakeAttributeRow(FMetaLandRoadAttributeRegistry::TypePolygon, LOCTEXT("PolygonAttr", "Polygon"), "Icons.Transform", false)
-				]
-			]
-			+ SVerticalBox::Slot().AutoHeight()
-			[
-				SNew(SBox)
-				.Visibility_Lambda([MatchesSearch]()
-				{
-					return MatchesSearch(LOCTEXT("SidewalkHeightAttr", "Sidewalk Height")) ? EVisibility::Visible : EVisibility::Collapsed;
-				})
-				[
-					MakeAttributeRow(FMetaLandRoadAttributeRegistry::TypeSidewalkHeight, LOCTEXT("SidewalkHeightAttr", "Sidewalk Height"), "ClassIcon.StaticMeshActor", false)
-				]
-			]
-			+ SVerticalBox::Slot().AutoHeight().Padding(8.0f, 4.0f, 0.0f, 4.0f)
+			];
+	}
+
+	Panel->AddSlot()
+		.AutoHeight()
+		.Padding(8.0f, 4.0f, 0.0f, 4.0f)
 			[
 				SNew(SHorizontalBox)
 				.Visibility_Lambda([]()
@@ -575,41 +606,84 @@ TSharedRef<SWidget> FMetaLandRoadEditorModeToolkit::BuildLandscapeAttributePanel
 						return FReply::Handled();
 					})
 				]
-			]
-			+ SVerticalBox::Slot().AutoHeight().Padding(0.0f, 6.0f, 0.0f, 2.0f)
+			];
+
+	Panel->AddSlot()
+		.AutoHeight()
+		.Padding(0.0f, 6.0f, 0.0f, 2.0f)
+		[
+			SNew(STextBlock)
+			.Visibility_Lambda([]()
+			{
+				return FMetaLandRoadModule::Get().ShouldShowLandscapeDetailsPanel()
+					? EVisibility::Visible
+					: EVisibility::Collapsed;
+			})
+			.Text_Lambda([]()
+			{
+				if (FMetaLandRoadModule::Get().GetLandscapeContextJunction())
+				{
+					return LOCTEXT("JunctionLandscapeTitle", "Junction Landscape");
+				}
+				if (const TSharedPtr<FMoKuEditSplinesComponentVisualizer> RoadVis =
+					FMetaLandRoadModule::Get().GetRoadComponentVisualizer())
+				{
+					return RoadVis->GetSelectedLandscapeKeyTitle();
+				}
+				return LOCTEXT("LandscapeKeyBeginTitle", "Landscape Key Begin");
+			})
+		];
+
+	Panel->AddSlot()
+		.AutoHeight()
+		[
+			SNew(SBox)
+			.Visibility_Lambda([]()
+			{
+				return FMetaLandRoadModule::Get().ShouldShowLandscapeDetailsPanel()
+					? EVisibility::Visible
+					: EVisibility::Collapsed;
+			})
 			[
-				SNew(STextBlock)
-				.Visibility_Lambda([]()
-				{
-					return FMetaLandRoadModule::Get().IsLandscapeAttributeSelected()
-						? EVisibility::Visible
-						: EVisibility::Collapsed;
-				})
-				.Text_Lambda([]()
-				{
-					if (const TSharedPtr<FMoKuEditSplinesComponentVisualizer> RoadVis =
-						FMetaLandRoadModule::Get().GetRoadComponentVisualizer())
-					{
-						return RoadVis->GetSelectedLandscapeKeyTitle();
-					}
-					return LOCTEXT("LandscapeKeyBeginTitle", "Landscape Key Begin");
-				})
-			]
-			+ SVerticalBox::Slot().AutoHeight()
-			[
-				SNew(SBox)
-				.Visibility_Lambda([]()
-				{
-					return FMetaLandRoadModule::Get().IsLandscapeAttributeSelected()
-						? EVisibility::Visible
-						: EVisibility::Collapsed;
-				})
+				SNew(SVerticalBox)
+				+ SVerticalBox::Slot().AutoHeight()
 				[
-					LandscapeKeyDetailsView.IsValid()
-						? LandscapeKeyDetailsView->GetWidget().ToSharedRef()
-						: SNullWidget::NullWidget
+					SNew(SBox)
+					.Visibility_Lambda([]()
+					{
+						return FMetaLandRoadModule::Get().GetLandscapeContextJunction()
+							? EVisibility::Collapsed
+							: EVisibility::Visible;
+					})
+					[
+						LandscapeKeyDetailsView.IsValid()
+							? LandscapeKeyDetailsView->GetWidget().ToSharedRef()
+							: SNullWidget::NullWidget
+					]
+				]
+				+ SVerticalBox::Slot().AutoHeight()
+				[
+					SNew(SBox)
+					.Visibility_Lambda([]()
+					{
+						return FMetaLandRoadModule::Get().GetLandscapeContextJunction()
+							? EVisibility::Visible
+							: EVisibility::Collapsed;
+					})
+					[
+						JunctionLandscapeDetailsView.IsValid()
+							? JunctionLandscapeDetailsView->GetWidget().ToSharedRef()
+							: SNullWidget::NullWidget
+					]
 				]
 			]
+		];
+
+	return SNew(SBorder)
+		.BorderImage(FAppStyle::GetBrush("ToolPanel.GroupBorder"))
+		.Padding(8.0f)
+		[
+			Panel
 		];
 }
 

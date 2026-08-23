@@ -1,0 +1,622 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Render Dependency Graph · 官方文档图解</title>
+  <style>
+    :root { --text:#1a1a1a; --muted:#555; --line:#d8d8d8; --code:#f3f3f3; --th:#f6f6f6; --link:#0b57d0; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0 auto; max-width: 900px; padding: 40px 28px 80px;
+      font: 16px/1.65 "Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+      color: var(--text); background: #fff;
+    }
+    h1 { font-size: 28px; line-height: 1.3; margin: 0 0 10px; }
+    h2 { font-size: 21px; margin: 42px 0 12px; }
+    h3 { font-size: 17px; margin: 22px 0 10px; }
+    p { margin: 8px 0 14px; }
+    .sub { color: var(--muted); font-size: 14px; margin-bottom: 24px; }
+    .sub a { color: var(--link); }
+    table { width: 100%; border-collapse: collapse; margin: 10px 0 16px; font-size: 14.5px; }
+    th, td { border: 1px solid var(--line); padding: 8px 11px; text-align: left; vertical-align: top; }
+    th { background: var(--th); font-weight: 600; }
+    tr:nth-child(even) td { background: #fafafa; }
+    code, pre {
+      font-family: Consolas,"Cascadia Mono","SF Mono",monospace;
+      font-size: 0.86em; background: var(--code); border-radius: 3px;
+    }
+    code { padding: 1px 5px; }
+    pre {
+      padding: 12px 14px; overflow-x: auto; line-height: 1.45;
+      border: 1px solid var(--line); margin: 8px 0 16px;
+    }
+    .toc { font-size: 14.5px; line-height: 1.85; margin-bottom: 8px; }
+    .toc a { color: var(--link); text-decoration: none; }
+    .toc a:hover { text-decoration: underline; }
+    .fig { margin: 14px 0 18px; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; background: #fcfcfc; }
+    .fig svg { display: block; width: 100%; height: auto; }
+    .cap { font-size: 13px; color: var(--muted); padding: 8px 12px; border-top: 1px solid var(--line); }
+    @media print { body { max-width: none; padding: 12px; } .fig, table, pre { break-inside: avoid; } }
+  </style>
+</head>
+<body>
+
+<h1>Render Dependency Graph（RDG）</h1>
+<p class="sub">
+  官方页 <a href="https://dev.epicgames.com/documentation/unreal-engine/render-dependency-graph-in-unreal-engine">Render Dependency Graph in Unreal Engine</a>（UE 5.8）的中文图解版。
+  API / 类名保留英文。不是逐段翻译，按官方目录做成对照表 + 图。
+</p>
+
+<div class="toc">
+  <div>1. <a href="#s1">RDG 是什么</a></div>
+  <div>2. <a href="#s2">Shader Parameter Structs</a>（<a href="#s2a">宏与 HLSL 类型</a>）</div>
+  <div>3. <a href="#s3">Shader Bindings</a></div>
+  <div>4. <a href="#s4">Uniform Buffers 与 Static Bindings</a></div>
+  <div>5. <a href="#s5">FRDGBuilder：建图与 Execute</a></div>
+  <div>6. <a href="#s6">Setup / Execute 两条时间线</a></div>
+  <div>7. <a href="#s7">工具函数</a></div>
+  <div>8. <a href="#s8">RDG 资源与 Views</a></div>
+  <div>9. <a href="#s9">Pass 与 Parameters（三种写法）</a></div>
+  <div>10. <a href="#s10">Raster Pass 与 Load Action</a></div>
+  <div>11. <a href="#s11">依赖、Cull、Mip 链</a></div>
+  <div>12. <a href="#s12">Asynchronous Compute</a></div>
+  <div>13. <a href="#s13">External 与 Transient</a></div>
+  <div>14. <a href="#s14">RDG Uniform Buffer 与 Upload</a></div>
+  <div>15. <a href="#s15">内存寿命与约定</a></div>
+  <div>16. <a href="#s16">调试、Validation、Insights</a></div>
+</div>
+
+<h2 id="s1">1. RDG 是什么</h2>
+<p>官方定义：RDG 是一套 <strong>immediate-mode API</strong> —— 按顺序调用 <code>Create*</code> / <code>AddPass</code>，命令被 <strong>记进一张图</strong>，再 <strong>Compile</strong>、再 <strong>Execute</strong>。它自动做易错操作，并遍历图来省显存、在 CPU/GPU 上并行 pass。</p>
+
+<table>
+  <tr><th>官方列出的能力</th><th>一句话</th></tr>
+  <tr><td>Asynchronous compute fences</td><td>按依赖在 Graphics / Async 队列之间插 fence</td></tr>
+  <tr><td>Transient resources + aliasing</td><td>短命资源按寿命分配，不相交可共用显存</td></tr>
+  <tr><td>Split-barriers on sub-resources</td><td>子资源 split-barrier，藏延迟、提高重叠</td></tr>
+  <tr><td>Parallel command list recording</td><td>多线程录制 command list</td></tr>
+  <tr><td>Culling unused resources / passes</td><td>丢掉图里没人用的资源和 pass</td></tr>
+  <tr><td>Validation</td><td>检查用法和依赖</td></tr>
+  <tr><td>RDG Insights</td><td>可视化图结构和显存寿命</td></tr>
+</table>
+<p>Deferred / Mobile 以及相关插件都已切到 RDG。<strong>新的高层渲染应写 RDG</strong>，尤其要用到上表时。</p>
+
+<div class="fig">
+<svg viewBox="0 0 860 100" xmlns="http://www.w3.org/2000/svg">
+  <defs><marker id="ar" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#333"/></marker></defs>
+  <rect x="16" y="26" width="150" height="48" rx="6" fill="#eef3ff" stroke="#8aa4d4"/><text x="91" y="54" text-anchor="middle" font-size="13">你写 Setup</text>
+  <rect x="186" y="26" width="150" height="48" rx="6" fill="#e8f6ee" stroke="#7bb89a"/><text x="261" y="54" text-anchor="middle" font-size="13">Compile</text>
+  <rect x="356" y="26" width="150" height="48" rx="6" fill="#fff4e0" stroke="#d4a85a"/><text x="431" y="54" text-anchor="middle" font-size="13">Execute λ</text>
+  <rect x="526" y="26" width="150" height="48" rx="6" fill="#fde8e8" stroke="#d48a8a"/><text x="601" y="54" text-anchor="middle" font-size="13">RHI</text>
+  <rect x="696" y="26" width="148" height="48" rx="6" fill="#f3f3f3" stroke="#aaa"/><text x="770" y="54" text-anchor="middle" font-size="13">GPU</text>
+  <line x1="166" y1="50" x2="184" y2="50" stroke="#333" marker-end="url(#ar)"/>
+  <line x1="336" y1="50" x2="354" y2="50" stroke="#333" marker-end="url(#ar)"/>
+  <line x1="506" y1="50" x2="524" y2="50" stroke="#333" marker-end="url(#ar)"/>
+  <line x1="676" y1="50" x2="694" y2="50" stroke="#333" marker-end="url(#ar)"/>
+</svg>
+<p class="cap">图 1 · 官方核心：先记图，Execute 才跟 RHI 说话。写法像立即模式，执行是延迟的。</p>
+</div>
+
+<h2 id="s2">2. Shader Parameter Structs</h2>
+<p>RDG 的依赖，建立在 <strong>shader parameter struct</strong> 的扩展上。同一套槽位既给 HLSL 绑参数，也给 RDG 扫「谁读谁写」。</p>
+
+<table>
+  <tr><th>层</th><th>长什么样</th></tr>
+  <tr><td>HLSL</td><td><code>float2 ViewportSize;</code> <code>Texture2D SceneColorTexture;</code> <code>RWTexture2D&lt;float4&gt; SceneColorOutput;</code></td></tr>
+  <tr><td>理想 C++（不要手写）</td><td>扁平 struct，里面是 <code>FRHITexture*</code> / <code>FRHIUnorderedAccessView*</code></td></tr>
+  <tr><td>官方写法</td><td><code>BEGIN_SHADER_PARAMETER_STRUCT</code> + 一堆宏 → <strong>结构体 + 编译期反射</strong></td></tr>
+</table>
+
+<pre>BEGIN_SHADER_PARAMETER_STRUCT(FMyShaderParameters, /* MODULE_API */)
+    SHADER_PARAMETER(FVector2D, ViewportSize)
+    SHADER_PARAMETER(FVector4, Hello)
+    SHADER_PARAMETER(float, World)
+    SHADER_PARAMETER_ARRAY(FVector, FooBarArray, [16])
+    SHADER_PARAMETER_TEXTURE(Texture2D, BlueNoiseTexture)
+    SHADER_PARAMETER_SAMPLER(SamplerState, BlueNoiseSampler)
+    SHADER_PARAMETER_TEXTURE(Texture2D, SceneColorTexture)
+    SHADER_PARAMETER_UAV(RWTexture2D, SceneColorOutput)
+END_SHADER_PARAMETER_STRUCT()</pre>
+
+<h3 id="s2a">2.1 这些宏、变量、HLSL 类型是什么</h3>
+<p>每一行都是：<strong>宏（怎么往 C++ struct 里塞）</strong> + <strong>HLSL 类型（GPU 眼里它是什么）</strong> + <strong>变量名（必须和 <code>.usf</code> 里同名）</strong>。</p>
+
+<table>
+  <tr><th>这一行</th><th>宏在干什么</th><th>变量是什么</th><th>HLSL 侧</th></tr>
+  <tr>
+    <td><code>SHADER_PARAMETER(FVector2D, ViewportSize)</code></td>
+    <td>塞一个 <strong>常量</strong>（进 Constant Buffer）</td>
+    <td>视口宽高，例如 <code>(1920, 1080)</code></td>
+    <td><code>float2 ViewportSize</code></td>
+  </tr>
+  <tr>
+    <td><code>SHADER_PARAMETER(FVector4, Hello)</code></td>
+    <td>同上，四个 float</td>
+    <td>官方例子的占位名，随便什么四维数</td>
+    <td><code>float4 Hello</code></td>
+  </tr>
+  <tr>
+    <td><code>SHADER_PARAMETER(float, World)</code></td>
+    <td>单个标量</td>
+    <td>占位名，一个 float</td>
+    <td><code>float World</code></td>
+  </tr>
+  <tr>
+    <td><code>SHADER_PARAMETER_ARRAY(FVector, FooBarArray, [16])</code></td>
+    <td>常量数组，长度写在第三参</td>
+    <td>16 个 <code>float3</code>（C++ <code>FVector</code> 按 16 字节对齐常被当成 float4 槽）</td>
+    <td><code>float3 FooBarArray[16]</code></td>
+  </tr>
+  <tr>
+    <td><code>SHADER_PARAMETER_TEXTURE(Texture2D, BlueNoiseTexture)</code></td>
+    <td>绑一张 <strong>只读</strong> 2D 贴图（RHI <code>FRHITexture*</code>）</td>
+    <td>蓝噪声贴图，用来破带、抖动</td>
+    <td><code>Texture2D BlueNoiseTexture</code></td>
+  </tr>
+  <tr>
+    <td><code>SHADER_PARAMETER_SAMPLER(SamplerState, BlueNoiseSampler)</code></td>
+    <td>绑一个 <strong>采样器</strong>（怎么读贴图）</td>
+    <td>和上一张贴图配对：滤波、寻址</td>
+    <td><code>SamplerState BlueNoiseSampler</code></td>
+  </tr>
+  <tr>
+    <td><code>SHADER_PARAMETER_TEXTURE(Texture2D, SceneColorTexture)</code></td>
+    <td>又一张只读 2D 图</td>
+    <td>场景颜色（上一 pass 画好的画面）</td>
+    <td><code>Texture2D SceneColorTexture</code></td>
+  </tr>
+  <tr>
+    <td><code>SHADER_PARAMETER_UAV(RWTexture2D, SceneColorOutput)</code></td>
+    <td>绑一个 <strong>可写</strong> 视图（UAV）</td>
+    <td>Compute 写出的目标图</td>
+    <td><code>RWTexture2D&lt;float4&gt; SceneColorOutput</code></td>
+  </tr>
+</table>
+
+<table>
+  <tr><th>HLSL / 宏里的类型</th><th>是什么</th><th>类比</th></tr>
+  <tr>
+    <td><code>Texture2D</code></td>
+    <td>一张 2D 像素数组，shader 里 <strong>只能读</strong>。<code>Load(int2)</code> 或 <code>Sample(sampler, uv)</code>。</td>
+    <td>一本只能翻的相册</td>
+  </tr>
+  <tr>
+    <td><code>SamplerState</code></td>
+    <td>不是图，是 <strong>读图的规则</strong>：线性还是点采样、UV 出界 Clamp 还是 Wrap、各向异性等。一张图可以配不同 sampler。</td>
+    <td>放大镜 / 滤镜，不是照片本身</td>
+  </tr>
+  <tr>
+    <td><code>RWTexture2D</code> / <code>RWTexture2D&lt;float4&gt;</code></td>
+    <td><strong>Read-Write Texture2D</strong>。Compute（或 UAV 光栅）可以 <code>Output[xy] = color</code> 直接写像素。一般要 UAV 绑定，不能同时当普通 <code>Texture2D</code> 采样（除非特殊）。<code>&lt;float4&gt;</code> 是每个像素四通道。</td>
+    <td>可以涂改的画板</td>
+  </tr>
+  <tr>
+    <td><code>FVector2D</code> / <code>float2</code></td>
+    <td>两个 float（宽、高或 UV）</td>
+    <td>—</td>
+  </tr>
+  <tr>
+    <td><code>FVector4</code> / <code>float4</code></td>
+    <td>四个 float（颜色 RGBA 或任意四元组）</td>
+    <td>—</td>
+  </tr>
+  <tr>
+    <td>UAV</td>
+    <td><strong>Unordered Access View</strong>：GPU 上「随便写哪个像素」，不走光栅 RT 管线。CS 写图几乎都是 UAV。</td>
+    <td>和 <code>SV_Target0</code> 那条 RT 是另一条写路径</td>
+  </tr>
+  <tr>
+    <td>SRV</td>
+    <td><strong>Shader Resource View</strong>：只读绑到 shader。普通 <code>Texture2D</code> / <code>StructuredBuffer</code> 都是 SRV。</td>
+    <td>只读口</td>
+  </tr>
+</table>
+
+<div class="fig">
+<svg viewBox="0 0 860 150" xmlns="http://www.w3.org/2000/svg">
+  <rect x="20" y="20" width="200" height="110" rx="8" fill="#eef3ff" stroke="#8aa4d4"/>
+  <text x="120" y="48" text-anchor="middle" font-size="13">Texture2D</text>
+  <text x="120" y="70" text-anchor="middle" font-size="11" fill="#555">像素数据（只读）</text>
+  <text x="120" y="90" text-anchor="middle" font-size="11" fill="#555">BlueNoise / SceneColor</text>
+  <text x="120" y="112" text-anchor="middle" font-size="11" fill="#555">SRV</text>
+  <rect x="250" y="20" width="200" height="110" rx="8" fill="#fff4e0" stroke="#d4a85a"/>
+  <text x="350" y="48" text-anchor="middle" font-size="13">SamplerState</text>
+  <text x="350" y="70" text-anchor="middle" font-size="11" fill="#555">怎么采样</text>
+  <text x="350" y="90" text-anchor="middle" font-size="11" fill="#555">Point / Linear / Clamp</text>
+  <text x="350" y="112" text-anchor="middle" font-size="11" fill="#555">不是贴图</text>
+  <rect x="480" y="20" width="200" height="110" rx="8" fill="#e8f6ee" stroke="#7bb89a"/>
+  <text x="580" y="48" text-anchor="middle" font-size="13">常量</text>
+  <text x="580" y="70" text-anchor="middle" font-size="11" fill="#555">ViewportSize / Hello</text>
+  <text x="580" y="90" text-anchor="middle" font-size="11" fill="#555">World / FooBarArray</text>
+  <text x="580" y="112" text-anchor="middle" font-size="11" fill="#555">Constant Buffer</text>
+  <rect x="710" y="20" width="130" height="110" rx="8" fill="#fde8e8" stroke="#d48a8a"/>
+  <text x="775" y="48" text-anchor="middle" font-size="13">RWTexture2D</text>
+  <text x="775" y="70" text-anchor="middle" font-size="11" fill="#555">可写</text>
+  <text x="775" y="90" text-anchor="middle" font-size="11" fill="#555">SceneColorOutput</text>
+  <text x="775" y="112" text-anchor="middle" font-size="11" fill="#555">UAV</text>
+</svg>
+<p class="cap">图 1b · 贴图是数据，Sampler 是读法，常量是数字，RW/UAV 才是 Compute 的写出口。光栅 PS 写颜色通常走 RT（<code>SV_Target</code>），不走 UAV。</p>
+</div>
+
+<p><code>SHADER_PARAMETER_TEXTURE</code> + <code>SAMPLER</code> 是 <strong>旧 RHI 绑法</strong>（C++ 里是 <code>FRHITexture*</code>）。进 RDG 后同一意图改成 <code>SHADER_PARAMETER_RDG_TEXTURE</code>，RDG 才能看见依赖边。我们 Stamp 的 <code>T_Combined</code> 就是 RDG 版只读图；写 Dest 走的是 <code>RENDER_TARGET_BINDING_SLOTS</code>，不是 <code>RWTexture2D</code>。</p>
+
+<table>
+  <tr><th>宏</th><th>对应 HLSL</th><th>RDG 是否当资源边</th></tr>
+  <tr><td><code>SHADER_PARAMETER(Type, Name)</code></td><td>常量 / 数组</td><td>否</td></tr>
+  <tr><td><code>SHADER_PARAMETER_TEXTURE</code></td><td><code>Texture2D</code>（RHI 指针）</td><td>否（旧绑法）</td></tr>
+  <tr><td><code>SHADER_PARAMETER_UAV</code></td><td><code>RWTexture2D</code></td><td>否（旧绑法）</td></tr>
+  <tr><td><code>SHADER_PARAMETER_RDG_TEXTURE</code></td><td>同上，但是 <code>FRDGTexture*</code></td><td><strong>是</strong></td></tr>
+  <tr><td><code>SHADER_PARAMETER_RDG_TEXTURE_UAV</code></td><td>CS 可写</td><td><strong>是</strong></td></tr>
+  <tr><td><code>SHADER_PARAMETER_RDG_BUFFER_SRV</code></td><td><code>StructuredBuffer</code></td><td><strong>是</strong></td></tr>
+</table>
+<p>反射：<code>FMyShaderParameters::FTypeInfo::GetStructMetadata()</code>。每个成员有名字、C++/HLSL 类型、byte offset。RDG <strong>靠扫这些成员</strong> 推 pass 依赖。详见 <code>FShaderParametersMetadata::FMember</code>。</p>
+
+<h2 id="s3">3. Shader Bindings</h2>
+<p>参数 struct 要和 <code>FShader</code> 配在一起，才能往 command list 上绑。</p>
+<table>
+  <tr><th>步骤</th><th>做什么</th></tr>
+  <tr><td>1</td><td>派生 <code>FGlobalShader</code>（或 Material shader）</td></tr>
+  <tr><td>2</td><td><code>DECLARE_GLOBAL_SHADER</code></td></tr>
+  <tr><td>3</td><td><code>SHADER_USE_PARAMETER_STRUCT(本类, 基类)</code> —— 生成构造函数，注册绑定</td></tr>
+  <tr><td>4</td><td><code>using FParameters = FMyShaderParameters;</code> 或在类里内联 <code>BEGIN_SHADER_PARAMETER_STRUCT(FParameters,)</code></td></tr>
+  <tr><td>5</td><td>填 struct，调用 <code>SetShaderParameters(RHICmdList, Shader, ShaderRHI, Parameters)</code></td></tr>
+</table>
+<pre>class FMyShaderCS : public FGlobalShader
+{
+    DECLARE_GLOBAL_SHADER(FMyShaderCS);
+    SHADER_USE_PARAMETER_STRUCT(FMyShaderCS, FGlobalShader);
+    using FParameters = FMyShaderParameters;
+};</pre>
+<p>不经过 RDG 时：<code>SetComputeShader</code> → 填栈上 <code>FParameters</code> → <code>SetShaderParameters</code> → <code>DispatchComputeShader</code>。RDG 只是把「填参数 + Dispatch」<strong>推迟进 pass lambda</strong>，并把 RHI 指针换成 RDG 句柄。</p>
+
+<h2 id="s4">4. Uniform Buffers 与 Static Bindings</h2>
+<h3>4.1 普通 Uniform Buffer</h3>
+<table>
+  <tr><th>宏</th><th>作用</th></tr>
+  <tr><td><code>BEGIN_UNIFORM_BUFFER_STRUCT</code> / <code>END_…</code></td><td>声明一组打成一个 RHI UB 的参数</td></tr>
+  <tr><td><code>IMPLEMENT_UNIFORM_BUFFER_STRUCT(Type, "HLSL名")</code></td><td>登记，并生成 HLSL（<code>UniformBuffer.Member</code>）</td></tr>
+  <tr><td><code>SHADER_PARAMETER_STRUCT_REF</code></td><td>在父 <code>FParameters</code> 里引用这份 UB</td></tr>
+</table>
+<p>HLSL 通过 <code>/Engine/Generated/GeneratedUniformBuffers.ush</code>（<code>Common.ush</code> 会带上）。每个 UB 是一个 <strong>全局命名空间</strong>。</p>
+
+<h3 id="s4why">4.1b 官方 sample / 我们 Stamp 为什么没用这套 UB 宏</h3>
+<p>上面三行宏是为了做一份 <strong>有名字、可复用、多 shader 共享</strong> 的 Buffer（如 <code>SceneTexturesStruct</code>）。官方 §2 那个 <code>FMyShaderParameters</code>，以及我们的 <code>FRoadLandscapeProfilePS::FParameters</code>，都 <strong>不必</strong> 再包一层。</p>
+<table>
+  <tr><th></th><th><code>SHADER_PARAMETER(float, World)</code> 这种</th><th><code>BEGIN_UNIFORM_BUFFER_STRUCT</code></th></tr>
+  <tr><td>干什么</td><td>写在 <strong>这一个 shader</strong> 的 <code>FParameters</code> 里</td><td>单独登记一份 <strong>全局命名空间</strong>，很多 shader 都能 <code>UB.成员</code></td></tr>
+  <tr><td>常量存在哪</td><td>引擎仍会打进一份 <strong>隐式 root Uniform Buffer</strong>（<code>SetShaderParameters</code> 自动建）</td><td>你自己命名的那份 UB</td></tr>
+  <tr><td>谁用</td><td>仅本 pass / 本 Global Shader</td><td>View、SceneTextures、整帧共用</td></tr>
+  <tr><td>HLSL</td><td>直接写 <code>float World;</code></td><td><code>SceneTexturesStruct.SceneColorTexture</code></td></tr>
+</table>
+<table>
+  <tr><th>我们 Stamp 里的东西</th><th>它是哪种 Buffer</th><th>为什么不是 §4.1 那种 UB</th></tr>
+  <tr><td><code>NumSamples</code> / <code>StampSize</code> / 矩阵</td><td>隐式 CB（跟在 <code>FParameters</code> 后面）</td><td>只有这一个 PS 用，不必 <code>IMPLEMENT_UNIFORM_BUFFER_STRUCT</code></td></tr>
+  <tr><td><code>Samples</code>（<code>StructuredBuffer</code>）</td><td><strong>Structured Buffer + SRV</strong></td><td>最多 4096 个 struct，UB 太小（常见几 KB 上限），而且是「很多条记录」不是「几个常量」</td></tr>
+  <tr><td><code>T_Combined</code></td><td>贴图 SRV</td><td>贴图不放进普通 UB</td></tr>
+  <tr><td>Dest</td><td>Render Target</td><td>光栅写口，不是 UB</td></tr>
+</table>
+<p>所以不是「没用不了 Buffer」，而是：<strong>常量已经在 FParameters 的隐式 UB 里</strong>；<strong>路点列是 StructuredBuffer</strong>。§4.1 要解决的是「Scene / View 给一百个 shader 共用同一份数据」，我们没有这个问题。</p>
+
+<h3>4.2 为什么要 Static Binding</h3>
+<p>每个 shader、每个 stage（VS/PS）绑定槽都不同。<code>Set{Graphics,Compute}PipelineState</code> 会 <strong>作废全部绑定</strong>，每个 PSO 后都要重绑。</p>
+<table>
+  <tr><th></th><th>每 Draw 绑一遍</th><th>Static Uniform Buffer</th></tr>
+  <tr><td>顺序</td><td>Set PSO → 每 Draw 绑 VS/PS → 下一 PSO 再绑</td><td>Set Static UB → Set PSO → 只 Draw</td></tr>
+  <tr><td>问题</td><td>Mesh Draw Command 被多 pass/View 缓存，不能为每个组合生成一套绑定</td><td>UB 绑在 command list 的 <strong>静态槽</strong>，shader 要时从槽里取</td></tr>
+  <tr><td>频率</td><td>PSO / Draw</td><td><strong>Pass</strong></td></tr>
+</table>
+<pre>IMPLEMENT_STATIC_UNIFORM_BUFFER_SLOT(SceneTextures);
+IMPLEMENT_STATIC_UNIFORM_BUFFER_STRUCT(FSceneTextureUniformParameters, "SceneTexturesStruct", SceneTextures);
+IMPLEMENT_STATIC_UNIFORM_BUFFER_STRUCT(FMobileSceneTextureUniformParameters, "MobileSceneTextures", SceneTextures);</pre>
+<p>同一槽同时只能绑一个。尽量复用槽。<code>RHICmdList.SetStaticUniformBuffers</code> 设置；<strong>RDG 在每个 pass 执行前自动绑</strong>。静态 UB 应出现在 pass 的 parameter struct 里。</p>
+
+<h2 id="s5">5. FRDGBuilder：建图与 Execute</h2>
+<p>官方：实例化 <code>FRDGBuilder</code> → 建资源、加 pass → <code>FRDGBuilder::Execute</code> 编译并执行。Builder <strong>建在栈上</strong>，析构前必须 Execute。图 API <strong>单线程</strong>，同一时刻只能有一个实例（不能嵌套、不能并排）。Deferred / Mobile 每次场景渲染共用一张大图。</p>
+
+<table>
+  <tr><th>步</th><th>API</th><th>此时 GPU？</th></tr>
+  <tr><td>1</td><td><code>FRDGBuilder GraphBuilder(RHICmdList)</code></td><td>否</td></tr>
+  <tr><td>2</td><td><code>CreateTexture</code> / <code>CreateBuffer</code></td><td><strong>只分配 Descriptor</strong>，RHI 显存在 Execute 才分配</td></tr>
+  <tr><td>3</td><td><code>AddPass(名字, 参数, Flags, lambda)</code></td><td>否，只登记</td></tr>
+  <tr><td>4</td><td>参数必须用 <code>AllocParameters</code>，填上本 lambda 会用到的 RDG 资源</td><td>否；RDG 用这些推依赖和 Transient 寿命</td></tr>
+  <tr><td>5</td><td><code>Execute()</code></td><td><strong>这时才 Compile + Draw</strong></td></tr>
+</table>
+
+<table>
+  <tr><th><code>AddPass</code> 参数</th><th>含义</th></tr>
+  <tr><td><code>RDG_EVENT_NAME("MyShader %d", …)</code></td><td>profiler 名，printf 语义</td></tr>
+  <tr><td>Pass parameter struct</td><td>带 RDG 资源的扩展 shader 参数</td></tr>
+  <tr><td><code>ERDGPassFlags::Compute</code> / <code>Raster</code> / <code>Copy</code> / <code>AsyncCompute</code></td><td>这个 pass 允许哪种命令</td></tr>
+  <tr><td>lambda</td><td>Execute 时往 command list 录工作；<strong>可能并行</strong></td></tr>
+</table>
+<p>Compute 用 <code>FRHIComputeCommandList</code>（和 Async 共用接口）。Raster 用 <code>FRHICommandList</code>。<strong>避免</strong> <code>FRHICommandListImmediate</code>，否则该 pass 不能并行。理想 lambda 无副作用；若必须在 Render Thread 上创建/锁 RHI，才用 immediate。</p>
+
+<pre>FRDGBuilder GraphBuilder(RHICmdList);
+FMyShaderCS::FParameters* PassParameters = GraphBuilder.AllocParameters&lt;FMyShaderCS::FParameters&gt;();
+PassParameters-&gt;SceneColorTexture = SceneColor;
+PassParameters-&gt;SceneColorOutput = GraphBuilder.CreateUAV(NewSceneColor);
+
+GraphBuilder.AddPass(
+    RDG_EVENT_NAME("MyShader %d%d", View.ViewRect.Width(), View.ViewRect.Height()),
+    PassParameters,
+    ERDGPassFlags::Compute,
+    [PassParameters, ComputeShader, GroupCount](FRHIComputeCommandList&amp; RHICmdList)
+    {
+        FComputeShaderUtils::Dispatch(RHICmdList, ComputeShader, PassParameters, GroupCount);
+    });
+
+GraphBuilder.Execute();</pre>
+
+<h2 id="s6">6. Setup / Execute 两条时间线</h2>
+<table>
+  <tr><th>时间线</th><th>做什么</th><th>不要做什么</th></tr>
+  <tr><td><strong>Setup</strong></td><td>建资源、管线分支、<code>AddPass</code></td><td>不要在这里直接 Draw</td></tr>
+  <tr><td><strong>Compile</strong>（<code>Execute</code> 开头）</td><td>依赖、Cull、Barrier、Transient 规划</td><td>你插不进去</td></tr>
+  <tr><td><strong>Execute</strong></td><td>调各 pass lambda，往 command list 录命令</td><td>不要有副作用；内存必须活到这时</td></tr>
+</table>
+
+<div class="fig">
+<svg viewBox="0 0 860 150" xmlns="http://www.w3.org/2000/svg">
+  <text x="20" y="24" font-size="13" fill="#666">没有 RDG：一条线</text>
+  <rect x="20" y="36" width="120" height="32" rx="4" fill="#f3f3f3" stroke="#aaa"/><text x="80" y="56" text-anchor="middle" font-size="11">分支</text>
+  <rect x="150" y="36" width="120" height="32" rx="4" fill="#f3f3f3" stroke="#aaa"/><text x="210" y="56" text-anchor="middle" font-size="11">分配 RT</text>
+  <rect x="280" y="36" width="120" height="32" rx="4" fill="#f3f3f3" stroke="#aaa"/><text x="340" y="56" text-anchor="middle" font-size="11">Draw</text>
+  <rect x="410" y="36" width="140" height="32" rx="4" fill="#f3f3f3" stroke="#aaa"/><text x="480" y="56" text-anchor="middle" font-size="11">手写 Barrier</text>
+  <text x="20" y="92" font-size="13" fill="#666">有 RDG：Setup 与 Execute 分开</text>
+  <rect x="20" y="104" width="200" height="32" rx="4" fill="#eef3ff" stroke="#8aa4d4"/><text x="120" y="124" text-anchor="middle" font-size="11">Setup：Create / AddPass</text>
+  <rect x="230" y="104" width="160" height="32" rx="4" fill="#e8f6ee" stroke="#7bb89a"/><text x="310" y="124" text-anchor="middle" font-size="11">Compile</text>
+  <rect x="400" y="104" width="220" height="32" rx="4" fill="#fff4e0" stroke="#d4a85a"/><text x="510" y="124" text-anchor="middle" font-size="11">Execute：多线程调 λ</text>
+  <rect x="630" y="104" width="200" height="32" rx="4" fill="#fde8e8" stroke="#d48a8a"/><text x="730" y="124" text-anchor="middle" font-size="11">RHI command lists</text>
+</svg>
+<p class="cap">图 2 · 官方对照：没有 RDG 时 Setup 和 Draw 写在一起；有 RDG 时 lambda 被推迟，且可能并行录制。</p>
+</div>
+
+<h2 id="s7">7. 工具函数</h2>
+<p>官方：能用 <code>RenderGraphUtils.h</code> 就用，少写样板。文档里的长例子是为了讲原理。</p>
+<table>
+  <tr><th>Helper</th><th>用途</th></tr>
+  <tr><td><code>FComputeShaderUtils::AddPass</code></td><td>Compute dispatch</td></tr>
+  <tr><td><code>FPixelShaderUtils::AddFullscreenPass</code></td><td>全屏 Pixel Shader</td></tr>
+  <tr><td><code>FPixelShaderUtils::AddUAVPass</code></td><td>光栅但输出到 UAV、不绑传统 RT</td></tr>
+  <tr><td><code>AddCopyTexturePass</code></td><td>拷贴图</td></tr>
+  <tr><td><code>AddClearRenderTargetPass</code></td><td>清 RT</td></tr>
+</table>
+
+<h2 id="s8">8. RDG 资源与 Views</h2>
+<p>RDG 资源一开始只有 <strong>Descriptor</strong>。底层 RHI 只在 <strong>声明了该资源的 pass 的 lambda</strong> 里才能 <code>GetRHI()</code>。Setup 里调用会 assert。指针归 Builder，<strong>析构后全部作废</strong>。</p>
+
+<table>
+  <tr><th>种类</th><th>怎么创建</th><th>寿命</th></tr>
+  <tr><td><strong>Transient</strong></td><td><code>CreateTexture</code> / <code>CreateBuffer</code></td><td>锁在图内；不相交可 alias</td></tr>
+  <tr><td><strong>External</strong></td><td><code>RegisterExternal{Texture,Buffer}</code> 或 Extract</td><td>伸出图外</td></tr>
+</table>
+
+<table>
+  <tr><th>View</th><th>API</th><th>给 shader</th></tr>
+  <tr><td>SRV</td><td><code>CreateSRV</code></td><td>只读</td></tr>
+  <tr><td>UAV</td><td><code>CreateUAV</code></td><td>CS / 部分光栅可写</td></tr>
+</table>
+<pre>FRDGTexture* Texture = GraphBuilder.CreateTexture(FRDGTextureDesc::Create2D(...), TEXT("MyTexture"));
+// 非法: Texture-&gt;GetRHI();
+FRDGTextureUAV* TextureUAV = GraphBuilder.CreateUAV(FRDGTextureUAVDesc(Texture, MipLevel));
+FRDGBuffer* Buffer = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateBufferDesc(...), TEXT("MyBuffer"));
+FRDGBufferSRV* BufferSRV = GraphBuilder.CreateSRV(Buffer, PF_R32_FLOAT);</pre>
+
+<h2 id="s9">9. Pass 与 Parameters（三种写法）</h2>
+<p>参数必须 <code>AllocParameters</code>，保证寿命。RDG 有自己的宏；<code>AddPass</code> <strong>只消费 RDG 宏</strong>，普通 shader 宏给 <code>SetShaderParameters</code>。官方故意让 pass 参数和 shader 参数同一套 API，减少样板。</p>
+
+<h3>9.1 只有 shader、没有 RDG（基线）</h3>
+<table>
+  <tr><th>HLSL</th><th>C++ 宏</th></tr>
+  <tr><td><code>Texture2D MyTexture</code></td><td><code>SHADER_PARAMETER_TEXTURE(Texture2D, MyTexture)</code> → <code>FRHITexture*</code></td></tr>
+  <tr><td><code>RWTexture2D MyUAV</code></td><td><code>SHADER_PARAMETER_UAV</code> → <code>FRHIUnorderedAccessView*</code></td></tr>
+  <tr><td><code>float MyFloat</code></td><td><code>SHADER_PARAMETER(float, MyFloat)</code></td></tr>
+</table>
+<p>栈上 <code>FParameters</code>，立刻 <code>SetShaderParameters</code> + Dispatch。<code>IMPLEMENT_GLOBAL_SHADER(..., "MainCS", SF_Compute)</code>。</p>
+
+<h3>9.2 Shader + RDG pass</h3>
+<table>
+  <tr><th>改成</th><th>效果</th></tr>
+  <tr><td><code>SHADER_PARAMETER_RDG_TEXTURE</code></td><td>读 <code>FRDGTexture*</code>，RDG 记读边</td></tr>
+  <tr><td><code>SHADER_PARAMETER_RDG_TEXTURE_SRV</code></td><td>读 SRV</td></tr>
+  <tr><td><code>SHADER_PARAMETER_RDG_TEXTURE_UAV</code></td><td>写 UAV</td></tr>
+  <tr><td>仍用 <code>SHADER_PARAMETER(float)</code></td><td><strong>RDG 忽略</strong>，只给 <code>SetShaderParameters</code></td></tr>
+  <tr><td>可以赋 <code>nullptr</code></td><td>RDG 忽略空字段</td></tr>
+</table>
+<p><code>ERDGPassFlags::Compute</code> 表示这个 pass <strong>只能</strong> 发 Compute 命令。lambda 里再 <code>SetComputeShader</code> + <code>SetShaderParameters(*PassParameters)</code>，非空 RDG 字段此时已解成 RHI。</p>
+
+<h3>9.3 没有 shader 的 pass（Copy）</h3>
+<pre>BEGIN_SHADER_PARAMETER_STRUCT(FCopyTextureParameters, )
+    RDG_TEXTURE_ACCESS(Input,  ERHIAccess::CopySrc)
+    RDG_TEXTURE_ACCESS(Output, ERHIAccess::CopyDest)
+END_SHADER_PARAMETER_STRUCT()</pre>
+<p>用于「pass 和 shader 不是一对一」或根本没有 shader。Flags 用 <code>ERDGPassFlags::Copy</code>。lambda 里 <code>RHICmdList.CopyTexture(Input-&gt;GetRHI(), Output-&gt;GetRHI(), …)</code> —— 这里 <code>GetRHI()</code> 合法。</p>
+
+<h2 id="s10">10. Raster Pass 与 Load Action</h2>
+<p>固定管线 RT 用 <code>RENDER_TARGET_BINDING_SLOTS()</code>。RHI 用 render pass 绑 RT；<strong>RDG 自动 Begin/End</strong>，你只提供绑定。Tile GPU 上 Load Action 必须准确才有性能。</p>
+<table>
+  <tr><th><code>ERenderTargetLoadAction</code></th><th>含义</th></tr>
+  <tr><td><code>ELoad</code></td><td>保留旧内容</td></tr>
+  <tr><td><code>EClear</code></td><td>清成 optimized clear</td></tr>
+  <tr><td><code>ENoAction</code></td><td>不保证旧内容；整屏都会写时部分硬件更快</td></tr>
+</table>
+<p>Depth/Stencil 要分别指定 load，并用 <code>FExclusiveDepthStencil</code> 控制读写。官方例子：Color 用 <code>ENoAction</code> + lambda 里 <code>DrawClearQuad</code>；DepthStencil 用 <code>EClear</code> + <strong>空 lambda</strong>（清由 action 完成）。</p>
+<p>UAV 光栅（不绑传统 RT）：<code>FPixelShaderUtils::AddUAVPass</code>，自己指定 viewport。</p>
+
+<h2 id="s11">11. 依赖、Cull、Mip 链</h2>
+<p>资源出现在 <code>AddPass</code> 的 struct 上，就可能延长寿命或与更早 pass 连边。尽量只声明真正用到的；不用的设 null。</p>
+<p>难点：shader permutation 可能编掉某个资源。用 <code>ClearUnusedGraphResources(*ComputeShader, PassParameters)</code> 把 shader 没用到的 RDG 字段清掉。多 shader 版本：只有「所有 shader 都不用」才清。</p>
+
+<div class="fig">
+<svg viewBox="0 0 860 90" xmlns="http://www.w3.org/2000/svg">
+  <rect x="30" y="20" width="160" height="50" rx="6" fill="#eef3ff" stroke="#8aa4d4"/><text x="110" y="50" text-anchor="middle" font-size="13">Pass A 写 UAV</text>
+  <rect x="350" y="20" width="160" height="50" rx="6" fill="#e8f6ee" stroke="#7bb89a"/><text x="430" y="50" text-anchor="middle" font-size="13">FRDGTexture</text>
+  <rect x="670" y="20" width="160" height="50" rx="6" fill="#fff4e0" stroke="#d4a85a"/><text x="750" y="50" text-anchor="middle" font-size="13">Pass B 读 SRV</text>
+  <line x1="190" y1="45" x2="348" y2="45" stroke="#333"/><line x1="510" y1="45" x2="668" y2="45" stroke="#333"/>
+</svg>
+<p class="cap">图 3 · 依赖边来自参数字段，不是手画箭头。Mip 链 = 对每一级重复：读上一级 SRV，写下一级 UAV 或 RT。</p>
+</div>
+<p>官方用 <code>FGenerateMips</code> 演示：Raster 走 <code>AddFullscreenPass</code> + <code>RenderTargets[0] = FRenderTargetBinding(Texture, ELoad, MipLevel)</code>；Compute 走 <code>FComputeShaderUtils::AddPass</code> + <code>MipInSRV</code> / <code>MipOutUAV</code>。</p>
+
+<h2 id="s12">12. Asynchronous Compute</h2>
+<table>
+  <tr><th>条件</th><th>写法</th></tr>
+  <tr><td>标记 pass</td><td><code>ERDGPassFlags::AsyncCompute</code></td></tr>
+  <tr><td>lambda 参数</td><td><code>FRHIComputeCommandList&amp;</code></td></tr>
+  <tr><td>平台不支持</td><td>回退到 graphics pipe</td></tr>
+  <tr><td>总开关</td><td><code>r.RDG.AsyncCompute</code>（默认开）</td></tr>
+</table>
+<p>简单 CS 用 <code>FComputeShaderUtils::AddPass</code> 的 async 变体。RDG 沿图找 Graphics 上 <strong>最后一个生产者</strong> 插 fence；Graphics <strong>第一次消费</strong> 时 join 回来。</p>
+
+<div class="fig">
+<svg viewBox="0 0 860 130" xmlns="http://www.w3.org/2000/svg">
+  <text x="20" y="22" font-size="12" fill="#666">Graphics</text>
+  <rect x="20" y="32" width="100" height="36" rx="5" fill="#eef3ff" stroke="#8aa4d4"/><text x="70" y="54" text-anchor="middle" font-size="12">A 生产</text>
+  <rect x="140" y="32" width="80" height="36" rx="5" fill="#f3f3f3" stroke="#aaa"/><text x="180" y="54" text-anchor="middle" font-size="12">B</text>
+  <rect x="640" y="32" width="100" height="36" rx="5" fill="#fff4e0" stroke="#d4a85a"/><text x="690" y="54" text-anchor="middle" font-size="12">E 消费</text>
+  <text x="20" y="90" font-size="12" fill="#666">Async Compute</text>
+  <rect x="240" y="100" width="100" height="24" rx="4" fill="#e8f6ee" stroke="#7bb89a"/><text x="290" y="116" text-anchor="middle" font-size="11">C</text>
+  <rect x="360" y="100" width="100" height="24" rx="4" fill="#e8f6ee" stroke="#7bb89a"/><text x="410" y="116" text-anchor="middle" font-size="11">D</text>
+  <path d="M120 50 L240 112" stroke="#2a6" fill="none" stroke-dasharray="4 3"/>
+  <text x="160" y="88" font-size="11" fill="#2a6">fence</text>
+  <path d="M460 112 L640 50" stroke="#c44" fill="none" stroke-dasharray="4 3"/>
+  <text x="520" y="88" font-size="11" fill="#c44">join</text>
+</svg>
+<p class="cap">图 4 · 官方场景：A 生产给 C，fence 在 A 后；D 做完再 join，E 才能看见正确结果。用 RDG Insights 看真实 workload。</p>
+</div>
+
+<h2 id="s13">13. External 与 Transient</h2>
+<h3>13.1 External：寿命伸出图外</h3>
+<table>
+  <tr><th>方式</th><th>API</th><th>寿命伸到</th><th>指针何时有效</th></tr>
+  <tr><td>登记进去</td><td><code>RegisterExternal{Texture,Buffer}</code></td><td>图 <strong>开头</strong></td><td>Setup 立刻有 RDG 句柄（底层已是 pooled <code>IPooledRenderTarget</code> / <code>FRDGPooledBuffer</code>）</td></tr>
+  <tr><td>从图里取出</td><td><code>QueueTextureExtraction</code></td><td>图 <strong>末尾</strong></td><td><strong>Execute 之后</strong> 才填好</td></tr>
+  <tr><td>立刻转 External</td><td><code>ConvertToExternal{Texture,Buffer}</code></td><td>图开头（立刻分配）</td><td>Setup；<strong>不能</strong>再和本帧其他资源 alias</td></tr>
+</table>
+<p>图 A extract → 图 B register，用同一套 pooled 类型即可往返。图外若不再持有引用，仍可能和本帧更早/更晚的 RDG 资源共享池内存。</p>
+<p><code>ConvertToExternal</code> 用在「等不到 Execute 结束就必须拿资源」。和 Extract 的最大差别是寿命方向：Convert 伸到图头，Extract 伸到图尾。</p>
+
+<h3>13.2 Transient</h3>
+<p>Compile 时规划执行轴上的分配，寿命不相交可以重叠。有 Transient allocator 的平台，峰值显存通常低于「按 RHI Descriptor 匹配资源池」。</p>
+<table>
+  <tr><th>点</th><th>说明</th></tr>
+  <tr><td>开关</td><td><code>r.RDG.TransientAllocator</code></td></tr>
+  <tr><td>查 alias bug</td><td>关掉它对比</td></tr>
+  <tr><td><strong>不要假设</strong></td><td>资源里有上一帧合法内容。Alias 后是垃圾。资源池常掩盖这类问题</td></tr>
+</table>
+
+<div class="fig">
+<svg viewBox="0 0 860 90" xmlns="http://www.w3.org/2000/svg">
+  <text x="20" y="20" font-size="12" fill="#666">时间 →</text>
+  <rect x="40" y="32" width="240" height="22" rx="3" fill="#8aa4d4"/><text x="160" y="48" text-anchor="middle" font-size="11" fill="#fff">Resource A（Pass 1–3）</text>
+  <rect x="300" y="32" width="240" height="22" rx="3" fill="#7bb89a"/><text x="420" y="48" text-anchor="middle" font-size="11" fill="#fff">Resource C（Pass 4–…）可与 A 同块显存</text>
+  <rect x="40" y="62" width="180" height="18" rx="3" fill="#d4a85a"/><text x="130" y="75" text-anchor="middle" font-size="11">同一块 GPU 内存 alias</text>
+</svg>
+<p class="cap">图 5 · 官方 Transient：A 用完后同一块内存可以给 C。不要读「清之前」的内容。</p>
+</div>
+
+<h2 id="s14">14. RDG Uniform Buffer 与 Upload</h2>
+<h3>14.1 RDG Uniform Buffer</h3>
+<p>UB 里可以装 RDG 资源。Setup 只建 Descriptor，Execute 才建 RHI UB。确认没用则 Cull，永不初始化。</p>
+<table>
+  <tr><th>API</th><th>作用</th></tr>
+  <tr><td><code>CreateUniformBuffer(参数 struct)</code></td><td>创建 RDG UB</td></tr>
+  <tr><td><code>SHADER_PARAMETER_RDG_UNIFORM_BUFFER</code></td><td>必须写在交给 <code>AddPass</code> 的 struct 上，lambda 里才能解引用</td></tr>
+  <tr><td><code>AddPass</code></td><td>会扫 <strong>子 UB</strong>，不只扫根参数</td></tr>
+</table>
+<p>当前限制：RDG UB <strong>不能</strong> 靠 shader 反射把不用的资源裁掉。要手剪，或为每套参数建不同 UB。实践见 Deferred 的 Scene Textures UB。</p>
+
+<h3>14.2 <code>QueueBufferUpload</code></h3>
+<p>图执行前要把 CPU 数据灌进 Buffer：用 <code>QueueBufferUpload</code>。RDG 在 Compile 时批处理，并可和其他 Compile 任务重叠。</p>
+<table>
+  <tr><th>规则</th><th>原因</th></tr>
+  <tr><td>要用 RDG 做 upload</td><td>pass 里 Lock/Unlock immediate list = 同步点，破坏并行</td></tr>
+  <tr><td>Upload 的 Buffer 自动非 Transient</td><td>Transient 不支持 CPU upload</td></tr>
+  <tr><td>选准 <code>ERDGInitialDataFlags</code></td><td>数据能活过 deferral 用 <code>NoCopy</code>，否则让 RDG 拷一份</td></tr>
+</table>
+
+<h2 id="s15">15. 内存寿命与约定</h2>
+<p>最常见错误：把 <strong>不能活到 Execute</strong> 的内存塞进 lambda。</p>
+<table>
+  <tr><th>写法</th><th>官方评价</th></tr>
+  <tr><td>栈对象 <code>[&amp;Object]</code></td><td><strong>Bad</strong> —— 野指针</td></tr>
+  <tr><td><code>TUniquePtr</code> Move 进 lambda</td><td>Good，但分配贵</td></tr>
+  <tr><td><code>GraphBuilder.AllocObject&lt;T&gt;()</code></td><td>Best（C++，会析构）</td></tr>
+  <tr><td><code>AllocPOD&lt;T&gt;()</code></td><td>Best（POD，不析构）</td></tr>
+  <tr><td><code>AllocParameters&lt;T&gt;()</code></td><td>pass 参数（可能额外跟踪）</td></tr>
+  <tr><td><code>Alloc(Size, Align)</code></td><td>原始内存</td></tr>
+</table>
+<p>这些内存活到 <strong>Builder 析构</strong>。线性分配器，很快。</p>
+
+<table>
+  <tr><th>Profiling 宏</th><th>给谁</th></tr>
+  <tr><td><code>RDG_EVENT_SCOPE</code></td><td>GPU 范围（RenderDoc、Insights）</td></tr>
+  <tr><td><code>RDG_GPU_STAT_SCOPE</code></td><td><code>stat gpu</code></td></tr>
+  <tr><td><code>RDG_CSV_STAT_EXCLUSIVE_SCOPE</code></td><td>CSV profiler</td></tr>
+</table>
+<p>都要传入 Builder，以对齐两条时间线。</p>
+<table>
+  <tr><th>约定</th><th>例子</th></tr>
+  <tr><td>资源名用点分层</td><td><code>TSR.History.ScreenPercentage</code>（Insights 好滤）</td></tr>
+  <tr><td>Builder 叫</td><td><code>GraphBuilder</code></td></tr>
+  <tr><td>shader 参数就地叫</td><td><code>FParameters</code></td></tr>
+  <tr><td>pass 用</td><td><code>RDG_EVENT_SCOPE</code> 当命名空间</td></tr>
+  <tr><td>能用工具就用</td><td><code>RenderGraphUtils.h</code> / <code>ScreenPass.h</code></td></tr>
+</table>
+
+<h2 id="s16">16. 调试、Validation、Insights</h2>
+<p>RDG 是 <strong>延迟结构</strong>。崩在 Execute / RHI 线程时，调用栈离 Setup 很远。RHI 线程开着时，正在执行的命令离 Setup 又远一层。</p>
+
+<h3>16.1 Immediate Mode</h3>
+<p>绕过 Compile，在 <code>AddPass</code> 里立刻跑该 pass。lambda 空指针时，调试器能直接看到 Setup。</p>
+<table>
+  <tr><th>方式</th><th>值</th></tr>
+  <tr><td>CVar</td><td><code>r.RDG.ImmediateMode</code></td></tr>
+  <tr><td>命令行</td><td><code>-rdgimmediate</code></td></tr>
+</table>
+<p>再加 <code>r.RHICmdBypass</code>：关掉并行和软件 command list。与 Immediate 一起 = 去掉所有 deferral。<strong>Immediate 会关掉</strong> Transient、culling、pass 合并等，可能引入副作用。</p>
+<table>
+  <tr><th>CVar</th><th>单独关掉谁（不必开 Immediate）</th></tr>
+  <tr><td><code>r.RDG.CullPasses</code></td><td>排除「pass 被扔掉」</td></tr>
+  <tr><td><code>r.RDG.MergeRenderPasses</code></td><td>每个 RDG raster 单独一个 RHI render pass</td></tr>
+  <tr><td><code>r.RDG.ParallelExecute</code></td><td>全部在 Render Thread 串行</td></tr>
+  <tr><td><code>r.RDG.TransientAllocator</code></td><td>退回资源池</td></tr>
+</table>
+<p>Validation Layer：Debug / Development 默认开，错误用法尽早 fatal 并打出资源/pass 名。Test / Shipping 编掉。</p>
+
+<h3>16.2 Transition 日志</h3>
+<p>RDG 按 pass 参数自动转 <code>ERHIAccess</code> / pipeline。RDG 的调用栈看起来总一样，所以要和 RHI validation 对打。</p>
+<table>
+  <tr><th>RDG</th><th>RHI</th></tr>
+  <tr><td><code>-rdgtransitionlog</code> 或 <code>r.rdg.transitionlog X</code></td><td><code>-rhivalidation -rhivalidationlog=Name</code></td></tr>
+  <tr><td><code>r.RDG.Debug.ResourceFilter</code> / <code>PassFilter</code></td><td>默认 RHI 在 RHI Thread 打，RDG 在 Render Thread</td></tr>
+</table>
+<p>对齐两线程：<code>-norhithread -forcerhibypass</code> 或 <code>-onethread</code>（可能掩盖跨队列错误）。例：只盯 <code>SceneDepthZ</code>：</p>
+<pre>-rhivalidation -rhivalidationlog=SceneDepthZ -rdgtransitionlog -rdgdebugresourcefilter=SceneDepthZ -onethread</pre>
+
+<h3>16.3 vis 与 Transient 花屏</h3>
+<p>Development 下，RDG 把 UAV/RTV 写入注册到 <code>vis</code>。控制台输入 <code>vis</code> 看列表。</p>
+<table>
+  <tr><th>怀疑 Transient</th><th>试</th></tr>
+  <tr><td>关掉系统就好</td><td><code>r.RDG.TransientAllocator 0</code></td></tr>
+  <tr><td>没初始化就读</td><td><code>r.RDG.ClobberResources</code></td></tr>
+  <tr><td>缺 alias barrier / 寿命错</td><td><code>r.RDG.Debug.ExtendResourceLifetimes</code></td></tr>
+  <tr><td>缩小范围</td><td><code>r.RDG.Debug.ResourceFilter</code>、<code>DisableTransientResources</code></td></tr>
+</table>
+
+<h3>16.4 RDG Insights</h3>
+<p><strong>Edit → Plugins → Insights</strong>。Timing 视图多一条 RDG track。</p>
+<table>
+  <tr><th>能看</th><th>能回答</th></tr>
+  <tr><td>资源寿命、池重叠、Async fence、cull / pass 合并、并行区间、Transient 布局</td><td>为什么 Async 不重叠？某资源整帧谁在用？后处理用了谁？哪个 pass 被 cull？</td></tr>
+</table>
+<p>抓 trace：<code>-trace=rdg,defaults</code>，或 Live Trace 打开 RDG channel。数据量很大。更细的走查见官方 slide deck。</p>
+
+<p class="sub" style="margin-top:40px">
+  原文：<a href="https://dev.epicgames.com/documentation/unreal-engine/render-dependency-graph-in-unreal-engine">dev.epicgames.com · Render Dependency Graph</a><br />
+  浏览器打开本 HTML；打印可出 PDF。
+</p>
+
+</body>
+</html>

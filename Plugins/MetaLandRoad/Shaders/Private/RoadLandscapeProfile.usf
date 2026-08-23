@@ -1,4 +1,5 @@
-// Version02 — box sides + falloff-controlled corner rounding + light slope noise.
+// Version02 live. Frozen copy: RoadLandscapeProfile_Version02.usf
+// Box dispatch is CPU scissor (copy Combined + viewport). This shader is unchanged.
 // Version01 rollback: copy RoadLandscapeProfile_Version01.usf over this file.
 #include "/Engine/Private/Common.ush"
 #include "/Engine/Private/Landscape/LandscapeCommon.ush"
@@ -21,6 +22,7 @@ float LandscapeZScale;
 float LandscapeCmPerQuad;
 float2 RoadBoundsMin;
 float2 RoadBoundsMax;
+uint WeightMode;
 
 float Hash21(float2 P)
 {
@@ -47,16 +49,12 @@ float SlopeNoise(float2 WorldXY)
 	return (N / 1.45) * 2.0 - 1.0;
 }
 
-// Box = sharp rectangular iso (图二三方头). Euclidean rect = rounded positive iso
-// (not a full capsule: sides stay straight when EndOut==0).
-// Soft is capped at 0.5 so ends never become a half-pill.
+// Euclidean offset of the solid (half-width + Offset). Box max() made
+// folded-triangle / square caps; length() follows the edge as an arc.
 float HybridSolidDistance(float LatOut, float EndOut, float FalloffCm)
 {
-	float BoxD = max(LatOut, EndOut);
 	float2 Outside = float2(max(LatOut, 0.0), max(EndOut, 0.0));
-	float EucD = length(Outside) + min(max(LatOut, EndOut), 0.0);
-	float Soft = saturate(FalloffCm / 800.0) * 0.5;
-	return lerp(BoxD, EucD, Soft);
+	return length(Outside) + min(max(LatOut, EndOut), 0.0);
 }
 
 float4 EvaluateRoadProfile(uint2 Id)
@@ -153,6 +151,7 @@ float4 EvaluateRoadProfile(uint2 Id)
 
 	FRoadProfileSample SampleA = Samples[BestIndex];
 	FRoadProfileSample SampleB = Samples[BestIndex + 1];
+	float SideOffset = max(lerp(SampleA.Falloff.x, SampleB.Falloff.x, BestT), 0.0);
 	float SideFalloff = max(lerp(SampleA.Falloff.y, SampleB.Falloff.y, BestT), 1.0);
 	float HeightOffset = lerp(SampleA.Falloff.z, SampleB.Falloff.z, BestT);
 	float LayerFactor = saturate(lerp(SampleA.Extra.z, SampleB.Extra.z, BestT));
@@ -162,6 +161,36 @@ float4 EvaluateRoadProfile(uint2 Id)
 	float Taper = saturate(max(DistFromSolid, 0.0) / SideFalloff);
 	float SmoothT = Taper * Taper * Taper * (Taper * (Taper * 6.0 - 15.0) + 10.0);
 	float Alpha = (1.0 - SmoothT) * LayerFactor;
+	if (WeightMode > 0)
+	{
+		float CombinedW = Combined.r;
+		float DistFromMesh = BestSigned + SideOffset;
+		float Weight = 0.0;
+		if (WeightMode == 1)
+		{
+			float AA = max(LandscapeCmPerQuad * 1.5, 1.0);
+			Weight = saturate(1.0 - DistFromMesh / AA) * LayerFactor;
+		}
+		else
+		{
+			float Dirty = 0.0;
+			if (DistFromMesh > 0.0)
+			{
+				if (DistFromMesh <= SideOffset)
+				{
+					Dirty = 1.0;
+				}
+				else
+				{
+					float FadeT = saturate((DistFromMesh - SideOffset) / SideFalloff);
+					float FadeS = FadeT * FadeT * FadeT * (FadeT * (FadeT * 6.0 - 15.0) + 10.0);
+					Dirty = 1.0 - FadeS;
+				}
+			}
+			Weight = Dirty * LayerFactor;
+		}
+		return float4(max(CombinedW, saturate(Weight)), Combined.gba);
+	}
 	if (Alpha < 0.001)
 	{
 		return Combined;

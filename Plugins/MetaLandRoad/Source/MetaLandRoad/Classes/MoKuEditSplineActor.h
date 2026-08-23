@@ -284,6 +284,19 @@ public:
 	/** Copy the selected (or Begin) landscape key falloff onto RoadHeightmapSettings. */
 	void SyncHeightmapFalloffFromLandscapeKey(int32 SectionIndex, int32 KeyIndex);
 
+	bool FindNearestEditableLandscapeKeyToJunction(
+		const AMoKuEditIntersectionActor* Junction,
+		int32& OutSectionIndex,
+		int32& OutKeyIndex) const;
+	bool IsNearestEditableLandscapeKeyToJunction(
+		const AMoKuEditIntersectionActor* Junction,
+		int32 SectionIndex,
+		int32 KeyIndex) const;
+	void WriteNearestLandscapeKeyFromJunction(
+		const AMoKuEditIntersectionActor* Junction,
+		float SideOffsetCm,
+		float SideFalloffCm);
+
 	/** Write RoadHeightmapSettings.FalloffSettings into the selected key, or Begin+End if none. */
 	void PushHeightmapFalloffToLandscapeKeys();
 

@@ -108,6 +108,90 @@ void FMetaLandRoadSidewalkHeightAttributeValue::InterpolateWith(const FMetaLandR
 	Height = FMath::Lerp(Height, OtherValue.Height, FMath::Clamp(Alpha, 0.0f, 1.0f));
 }
 
+FMetaLandRoadAttributeTypeDesc FMetaLandRoadMarkAttributeValue::GetTypeDesc()
+{
+	FMetaLandRoadAttributeTypeDesc Desc;
+	Desc.TypeId = FMetaLandRoadAttributeRegistry::TypeMark;
+	Desc.DisplayName = NSLOCTEXT("MetaLandRoadAttribute", "Mark", "Mark");
+	Desc.Category = TEXT("Marking");
+	Desc.IconName = TEXT("ClassIcon.Actor");
+	Desc.ValueStruct = StaticStruct();
+	Desc.EvalMode = EMetaLandRoadAttributeEvalMode::Stepped;
+	Desc.bAllowOnLane = true;
+	Desc.bAllowOnSectionCenter = false;
+	return Desc;
+}
+
+FMetaLandRoadAttributeTypeDesc FMetaLandRoadSpeedAttributeValue::GetTypeDesc()
+{
+	FMetaLandRoadAttributeTypeDesc Desc;
+	Desc.TypeId = FMetaLandRoadAttributeRegistry::TypeSpeed;
+	Desc.DisplayName = NSLOCTEXT("MetaLandRoadAttribute", "Speed", "Speed");
+	Desc.Category = TEXT("Data");
+	Desc.IconName = TEXT("ClassIcon.Actor");
+	Desc.ValueStruct = StaticStruct();
+	Desc.EvalMode = EMetaLandRoadAttributeEvalMode::Stepped;
+	Desc.bAllowOnLane = true;
+	Desc.bAllowOnSectionCenter = false;
+	return Desc;
+}
+
+FMetaLandRoadAttributeTypeDesc FMetaLandRoadCurbCutAttributeValue::GetTypeDesc()
+{
+	FMetaLandRoadAttributeTypeDesc Desc;
+	Desc.TypeId = FMetaLandRoadAttributeRegistry::TypeCurbCut;
+	Desc.DisplayName = NSLOCTEXT("MetaLandRoadAttribute", "CurbCut", "Curb Cut");
+	Desc.Category = TEXT("Geometry");
+	Desc.IconName = TEXT("GraphEditor.Curve_16x");
+	Desc.ValueStruct = StaticStruct();
+	Desc.EvalMode = EMetaLandRoadAttributeEvalMode::Stepped;
+	Desc.bAllowOnLane = true;
+	Desc.bAllowOnSectionCenter = true;
+	return Desc;
+}
+
+FMetaLandRoadAttributeTypeDesc FMetaLandRoadLandscapeAttributeValue::GetTypeDesc()
+{
+	FMetaLandRoadAttributeTypeDesc Desc;
+	Desc.TypeId = FMetaLandRoadAttributeRegistry::TypeLandscape;
+	Desc.DisplayName = NSLOCTEXT("MetaLandRoadAttribute", "Landscape", "Landscape");
+	Desc.Category = TEXT("Landscape");
+	Desc.IconName = TEXT("ClassIcon.Landscape");
+	Desc.ValueStruct = StaticStruct();
+	Desc.EvalMode = EMetaLandRoadAttributeEvalMode::Interpolated;
+	Desc.bAllowOnLane = false;
+	Desc.bAllowOnSectionCenter = true;
+	return Desc;
+}
+
+FMetaLandRoadAttributeTypeDesc FMetaLandRoadPolygonAttributeValue::GetTypeDesc()
+{
+	FMetaLandRoadAttributeTypeDesc Desc;
+	Desc.TypeId = FMetaLandRoadAttributeRegistry::TypePolygon;
+	Desc.DisplayName = NSLOCTEXT("MetaLandRoadAttribute", "Polygon", "Polygon");
+	Desc.Category = TEXT("Marking");
+	Desc.IconName = TEXT("Icons.Transform");
+	Desc.ValueStruct = StaticStruct();
+	Desc.EvalMode = EMetaLandRoadAttributeEvalMode::Stepped;
+	Desc.bAllowOnLane = true;
+	Desc.bAllowOnSectionCenter = false;
+	return Desc;
+}
+
+FMetaLandRoadAttributeTypeDesc FMetaLandRoadSidewalkHeightAttributeValue::GetTypeDesc()
+{
+	FMetaLandRoadAttributeTypeDesc Desc;
+	Desc.TypeId = FMetaLandRoadAttributeRegistry::TypeSidewalkHeight;
+	Desc.DisplayName = NSLOCTEXT("MetaLandRoadAttribute", "SidewalkHeight", "Sidewalk Height");
+	Desc.Category = TEXT("Geometry");
+	Desc.IconName = TEXT("ClassIcon.StaticMeshActor");
+	Desc.ValueStruct = StaticStruct();
+	Desc.EvalMode = EMetaLandRoadAttributeEvalMode::Interpolated;
+	Desc.bAllowOnLane = true;
+	Desc.bAllowOnSectionCenter = true;
+	return Desc;
+}
+
 bool FMetaLandRoadLaneAttributeKey::operator<(const FMetaLandRoadLaneAttributeKey& Other) const
 {
 	return SOffset < Other.SOffset;
@@ -121,66 +205,12 @@ void FMetaLandRoadAttributeRegistry::RegisterBuiltInTypes()
 	}
 
 	GAttributeTypesRegistered = true;
-
-	FMetaLandRoadAttributeTypeDesc Mark;
-	Mark.TypeId = TypeMark;
-	Mark.DisplayName = NSLOCTEXT("MetaLandRoadAttribute", "Mark", "Mark");
-	Mark.Category = TEXT("Marking");
-	Mark.ValueStruct = FMetaLandRoadMarkAttributeValue::StaticStruct();
-	Mark.EvalMode = EMetaLandRoadAttributeEvalMode::Stepped;
-	Mark.bAllowOnLane = true;
-	Mark.bAllowOnSectionCenter = false;
-	RegisterType(Mark);
-
-	FMetaLandRoadAttributeTypeDesc Speed;
-	Speed.TypeId = TypeSpeed;
-	Speed.DisplayName = NSLOCTEXT("MetaLandRoadAttribute", "Speed", "Speed");
-	Speed.Category = TEXT("Data");
-	Speed.ValueStruct = FMetaLandRoadSpeedAttributeValue::StaticStruct();
-	Speed.EvalMode = EMetaLandRoadAttributeEvalMode::Stepped;
-	Speed.bAllowOnLane = true;
-	Speed.bAllowOnSectionCenter = false;
-	RegisterType(Speed);
-
-	FMetaLandRoadAttributeTypeDesc CurbCut;
-	CurbCut.TypeId = TypeCurbCut;
-	CurbCut.DisplayName = NSLOCTEXT("MetaLandRoadAttribute", "CurbCut", "Curb Cut");
-	CurbCut.Category = TEXT("Geometry");
-	CurbCut.ValueStruct = FMetaLandRoadCurbCutAttributeValue::StaticStruct();
-	CurbCut.EvalMode = EMetaLandRoadAttributeEvalMode::Stepped;
-	CurbCut.bAllowOnLane = true;
-	CurbCut.bAllowOnSectionCenter = true;
-	RegisterType(CurbCut);
-
-	FMetaLandRoadAttributeTypeDesc Landscape;
-	Landscape.TypeId = TypeLandscape;
-	Landscape.DisplayName = NSLOCTEXT("MetaLandRoadAttribute", "Landscape", "Landscape");
-	Landscape.Category = TEXT("Landscape");
-	Landscape.ValueStruct = FMetaLandRoadLandscapeAttributeValue::StaticStruct();
-	Landscape.EvalMode = EMetaLandRoadAttributeEvalMode::Interpolated;
-	Landscape.bAllowOnLane = false;
-	Landscape.bAllowOnSectionCenter = true;
-	RegisterType(Landscape);
-
-	FMetaLandRoadAttributeTypeDesc Polygon;
-	Polygon.TypeId = TypePolygon;
-	Polygon.DisplayName = NSLOCTEXT("MetaLandRoadAttribute", "Polygon", "Polygon");
-	Polygon.Category = TEXT("Marking");
-	Polygon.ValueStruct = FMetaLandRoadPolygonAttributeValue::StaticStruct();
-	Polygon.EvalMode = EMetaLandRoadAttributeEvalMode::Stepped;
-	Polygon.bAllowOnLane = true;
-	Polygon.bAllowOnSectionCenter = false;
-	RegisterType(Polygon);
-
-	FMetaLandRoadAttributeTypeDesc SidewalkHeight;
-	SidewalkHeight.TypeId = TypeSidewalkHeight;
-	SidewalkHeight.DisplayName = NSLOCTEXT("MetaLandRoadAttribute", "SidewalkHeight", "Sidewalk Height");
-	SidewalkHeight.Category = TEXT("Geometry");
-	SidewalkHeight.ValueStruct = FMetaLandRoadSidewalkHeightAttributeValue::StaticStruct();
-	SidewalkHeight.EvalMode = EMetaLandRoadAttributeEvalMode::Interpolated;
-	SidewalkHeight.bAllowOnLane = true;
-	SidewalkHeight.bAllowOnSectionCenter = true;
-	RegisterType(SidewalkHeight);
+	RegisterType(FMetaLandRoadMarkAttributeValue::GetTypeDesc());
+	RegisterType(FMetaLandRoadSpeedAttributeValue::GetTypeDesc());
+	RegisterType(FMetaLandRoadCurbCutAttributeValue::GetTypeDesc());
+	RegisterType(FMetaLandRoadLandscapeAttributeValue::GetTypeDesc());
+	RegisterType(FMetaLandRoadPolygonAttributeValue::GetTypeDesc());
+	RegisterType(FMetaLandRoadSidewalkHeightAttributeValue::GetTypeDesc());
 }
 
 bool FMetaLandRoadAttributeRegistry::RegisterType(const FMetaLandRoadAttributeTypeDesc& Desc)

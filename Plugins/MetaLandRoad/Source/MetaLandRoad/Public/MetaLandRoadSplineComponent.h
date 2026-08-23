@@ -120,6 +120,10 @@ public:
 
 	FMetaLandRoadLaneRange GetLaneRange(int SectionIndex, int LaneIndex) const;
 	FVector EvalLanePosition(int SectionIndex, int LaneIndex, double S, double Alpha, ESplineCoordinateSpace::Type CoordinateSpace) const;
+	/** Lift a sample toward linked junction actor Z (mouth=1, fade to next marker). */
+	FVector ApplyLinkedJunctionHeightToPosition(const FVector& Position, double S, ESplineCoordinateSpace::Type CoordinateSpace) const;
+	/** Next landscape key or spline point along the remaining road from MouthS. */
+	bool FindJunctionHeightBlendEndS(double MouthS, double& OutEndS) const;
 	float ClosestKeyToSegment(float Key1, float Key2, const FVector& A1, const FVector& A2) const;
 	float ClosestKeyToSegment2(float S1, float S2, const FVector& A1, const FVector& A2) const;
 

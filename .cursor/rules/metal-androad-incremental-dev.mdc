@@ -1,0 +1,33 @@
+---
+description: MetaLandRoad C++ — .h decls / .cpp impl, no namespace wrappers; Fig1 junction + strict vertex-order audit; MetaRoad is reference
+globs: Plugins/MetaLandRoad/**/*
+alwaysApply: false
+---
+
+# MetaLandRoad: incremental, in-place code
+
+- **MetaRoad** = target/reference plugin; **MetaLandRoad** = this project plugin.
+- See `Docs/MetaRoad-vs-MetaLandRoad.md` and skill `metal-androad-incremental-dev`.
+
+## C++ style (mandatory — strictly enforce)
+
+**函数声明写在 `.h`，函数实现写在 `.cpp`。不要把函数体写在头文件里。**
+
+另外，实现函数不套命名空间。
+
+- **`.h`**: declarations only (plus trivial one-line getters if unavoidable).
+- **`.cpp`**: **all function bodies** for new and edited code.
+- **No** anonymous namespaces, **no** `*Private` namespace blocks around implementations.
+- Use class `private`/`static` members (decl in `.h`, def in `.cpp`) or file-local `static` helpers in `.cpp`.
+- Add new behavior to the **existing** owning `.h` + `.cpp` pair; do not create new files for single functions.
+- **Ask the user first** before new source files.
+- Prefer small compile-safe slices (一点点来).
+- **Never** put new implementations in headers unless the user explicitly overrides this rule.
+
+## Junction (mandatory — critically important)
+
+- **Figure 1 wiring**: arm lane strips + N corner fillets + center/sector fill. **Not** Figure-3 fan / single-ring ear-clip as primary cover.
+- **一定要严格审核顶点顺序封面** — every junction mesh publish must run point-index / vertex-order audit; fail → abort mesh.
+- Overlap OK in edit preview; Cook must avoid permanent double-coverage (sector clip / arrangement), especially 5/6-way.
+- 4→5 / N-way = whole-node recook (polar re-sort arms), not local patches.
+- Full detail: skill `metal-androad-incremental-dev` section **Junction topology — Figure 1**.

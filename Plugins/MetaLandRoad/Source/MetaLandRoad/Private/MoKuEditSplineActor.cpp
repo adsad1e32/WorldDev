@@ -1445,6 +1445,122 @@ void AMoKuEditSplineActor::SyncHeightmapFalloffFromLandscapeKey(int32 SectionInd
 	bSyncingLandscapeHeightFalloff = false;
 }
 
+static double FindRoadMouthSForJunction(const AMoKuEditSplineActor* Road, const AMoKuEditIntersectionActor* Junction)
+{
+	if (!Road || !Junction)
+	{
+		return -1.0;
+	}
+	if (Road->EndOfJunction.Get() == Junction)
+	{
+		return Road->EndJunctionMeshTrimS;
+	}
+	if (Road->StartOfJunction.Get() == Junction)
+	{
+		return Road->StartJunctionMeshTrimS;
+	}
+	for (const FMetaLandRoadJunctionTrimZone& Zone : Road->JunctionTrimZones)
+	{
+		if (Zone.Junction.Get() != Junction)
+		{
+			continue;
+		}
+		if (Zone.ApproachCutS >= 0.0)
+		{
+			return Zone.ApproachCutS;
+		}
+		if (Zone.DepartCutS >= 0.0)
+		{
+			return Zone.DepartCutS;
+		}
+	}
+	return -1.0;
+}
+
+bool AMoKuEditSplineActor::FindNearestEditableLandscapeKeyToJunction(
+	const AMoKuEditIntersectionActor* Junction,
+	int32& OutSectionIndex,
+	int32& OutKeyIndex) const
+{
+	OutSectionIndex = INDEX_NONE;
+	OutKeyIndex = INDEX_NONE;
+	if (!Junction || !SplineComponent)
+	{
+		return false;
+	}
+
+	const double MouthS = FindRoadMouthSForJunction(this, Junction);
+	if (MouthS < 0.0)
+	{
+		return false;
+	}
+
+	double BestDist = TNumericLimits<double>::Max();
+	MetaLandRoadProfile::ForEachVisibleLandscapeKey(
+		SplineComponent,
+		this,
+		[MouthS, &BestDist, &OutSectionIndex, &OutKeyIndex](int32 SectionIndex, int32 KeyIndex, double WorldS)
+		{
+			const double Dist = FMath::Abs(WorldS - MouthS);
+			if (Dist < BestDist)
+			{
+				BestDist = Dist;
+				OutSectionIndex = SectionIndex;
+				OutKeyIndex = KeyIndex;
+			}
+			return true;
+		});
+	return OutSectionIndex != INDEX_NONE;
+}
+
+bool AMoKuEditSplineActor::IsNearestEditableLandscapeKeyToJunction(
+	const AMoKuEditIntersectionActor* Junction,
+	int32 SectionIndex,
+	int32 KeyIndex) const
+{
+	int32 NearestSection = INDEX_NONE;
+	int32 NearestKey = INDEX_NONE;
+	return FindNearestEditableLandscapeKeyToJunction(Junction, NearestSection, NearestKey)
+		&& NearestSection == SectionIndex
+		&& NearestKey == KeyIndex;
+}
+
+void AMoKuEditSplineActor::WriteNearestLandscapeKeyFromJunction(
+	const AMoKuEditIntersectionActor* Junction,
+	float SideOffsetCm,
+	float SideFalloffCm)
+{
+	if (!Junction || !SplineComponent || bSyncingLandscapeHeightFalloff)
+	{
+		return;
+	}
+
+	int32 SectionIndex = INDEX_NONE;
+	int32 KeyIndex = INDEX_NONE;
+	if (!FindNearestEditableLandscapeKeyToJunction(Junction, SectionIndex, KeyIndex))
+	{
+		return;
+	}
+
+	FMetaLandRoadLaneAttribute* Track =
+		SplineComponent->GetLaneSection(SectionIndex).FindAttribute(FMetaLandRoadAttributeRegistry::TypeLandscape);
+	if (!Track || !Track->Keys.IsValidIndex(KeyIndex))
+	{
+		return;
+	}
+
+	FRoadFalloffSettings Falloff;
+	if (!Track->GetKeyFalloff(KeyIndex, Falloff))
+	{
+		Falloff = RoadHeightmapSettings.FalloffSettings;
+	}
+	Falloff.EdgeOffset = FMath::Max(SideOffsetCm, 0.0f);
+	Falloff.FalloffWidth = FMath::Max(SideFalloffCm, 1.0f);
+	SplineComponent->Modify();
+	Track->ApplyFalloffToKey(KeyIndex, Falloff);
+	SyncHeightmapFalloffFromLandscapeKey(SectionIndex, KeyIndex);
+}
+
 void AMoKuEditSplineActor::PushHeightmapFalloffToLandscapeKeys()
 {
 	if (bSyncingLandscapeHeightFalloff || !SplineComponent)
@@ -1452,7 +1568,7 @@ void AMoKuEditSplineActor::PushHeightmapFalloffToLandscapeKeys()
 		return;
 	}
 
-	MetaLandRoadProfile::EnsureLandscapeAttributeOnSections(SplineComponent);
+	MetaLandRoadProfile::PrepareLandscapeKeys(SplineComponent, false);
 	SplineComponent->Modify();
 
 	int32 TargetSection = 0;

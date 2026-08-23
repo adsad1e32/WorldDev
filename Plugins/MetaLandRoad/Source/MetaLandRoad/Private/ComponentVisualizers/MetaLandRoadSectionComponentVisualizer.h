@@ -352,8 +352,10 @@ protected:
 	void OnDeleteWidthKey();
 	void OnAddLandscapeKey();
 	void OnDeleteLandscapeKey();
+	void PrepareLandscapeKeys(UMetaLandRoadSplineComponent* SplineComp) const;
 	bool VisProxyHandleAttributeKeyClick(FEditorViewportClient* InViewportClient, HComponentVisProxy* VisProxy, const FViewportClick& Click);
 	bool TryHandleLandscapeAttributePickClick(FEditorViewportClient* InViewportClient, HComponentVisProxy* VisProxy, const FViewportClick& Click);
+	bool TrySelectHoveredLandscapeAttributeKey(FEditorViewportClient* InViewportClient);
 	void NotifyLandscapeAttributeChanged(UMetaLandRoadSplineComponent* SplineComp) const;
 	void ApplyLandscapeAttributeKeySelection(
 		UMetaLandRoadSplineComponent* SplineComp,

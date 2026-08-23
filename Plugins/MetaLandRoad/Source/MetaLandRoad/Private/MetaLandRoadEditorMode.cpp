@@ -73,6 +73,45 @@ UMetaLandRoadEditorMode::UMetaLandRoadEditorMode(FVTableHelper& Helper)
 void UMetaLandRoadEditorMode::ActorSelectionChangeNotify()
 {
 	UpdateAssetGizmoImpl();
+	if (GMetaLandRoadEnteringEditorMode || !GEditor)
+	{
+		return;
+	}
+	if (!FModuleManager::Get().IsModuleLoaded(TEXT("MetaLandRoad")))
+	{
+		return;
+	}
+	FMetaLandRoadModule& Module = FMetaLandRoadModule::Get();
+	if (!Module.IsLandscapeAttributeOverlayRequested() && !Module.ShouldShowLandscapeDetailsPanel())
+	{
+		return;
+	}
+
+	AMoKuEditSplineActor* SelectedRoad = nullptr;
+	bool bSelectedNonRoad = false;
+	for (FSelectionIterator It(GEditor->GetSelectedActorIterator()); It; ++It)
+	{
+		AActor* Selected = Cast<AActor>(*It);
+		if (AMoKuEditSplineActor* Road = Cast<AMoKuEditSplineActor>(Selected))
+		{
+			if (!SelectedRoad)
+			{
+				SelectedRoad = Road;
+			}
+		}
+		else if (Selected)
+		{
+			bSelectedNonRoad = true;
+		}
+	}
+
+	if (SelectedRoad && !bSelectedNonRoad)
+	{
+		Module.ShowLandscapeOverlayForActor(SelectedRoad);
+		return;
+	}
+
+	Module.DismissLandscapeOverlayKeepAttribute();
 }
 
 void UMetaLandRoadEditorMode::SetEditTarget(const FMetaLandRoadEditTarget& Target)
@@ -299,16 +338,17 @@ bool UMetaLandRoadEditorMode::TryHandleLaneAnchorPickClick(
 
 void UMetaLandRoadEditorMode::Enter()
 {
-	TWeakObjectPtr<AActor> KeepSelectedRoad;
+	TWeakObjectPtr<AActor> KeepSelectedActor;
 	if (GEditor)
 	{
 		if (USelection* SelectedActors = GEditor->GetSelectedActors())
 		{
 			for (FSelectionIterator It(*SelectedActors); It; ++It)
 			{
-				if (AMoKuEditSplineActor* Road = Cast<AMoKuEditSplineActor>(*It))
+				AActor* Selected = Cast<AActor>(*It);
+				if (Cast<AMoKuEditSplineActor>(Selected) || Cast<AMoKuEditIntersectionActor>(Selected))
 				{
-					KeepSelectedRoad = Road;
+					KeepSelectedActor = Selected;
 					break;
 				}
 			}
@@ -401,9 +441,9 @@ void UMetaLandRoadEditorMode::Enter()
 	}
 	if (GEditor)
 	{
-		if (AActor* Road = KeepSelectedRoad.Get())
+		if (AActor* Selected = KeepSelectedActor.Get())
 		{
-			GEditor->SelectActor(Road, true, true, true, true);
+			GEditor->SelectActor(Selected, true, true, true, true);
 		}
 	}
 }

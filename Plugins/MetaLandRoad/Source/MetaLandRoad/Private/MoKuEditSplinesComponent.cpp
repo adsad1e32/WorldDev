@@ -94,12 +94,9 @@ void UMoKuEditSplinesComponent::PostLoad()
 void UMoKuEditSplinesComponent::PostEditUndo()
 {
 	Super::PostEditUndo();
-	if (UMetaLandRoadSplineComponent* RoadSpline = Cast<UMetaLandRoadSplineComponent>(this))
+	if (AMoKuEditSplineActor* Road = Cast<AMoKuEditSplineActor>(GetOwner()))
 	{
-		TGuardValue<bool> SuppressJunctionRecook(
-			AMoKuEditSplineActor::bSuppressJunctionRecookFromRoadRefresh, true);
-		MetaLandRoadProfile::RecookLocalJunctionsForSpline(RoadSpline);
-		MetaLandRoadProfile::RefreshConnectedRoadMeshes(RoadSpline);
+		MetaLandRoadProfile::NotifyUndoDerivedMeshDirty(Road);
 	}
 }
 #endif
@@ -111,7 +108,11 @@ void UMoKuEditSplinesComponent::UpdateRoadLayout()
 	if (ParentActor
 		&& !bIsRefreshingRoadMesh
 		&& !bDeferRoadMeshRefresh
-		&& !AMoKuEditSplineActor::bSuppressJunctionRecookFromRoadRefresh)
+		&& !AMoKuEditSplineActor::bSuppressJunctionRecookFromRoadRefresh
+#if WITH_EDITOR
+		&& !GIsTransacting
+#endif
+		)
 	{
 		ParentActor->RefreshDynamicRoadMesh();
 	}

@@ -1,5 +1,5 @@
 ---
-description: MetaLandRoad C++ — .h decls / .cpp impl, no namespace wrappers; Fig1 junction + strict vertex-order audit; MetaRoad is reference
+description: MetaLandRoad C++ — .h decls / .cpp impl; split by story not line count; review marks then discuss; Fig1 junction audit; MetaRoad is reference
 globs: Plugins/MetaLandRoad/**/*
 alwaysApply: false
 ---
@@ -7,27 +7,31 @@ alwaysApply: false
 # MetaLandRoad: incremental, in-place code
 
 - **MetaRoad** = target/reference plugin; **MetaLandRoad** = this project plugin.
-- See `Docs/MetaRoad-vs-MetaLandRoad.md` and skill `metal-androad-incremental-dev`.
+- Full text: skill `metal-androad-incremental-dev` and `Docs/Agent-Conventions.md`.
+- Any Editor Mode / Interactive Tool: `Docs/UE-InteractiveTool-Standard.md` (`OnClickPress` dispatches only).
+- Runtime vs Editor packaging: `Docs/MetaLandRoad-Runtime-Editor.md`. Runtime = data/mesh/stamp; Editor = Tool/Mode/Visualizer. Runtime calls Editor only via `FMetaLandRoadEditorHooks`.
 
-## C++ style (mandatory — strictly enforce)
+## Review
 
-**函数声明写在 `.h`，函数实现写在 `.cpp`。不要把函数体写在头文件里。**
+- Audit first: mark `[审核]` (location, why it is wrong, suggested result).
+- Dead / unused (hotkeys, preview, `#if 0`, leftover MetaRoad accessors): mark, **ask 是否移除**, do not delete until yes. Do not attach new features to a marked dead path.
+- Lane/Section live API = index + SOffset. Do not keep unused `GetStartSection` / object-ref wrappers or `static Fallback` refs. Symmetric Pin/Unpin: mark first.
+- Do not silently rewrite. Discuss, then change only agreed items.
+- No line-count split rule. Split by **one file, one story**, after user OK.
 
-另外，实现函数不套命名空间。
+## C++ style
 
-- **`.h`**: declarations only (plus trivial one-line getters if unavoidable).
-- **`.cpp`**: **all function bodies** for new and edited code.
-- **No** anonymous namespaces, **no** `*Private` namespace blocks around implementations.
-- Use class `private`/`static` members (decl in `.h`, def in `.cpp`) or file-local `static` helpers in `.cpp`.
-- Add new behavior to the **existing** owning `.h` + `.cpp` pair; do not create new files for single functions.
-- **Ask the user first** before new source files.
-- Prefer small compile-safe slices (一点点来).
-- **Never** put new implementations in headers unless the user explicitly overrides this rule.
+- **`.h`**: declarations. **`.cpp`**: all function bodies.
+- File-local `static` and anonymous namespace in `.cpp` are OK.
+- No `namespace XxxPrivate` as a second module. No new one-off `*Utils` / `*Generation` files.
+- New `UCLASS` / Tool / Global Shader → new file is normal.
+- Prefer small compile-safe slices.
 
-## Junction (mandatory — critically important)
+## Product / junction
 
-- **Figure 1 wiring**: arm lane strips + N corner fillets + center/sector fill. **Not** Figure-3 fan / single-ring ear-clip as primary cover.
-- **一定要严格审核顶点顺序封面** — every junction mesh publish must run point-index / vertex-order audit; fail → abort mesh.
-- Overlap OK in edit preview; Cook must avoid permanent double-coverage (sector clip / arrangement), especially 5/6-way.
-- 4→5 / N-way = whole-node recook (polar re-sort arms), not local patches.
-- Full detail: skill `metal-androad-incremental-dev` section **Junction topology — Figure 1**.
+- Landscape params = height only. Road weight falloff = Landscape Key (0 = Actor default); junction uses Actor. Profile PS draws Road only.
+- Visible road spans = `GetJunctionMeshGenerationSpans` (single owner).
+- **Figure 1** + vertex-order audit on every junction publish; fail → abort.
+- Junction cook: `Docs/MetaLandRoad-Junction-Spec.md` (T / Cross / N). Same-spline = outer chord, never inward fillet. Do not fix N by changing T (or the reverse).
+- Body-corner loft sweeps the authored spline (`Center + Right × Off`). Do not replace PathCenter with a second fillet curve (`Docs/MetaLandRoad-Guidance-vs-Mesh-Review.md`).
+- 4→5 / N-way = whole-node recook, not local patches. After a cook change, Recook T far-half + Cross/Fig2 + one 5-way.

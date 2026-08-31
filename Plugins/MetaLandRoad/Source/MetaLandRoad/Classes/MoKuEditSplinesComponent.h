@@ -268,7 +268,7 @@ public :
 //DECLARE_EVENT_OneParam(UMoKuEditSplinesComponent, FParamsChangedEvent, AActor*)
 
 UCLASS(ClassGroup=(Custom), meta=(BlueprintSpawnableComponent))
-class UMoKuEditSplinesComponent : public UMetaLandRoadSplineComponent
+class METALANDROAD_API UMoKuEditSplinesComponent : public UMetaLandRoadSplineComponent
 {
 	GENERATED_UCLASS_BODY()
 

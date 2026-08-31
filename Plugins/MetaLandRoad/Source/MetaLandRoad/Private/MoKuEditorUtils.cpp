@@ -6,7 +6,10 @@
 #include "UObject/UObjectGlobals.h"
 #include "ActorFolder.h"
 #include "WorldPersistentFolders.h"
+#if WITH_EDITOR
 #include "EditorActorFolders.h"
+#include "Tools/UEdMode.h"
+#endif
 #include "CompGeom/PolygonTriangulation.h"
 #include "CurveOps/TriangulateCurvesOp.h"
 #include "DynamicMesh/MeshNormals.h"
@@ -1338,6 +1341,8 @@ TArray<AActor*> MoKuSplineEditorUtils::GetActorListByFolderPath(const FString& I
 		FActorFolders::GetActorsFromFolders(*World, Paths, OutActors);
 	}
 	return OutActors;
+#else
+	return TArray<AActor*>();
 #endif
 }
 TArray<FVector> MoKuSplineEditorUtils::SortEdgePathByList(const TArray<TArray<FVector>>& InPostionList)
@@ -1509,6 +1514,7 @@ FCornerInfo MoKuSplineEditorUtils::CutJunctionCornerInfo(USplineComponent* InCur
 
 }
 
+#if WITH_EDITOR
 void  MoKuSplineEditorUtils::CheckAndSetEditLayer(UEdMode* ModeIn, const FString& InLayerName)
 {
 	if (!ModeIn)return;
@@ -1543,6 +1549,7 @@ void  MoKuSplineEditorUtils::CheckAndSetEditLayer(UEdMode* ModeIn, const FString
 
 
 }
+#endif
 
 void MoKuSplineEditorUtils::ConvertPointInfoData(const TArray<FInteresectionPointInfo>& IntersectionInfo, TMap<TObjectPtr<AMoKuEditBaseActor>, TMap<TObjectPtr<UMoKuEditSplinesComponent>, TArray<FActorInteresectionPointInfo>>>& OutActorInteresectionMapPointInfo)
 {

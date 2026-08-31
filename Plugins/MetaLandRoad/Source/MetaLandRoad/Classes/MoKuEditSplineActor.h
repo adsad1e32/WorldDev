@@ -35,6 +35,7 @@
 
 
 class UMoKuEditSplinesComponent;
+class UMetaLandRoadPropInstanceComponent;
 struct FMoKuSplineInterpPoint;
 
 
@@ -254,7 +255,7 @@ struct FMetaLandRoadJunctionTrimZone
 
 
 UCLASS(Blueprintable, hidecategories = (Replication, Input, LOD, Actor, Cooking, Rendering))
-class AMoKuEditSplineActor : public AMoKuEditBaseActor
+class METALANDROAD_API AMoKuEditSplineActor : public AMoKuEditBaseActor
 {
 	GENERATED_BODY()
 
@@ -281,7 +282,7 @@ public:
 	// 假如当前道路为DynamicMesh 则需要刷新
 	virtual void RefreshDynamicRoadMesh();
 
-	/** Copy the selected (or Begin) landscape key falloff onto RoadHeightmapSettings. */
+	/** Copy the selected (or Begin) landscape key falloff onto leftover RoadHeightmapSettings. */
 	void SyncHeightmapFalloffFromLandscapeKey(int32 SectionIndex, int32 KeyIndex);
 
 	bool FindNearestEditableLandscapeKeyToJunction(
@@ -297,7 +298,7 @@ public:
 		float SideOffsetCm,
 		float SideFalloffCm);
 
-	/** Write RoadHeightmapSettings.FalloffSettings into the selected key, or Begin+End if none. */
+	/** Write leftover RoadHeightmapSettings.FalloffSettings into the selected key, or Begin+End if none. */
 	void PushHeightmapFalloffToLandscapeKeys();
 
 	/**
@@ -328,6 +329,9 @@ public:
 
 	UPROPERTY(VisibleAnywhere, Category = "Spline")
 	TObjectPtr<UMoKuEditSplinesComponent> SplineComponent = nullptr;
+
+	UPROPERTY(VisibleAnywhere, Category = "PropSetting")
+	TObjectPtr<UMetaLandRoadPropInstanceComponent> PropInstanceHost = nullptr;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spline", meta = (DisplayName = "道路类型"))
 	ERoadType RoadModeType;
@@ -606,22 +610,31 @@ public:
 	TWeakObjectPtr<AMoKuEditIntersectionActor> EndOfJunction;
 
 	/** Mesh generation starts here when StartOfJunction is set (-1 = full spline start). Spline geometry unchanged. */
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = Junction)
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "MetaLandRoad|Junction")
 	double StartJunctionMeshTrimS = -1.0;
 
 	/** Mesh generation ends here when EndOfJunction is set (-1 = full spline end). Spline geometry unchanged. */
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = Junction)
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "MetaLandRoad|Junction")
 	double EndJunctionMeshTrimS = -1.0;
 
 	/** Multiple junction gaps along one road (preferred over Start/End trim fields). */
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = Junction)
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "MetaLandRoad|Junction", meta = (DisplayName = "Junction Trim Zones"))
 	TArray<FMetaLandRoadJunctionTrimZone> JunctionTrimZones;
 
-	/** Active [SMin, SMax] for lane mesh generation (respects junction trim, not spline length). */
-	void GetJunctionMeshGenerationRange(double& OutSMin, double& OutSMax) const;
-
-	/** One or two spans when a through road has a middle gap at a junction. */
+	/**
+	 * Remaining-road intervals after junction trim. One owner for mesh / overlay / stamp.
+	 * Empty = no usable mesh (zero length or fully trimmed).
+	 */
 	void GetJunctionMeshGenerationSpans(TArray<TPair<double, double>>& OutSpans) const;
+
+	/** WorldS on a remaining-road span. No spans = treat as the whole road. */
+	bool ContainsJunctionMeshStation(double WorldS, double TolCm = 1.0) const;
+
+	/** Snap WorldS onto the nearest remaining-road span. No spans = unchanged. */
+	double ClampToNearestJunctionMeshSpan(double WorldS) const;
+
+	/** Longest overlap of [InS0, InS1] with remaining-road spans. No spans = passthrough. */
+	bool ClipRangeToJunctionMeshSpans(double InS0, double InS1, double& OutS0, double& OutS1) const;
 
 	//UPROPERTY()
 	//TWeakObjectPtr<AWorldSceneManagement> SceneManagement;
@@ -631,12 +644,10 @@ public:
 	TArray<TArray<FMoKuSplineInterpPoint>> ExtraLocalMeshInterPointList;
 
 
-	/** Legacy angle/arc spline subdivision — disabled; kept for API compatibility. */
+	/** Angle-based corner handles on the existing key. Does not insert display points. */
 	TArray<FVector> UpdateInterpolateType(int32 Index, int32 SegmentNum=16,float Radius = 3000);
 	void SetSplineComponent(UMoKuEditSplinesComponent* InSplineComponent);
 	FORCEINLINE UMoKuEditSplinesComponent* GetSplineComponent() const { return SplineComponent;}
-	FORCEINLINE UStaticMeshComponent* GetStartAsset() const { return StartAsset.Get(); }
-	FORCEINLINE UStaticMeshComponent* GetEndAsset() const { return EndAsset.Get(); }
 	UMoKuEditSplinesComponent* BuildSideSpline(const TArray<FVector>& InPosition);
 	FORCEINLINE FSideRoadCurvePaths GetSideCurvePaths() { return SideCurvePaths; }
 	void AddGizmoInfoToSocket(const TObjectPtr<UStaticMeshComponent>& InAsset, TArray<FSocketGizmoTransformInfo>& OutGizmoTransform,bool EndMesh = false);

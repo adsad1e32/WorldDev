@@ -20,6 +20,8 @@ class IRoadBrushActorInterface
 		GENERATED_IINTERFACE_BODY()
 
 		virtual bool AffectsLandscape() const = 0;
+		virtual bool AffectsWeightmapLayer(FName LayerName) const = 0;
+		virtual float GetRoadWeightFalloffWidth() const = 0;
 	#if WITH_EDITOR
 		virtual const FSplineRoadHeightmapSettings& GetRoadHeightmapSettings() const = 0;
 

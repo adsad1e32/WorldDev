@@ -1,17 +1,19 @@
 #include "WorldLandscapeBlueprintBrush.h"
 #include "LandscapeSettings.h"
 #include "LandscapeModule.h"
-#include "LandscapeEditorServices.h"
 #include "Landscape.h"
+#if WITH_EDITOR
+#include "LandscapeEditorServices.h"
+#endif
 #include "MoKuEditBaseActor.h"
 #include "EngineUtils.h"
 #include "Algo/AnyOf.h"
 #include "EditSplineRoadInfo.h"
 #include "WorldEditorSettings.h"
-#include "Editor.h"
 #include "Containers/Ticker.h"
-
-#include "SplineRoadEditorSubsystem.h"
+#if WITH_EDITOR
+#include "Editor.h"
+#endif
 
 #include UE_INLINE_GENERATED_CPP_BY_NAME(WorldLandscapeBlueprintBrush)
 
@@ -672,47 +674,17 @@ bool AWorldLandscapeBlueprintBrush::IsActorAffectingLandscape(AActor* Actor) con
 void AWorldLandscapeBlueprintBrush::UpdateAffectedWeightmaps()
 {
 	AffectedWeightmapLayers.Empty();
-	for (const TWeakInterfacePtr<IRoadBrushActorInterface>& RoadBrushActor : ActorsAffectingLandscape)
-	{
-		if (RoadBrushActor.IsValid())
-		{
-			for (const TPair<FName, FRoadBodyWeightmapSettings>& Pair : RoadBrushActor->GetLayerWeightmapSettings())
-			{
-				AffectedWeightmapLayers.AddUnique(Pair.Key);
-			}
-		}
-	}
 
 	// Landscape only calls weight RenderLayer for names in AffectedWeightmapLayers.
 	// If the actor list is empty/stale, an empty list sets CanAffectWeightmap=false → weight settings appear to do nothing.
 	const UWorldEditorSettings* Settings = GetDefault<UWorldEditorSettings>();
 	const FName DefaultRoadLayer = Settings ? Settings->GetDefaultRoadWeightmapLayerName() : FName(TEXT("Road"));
-	const FName DefaultShoulderLayer = Settings ? Settings->GetDefaultShoulderWeightmapLayerName() : FName(TEXT("Dirty"));
 	if (DefaultRoadLayer != NAME_None)
 	{
 		AffectedWeightmapLayers.AddUnique(DefaultRoadLayer);
 	}
-	// Side slopes (embankment) — separate from pavement Road layer.
-	if (DefaultShoulderLayer != NAME_None)
-	{
-		AffectedWeightmapLayers.AddUnique(DefaultShoulderLayer);
-	}
 
 	SetCanAffectWeightmap(AffectedWeightmapLayers.Num() > 0);
-
-	FString LayerNames;
-	for (const FName& LayerName : AffectedWeightmapLayers)
-	{
-		if (!LayerNames.IsEmpty())
-		{
-			LayerNames += TEXT(",");
-		}
-		LayerNames += LayerName.ToString();
-	}
-	UE_LOG(LogTemp, Log, TEXT("[RoadLandscape] UpdateAffectedWeightmaps layers=%d (%s) actors=%d"),
-		AffectedWeightmapLayers.Num(),
-		LayerNames.IsEmpty() ? TEXT("none") : *LayerNames,
-		ActorsAffectingLandscape.Num());
 }
 
 void AWorldLandscapeBlueprintBrush::PostRegisterAllComponents()
@@ -860,8 +832,7 @@ void AWorldLandscapeBlueprintBrush::OnRoadBrushActorChanged(const IRoadBrushActo
 		{
 			UpdateAffectedWeightmaps();
 		}
-		// Do NOT global-kill DF cache here — that forced CaptureRoadDepth+JumpFlood on every
-		// road (41×) when one junction moved. Per-actor invalidate is in BlueprintRoadBodyChanged_Native.
+		// Profile stamp has no distance-field cache. One landscape request is enough.
 		if (bAffectsLandscape && !bActorAlreadyAffectingLandscape)
 		{
 			UWorld* BrushWorld = GetBrushActorWorldSafe(this);

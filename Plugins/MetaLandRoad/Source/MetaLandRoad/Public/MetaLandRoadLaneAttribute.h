@@ -3,6 +3,7 @@
 #include "CoreMinimal.h"
 #include "SplineRoadBasicSettings.h"
 #include "StructUtils/InstancedStruct.h"
+#include "MetaLandRoadPropSetting.h"
 
 #include "MetaLandRoadLaneAttribute.generated.h"
 
@@ -60,19 +61,23 @@ struct METALANDROAD_API FMetaLandRoadLandscapeAttributeValue : public FMetaLandR
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Landscape, meta = (ClampMin = "0.0", ClampMax = "1.0"))
 	float LayerFactor = 1.0f;
 
-	/** Extra fade beyond the solid road bed (cm). MetaRoad Side Falloff. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Landscape, meta = (ClampMin = "0.0", DisplayName = "Side Falloff"))
+	/** Extra fade beyond the solid road bed (cm). Height only. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Landscape, meta = (ClampMin = "0.0", DisplayName = "Height Side Falloff"))
 	float SideFalloff = 2000.0f;
 
-	/** Extra solid width beyond the mesh edge (cm). MetaRoad Side Offset. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Landscape, meta = (DisplayName = "Side Offset"))
+	/** Extra solid width beyond the mesh edge (cm). Height only. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Landscape, meta = (DisplayName = "Height Side Offset"))
 	float SideOffset = 0.0f;
 
-	/** Extra bias on the captured mesh Z (cm). 0 = landscape meets the mesh. */
+	/** Extra bias on the captured mesh Z (cm). Matches FRoadFalloffSettings::ZOffset. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Landscape, meta = (DisplayName = "Height Offset"))
-	float HeightOffset = 0.0f;
+	float HeightOffset = -5.0f;
 
-	/** Kept in sync with Side* for leftover JumpFlood / actor falloff. */
+	/** Road weight soft edge (cm). 0 = inherit Actor RoadWeightFalloffWidth. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Road Weight", meta = (ClampMin = "0.0", ClampMax = "2500.0", DisplayName = "Road Weight Falloff Width"))
+	float RoadWeightFalloffWidth = 0.0f;
+
+	/** Kept in sync with Side* for leftover actor falloff / junction key write. */
 	UPROPERTY()
 	FRoadFalloffSettings FalloffSettings;
 
@@ -120,6 +125,9 @@ struct METALANDROAD_API FMetaLandRoadJunctionLandscapeDetails
 
 	UPROPERTY(EditAnywhere, Category = "Landscape", meta = (ShowOnlyInnerProperties))
 	FMetaLandRoadLandscapeAttributeValue Landscape;
+
+	UPROPERTY(EditAnywhere, Category = "Road Weight", meta = (ClampMin = "1.0", ClampMax = "2500.0", DisplayName = "Road Weight Falloff Width"))
+	float RoadWeightFalloffWidth = 180.0f;
 };
 
 /** Stepped speed-limit metadata. Unit is caller-defined. */
@@ -211,6 +219,15 @@ struct METALANDROAD_API FMetaLandRoadSidewalkHeightAttributeValue : public FMeta
 	static FMetaLandRoadAttributeTypeDesc GetTypeDesc();
 };
 
+/** Registry dummy. Rails live on the track, not in Keys. */
+USTRUCT(BlueprintType)
+struct METALANDROAD_API FMetaLandRoadPropSettingAttributeValue : public FMetaLandRoadLaneAttributeValue
+{
+	GENERATED_BODY()
+
+	static FMetaLandRoadAttributeTypeDesc GetTypeDesc();
+};
+
 USTRUCT(BlueprintType)
 struct METALANDROAD_API FMetaLandRoadLaneAttributeKey
 {
@@ -235,6 +252,7 @@ public:
 	static const FName TypeLandscape;
 	static const FName TypePolygon;
 	static const FName TypeSidewalkHeight;
+	static const FName TypePropSetting;
 
 	static void RegisterBuiltInTypes();
 	static bool RegisterType(const FMetaLandRoadAttributeTypeDesc& Desc);
@@ -255,6 +273,14 @@ struct METALANDROAD_API FMetaLandRoadLaneAttribute
 
 	UPROPERTY(EditAnywhere, Category = LaneAttribute)
 	TArray<FMetaLandRoadLaneAttributeKey> Keys;
+
+	/** PropSetting only. Per-rail Keys live here, not in Keys. */
+	UPROPERTY(EditAnywhere, Category = LaneAttribute)
+	TArray<FMetaLandRoadPropRail> Rails;
+
+	FMetaLandRoadPropRail* FindRail(const FGuid& RailId);
+	const FMetaLandRoadPropRail* FindRail(const FGuid& RailId) const;
+	int32 FindRailIndex(const FGuid& RailId) const;
 
 	void Trim(double S0, double S1);
 	void SortKeys();

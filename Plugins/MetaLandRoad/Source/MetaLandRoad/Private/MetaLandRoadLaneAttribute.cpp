@@ -7,6 +7,7 @@ const FName FMetaLandRoadAttributeRegistry::TypeCurbCut(TEXT("CurbCut"));
 const FName FMetaLandRoadAttributeRegistry::TypeLandscape(TEXT("Landscape"));
 const FName FMetaLandRoadAttributeRegistry::TypePolygon(TEXT("Polygon"));
 const FName FMetaLandRoadAttributeRegistry::TypeSidewalkHeight(TEXT("SidewalkHeight"));
+const FName FMetaLandRoadAttributeRegistry::TypePropSetting(TEXT("PropSetting"));
 
 static TArray<FMetaLandRoadAttributeTypeDesc> GAttributeTypes;
 static bool GAttributeTypesRegistered = false;
@@ -21,7 +22,7 @@ FMetaLandRoadLandscapeAttributeValue::FMetaLandRoadLandscapeAttributeValue()
 {
 	SideFalloff = 2000.0f;
 	SideOffset = 0.0f;
-	HeightOffset = 0.0f;
+	HeightOffset = -5.0f;
 	SyncFalloffFromMetaRoadFields();
 }
 
@@ -74,6 +75,11 @@ void FMetaLandRoadLandscapeAttributeValue::InterpolateWith(const FMetaLandRoadLa
 	SideFalloff = FMath::Lerp(SideFalloff, OtherValue.SideFalloff, T);
 	SideOffset = FMath::Lerp(SideOffset, OtherValue.SideOffset, T);
 	HeightOffset = FMath::Lerp(HeightOffset, OtherValue.HeightOffset, T);
+	const float W0 = RoadWeightFalloffWidth >= 1.0f ? RoadWeightFalloffWidth : OtherValue.RoadWeightFalloffWidth;
+	const float W1 = OtherValue.RoadWeightFalloffWidth >= 1.0f ? OtherValue.RoadWeightFalloffWidth : RoadWeightFalloffWidth;
+	RoadWeightFalloffWidth = (W0 >= 1.0f && W1 >= 1.0f)
+		? FMath::Lerp(W0, W1, T)
+		: FMath::Max(W0, W1);
 	SyncFalloffFromMetaRoadFields();
 }
 
@@ -99,6 +105,19 @@ void FMetaLandRoadLandscapeAttributeValue::InterpolateCatmullRom(
 	SideFalloff = FMath::Max(0.1f, Sample(P0.SideFalloff, P1.SideFalloff, P2.SideFalloff, P3.SideFalloff));
 	SideOffset = Sample(P0.SideOffset, P1.SideOffset, P2.SideOffset, P3.SideOffset);
 	HeightOffset = Sample(P0.HeightOffset, P1.HeightOffset, P2.HeightOffset, P3.HeightOffset);
+	auto SolidW = [](float W) { return W >= 1.0f ? W : 0.0f; };
+	const float A1 = SolidW(P1.RoadWeightFalloffWidth);
+	const float A2 = SolidW(P2.RoadWeightFalloffWidth);
+	if (A1 >= 1.0f || A2 >= 1.0f)
+	{
+		const float A0 = SolidW(P0.RoadWeightFalloffWidth);
+		const float A3 = SolidW(P3.RoadWeightFalloffWidth);
+		const float S1 = A1 >= 1.0f ? A1 : A2;
+		const float S2 = A2 >= 1.0f ? A2 : S1;
+		const float S0 = A0 >= 1.0f ? A0 : S1;
+		const float S3 = A3 >= 1.0f ? A3 : S2;
+		RoadWeightFalloffWidth = FMath::Max(1.0f, Sample(S0, S1, S2, S3));
+	}
 	SyncFalloffFromMetaRoadFields();
 }
 
@@ -192,6 +211,20 @@ FMetaLandRoadAttributeTypeDesc FMetaLandRoadSidewalkHeightAttributeValue::GetTyp
 	return Desc;
 }
 
+FMetaLandRoadAttributeTypeDesc FMetaLandRoadPropSettingAttributeValue::GetTypeDesc()
+{
+	FMetaLandRoadAttributeTypeDesc Desc;
+	Desc.TypeId = FMetaLandRoadAttributeRegistry::TypePropSetting;
+	Desc.DisplayName = NSLOCTEXT("MetaLandRoadAttribute", "PropSetting", "PropSetting");
+	Desc.Category = TEXT("Prop");
+	Desc.IconName = TEXT("ClassIcon.StaticMeshActor");
+	Desc.ValueStruct = StaticStruct();
+	Desc.EvalMode = EMetaLandRoadAttributeEvalMode::Stepped;
+	Desc.bAllowOnLane = true;
+	Desc.bAllowOnSectionCenter = true;
+	return Desc;
+}
+
 bool FMetaLandRoadLaneAttributeKey::operator<(const FMetaLandRoadLaneAttributeKey& Other) const
 {
 	return SOffset < Other.SOffset;
@@ -211,6 +244,7 @@ void FMetaLandRoadAttributeRegistry::RegisterBuiltInTypes()
 	RegisterType(FMetaLandRoadLandscapeAttributeValue::GetTypeDesc());
 	RegisterType(FMetaLandRoadPolygonAttributeValue::GetTypeDesc());
 	RegisterType(FMetaLandRoadSidewalkHeightAttributeValue::GetTypeDesc());
+	RegisterType(FMetaLandRoadPropSettingAttributeValue::GetTypeDesc());
 }
 
 bool FMetaLandRoadAttributeRegistry::RegisterType(const FMetaLandRoadAttributeTypeDesc& Desc)
@@ -278,8 +312,55 @@ bool FMetaLandRoadAttributeRegistry::CanPinOn(FName TypeId, EMetaLandRoadAttribu
 	return Desc->bAllowOnSectionCenter;
 }
 
+FMetaLandRoadPropRail* FMetaLandRoadLaneAttribute::FindRail(const FGuid& RailId)
+{
+	const int32 Index = FindRailIndex(RailId);
+	return Rails.IsValidIndex(Index) ? &Rails[Index] : nullptr;
+}
+
+const FMetaLandRoadPropRail* FMetaLandRoadLaneAttribute::FindRail(const FGuid& RailId) const
+{
+	const int32 Index = FindRailIndex(RailId);
+	return Rails.IsValidIndex(Index) ? &Rails[Index] : nullptr;
+}
+
+int32 FMetaLandRoadLaneAttribute::FindRailIndex(const FGuid& RailId) const
+{
+	for (int32 Index = 0; Index < Rails.Num(); ++Index)
+	{
+		if (Rails[Index].RailId == RailId)
+		{
+			return Index;
+		}
+	}
+	return INDEX_NONE;
+}
+
 void FMetaLandRoadLaneAttribute::Trim(double S0, double S1)
 {
+	if (TypeId == FMetaLandRoadAttributeRegistry::TypePropSetting)
+	{
+		for (FMetaLandRoadPropRail& Rail : Rails)
+		{
+			for (int32 KeyIndex = Rail.Keys.Num() - 1; KeyIndex >= 0; --KeyIndex)
+			{
+				if (Rail.Keys[KeyIndex].SOffset < S0 || Rail.Keys[KeyIndex].SOffset > S1)
+				{
+					if (KeyIndex != 0 && KeyIndex != Rail.Keys.Num() - 1)
+					{
+						Rail.Keys.RemoveAt(KeyIndex);
+					}
+				}
+			}
+			for (FMetaLandRoadPropRailKey& Key : Rail.Keys)
+			{
+				Key.SOffset = FMath::Clamp(Key.SOffset, S0, S1) - S0;
+			}
+			Rail.EnsureSpanKeys(S1 - S0);
+		}
+		return;
+	}
+
 	int32 StartKey = INDEX_NONE;
 	int32 EndKey = INDEX_NONE;
 	for (int32 KeyIndex = 0; KeyIndex < Keys.Num(); ++KeyIndex)
@@ -329,6 +410,11 @@ void FMetaLandRoadLaneAttribute::SortKeys()
 
 void FMetaLandRoadLaneAttribute::EnsureFirstKeyAtZero()
 {
+	if (TypeId == FMetaLandRoadAttributeRegistry::TypePropSetting)
+	{
+		return;
+	}
+
 	if (Keys.Num() == 0)
 	{
 		FMetaLandRoadLaneAttributeKey FirstKey;
@@ -350,14 +436,6 @@ void FMetaLandRoadLaneAttribute::EnsureFirstKeyAtZero()
 		Keys[0].SOffset = 0.0;
 	}
 
-	for (FMetaLandRoadLaneAttributeKey& Key : Keys)
-	{
-		if (FMetaLandRoadLandscapeAttributeValue* LandscapeValue =
-			Key.Value.GetMutablePtr<FMetaLandRoadLandscapeAttributeValue>())
-		{
-			LandscapeValue->MigrateLegacyFields();
-		}
-	}
 }
 
 void FMetaLandRoadLaneAttribute::EnsureBeginAndEndKeys(double EndS)
@@ -534,12 +612,15 @@ bool FMetaLandRoadLaneAttribute::GetKeyFalloff(int32 KeyIndex, FRoadFalloffSetti
 		return false;
 	}
 
-	if (const FMetaLandRoadLandscapeAttributeValue* LandscapeValue =
-		Keys[KeyIndex].Value.GetPtr<FMetaLandRoadLandscapeAttributeValue>())
-	{
-		OutFalloff = LandscapeValue->FalloffSettings;
-		return true;
-	}
+		if (const FMetaLandRoadLandscapeAttributeValue* LandscapeValue =
+			Keys[KeyIndex].Value.GetPtr<FMetaLandRoadLandscapeAttributeValue>())
+		{
+			FMetaLandRoadLandscapeAttributeValue Synced = *LandscapeValue;
+			Synced.MigrateLegacyFields();
+			Synced.SyncFalloffFromMetaRoadFields();
+			OutFalloff = Synced.FalloffSettings;
+			return true;
+		}
 	return false;
 }
 
@@ -657,7 +738,6 @@ bool FMetaLandRoadLaneAttribute::EvalAsLandscape(double SOffset, FMetaLandRoadLa
 	if (const FMetaLandRoadLandscapeAttributeValue* LandscapeValue = EvalValue.GetPtr<FMetaLandRoadLandscapeAttributeValue>())
 	{
 		OutValue = *LandscapeValue;
-		OutValue.MigrateLegacyFields();
 		return true;
 	}
 

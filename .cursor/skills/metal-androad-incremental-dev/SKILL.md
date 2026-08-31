@@ -1,6 +1,6 @@
 ---
 name: metal-androad-incremental-dev
-description: WorldDev MetaLandRoad incremental C++ conventions — implementations in .cpp, declarations in .h, no namespace wrappers, MetaRoad reference alignment, Fig1 junction topology + strict vertex-order audit. Use when adding or editing C++ under Plugins/MetaLandRoad, comparing with MetaRoad, junction/FillMesh/UV/布线, or when the user mentions 头文件、cpp、命名空间、skill规范, or file organization.
+description: WorldDev MetaLandRoad conventions — .h decls / .cpp impl, split by responsibility not line count, review marks issues for discussion, MetaRoad reference, Fig1 junction + Junction Spec. Use when editing C++ under Plugins/MetaLandRoad, comparing MetaRoad, junction/FillMesh/UV/布线, RDG/stamp, Interactive Tool, or when the user mentions skill规范、审核、拆文件、路口规范.
 ---
 
 # MetaLandRoad Incremental Development
@@ -14,208 +14,127 @@ description: WorldDev MetaLandRoad incremental C++ conventions — implementatio
 
 Read before mesh or structure work:
 
-- [Docs/MetaRoad-vs-MetaLandRoad.md](../../../Docs/MetaRoad-vs-MetaLandRoad.md) — mesh pipelines + file layout comparison
-- [Docs/Agent-Conventions.md](../../../Docs/Agent-Conventions.md) — where to put new code
+- [Docs/MetaRoad-vs-MetaLandRoad.md](../../../Docs/MetaRoad-vs-MetaLandRoad.md)
+- [Docs/Agent-Conventions.md](../../../Docs/Agent-Conventions.md)
+- [Docs/UE-InteractiveTool-Standard.md](../../../Docs/UE-InteractiveTool-Standard.md) — **any** Editor Mode / Interactive Tool
+- [Docs/MetaLandRoad-Runtime-Editor.md](../../../Docs/MetaLandRoad-Runtime-Editor.md) — Runtime vs Editor cook
+- [Docs/MetaLandRoad-Junction-Spec.md](../../../Docs/MetaLandRoad-Junction-Spec.md) — **路口 cook 唯一正文**（T / Cross / N）
 
 ## Agent greeting (mandatory)
 
-When this skill applies, **start every user-facing reply with「大哥，」** before the substantive answer or action summary. This confirms the skill was loaded and followed.
-
-Example openings:
-
-- 「大哥，我先查圆环和 lane 高亮的实现。」
-- 「大哥，编译错误修好了，改动如下。」
+When this skill applies, **start every user-facing reply with「大哥，」** before the substantive answer or action summary.
 
 Do not skip the greeting on follow-up turns in the same MetaLandRoad task unless the user explicitly asks to stop.
 
-## Junction cook cover — Figure 1 strips (mandatory)
+## Product contracts (do not undo)
 
-**Primary cook (Fig3 MetaRoad / user): edge-lane links → fillmesh UV.**
+- Landscape params (Layer Factor / Height Side Falloff / Height Side Offset / Height Offset) affect **height only**.
+- Road weight falloff is Landscape Key **`RoadWeightFalloffWidth`** (0 = inherit Actor default). Junction / unset keys use Actor **`RoadWeightFalloffWidth`**. Profile PS draws **Road** only. No Dirty layer. No JF TMap.
+- Begin/End **data stays**; overlay **draws at CutS**. Hub-interior keys are not display keys.
+- Junction cook is **Fig1** + vertex-order audit; fail → abort mesh. **Follow [Junction Spec](../../../Docs/MetaLandRoad-Junction-Spec.md) exactly.**
+- CutS / remaining-road spans have **one owner**: `GetJunctionMeshGenerationSpans`. Do not copy a second trim test.
+- Do not fix N-way by changing T hole/fillet, or T by changing Cross/N hole. Same-spline adjacent = outer chord, never inward fillet.
+- Body-corner mesh: loft sweeps the authored spline (`Center + Right × Off`). Do not replace PathCenter with a second fillet curve. `EvalLanePosition` stays raw (Fig1 / half-width). Junction holes stay Fig1. Contract: [Docs/MetaLandRoad-Guidance-vs-Mesh-Review.md](../../../Docs/MetaLandRoad-Guidance-vs-Mesh-Review.md) §1 / §3.
 
-```
-ClearJunctionCoverMesh
-Refresh linked roads (trim gap)
-Ports polar θ; T through = ConnectSide half-CS
-  → Edge lane = 绿箭头两点 (CS outer + next inward)
-  → ONE shallow outer arc + **parallel** inner rail at laneW (path-normal); mesh strip
-  → Forbidden: two independent chord-arcs / hub-only offset (交叉穿插、一点扇面、相对图二严重变形)
-  → Reject mid-width outside [0.25,2.5]×laneW → straight lane fallback
-  → fillmesh on mouth CS[1]..CS[N-2] + inner rails
-```
+## Review before rewrite (mandatory)
 
-**UE native tools:** help triangulate a correct hole; boundary/lane links are our job (+ MetaRoad Arrangement2d long-term).
+When auditing or simplifying, **do not silently rewrite**. Mark the case, state the result, wait to discuss.
 
-**Recook / Debug (mandatory after every cook algorithm change):**
-- `DebugRecookJunction` / `DebugRecookLinkedJunctions` / `RecookFromLinkedRoads` / `RecookJunctionActor` must: `ClearJunctionCoverMesh` → re-cut/link → road trim refresh → `BuildFig1`
-- Mode inactive: fallback still calls `RefreshJunctionCoverMesh` (not bare `BuildFig1`)
-- Log BEGIN/END with `tris=` so Output Log proves debug path ran
-
-**Forbidden:** vertex-alpha overlap; hub-fan primary; edge stubs that cross; restoring full L↔R after T half snap; mouth inset into road body.
-
-| Layer | UV |
-|-------|-----|
-| Mouth / curb strip | World XY / asphalt at cut |
-| Center fill | World XY / tile |
-
-## Junction topology — Figure 1 (strip wiring — critically important)
-
-**Lane-aligned strip wiring for junctions (edit / future cook layers). Do NOT use unsorted polar fan of random cut points as the boundary.**
-
-### Pipeline (one-click cook / 4→5 / N-way)
+Template:
 
 ```
-Arms (polar order around Anchor)
-  → LaneStrips (per arm, cut → toward intersect; edit may overlap)
-  → CornerFillets (exactly N arcs for N arms, between consecutive outer edges)
-  → SectorClip or CenterFill (cook: no lasting double-coverage)
-  → ValidateJunctionMeshPointIndices (FAIL = abort mesh)
-  → UV
+[审核]
+位置：path:line（或函数名）
+现象：现在代码在做什么
+为何不合理：重复 / 一文件多故事 / 违反产品契约 / 非 UE 分层 / 死路径
+建议结果：留下 | 合并到 X | 抽到拥有者类 | 新文件（新 UCLASS/Tool/Shader）| 删除死路径
+待讨论：是 / 否
 ```
 
-| Layer | Role | UV |
-|-------|------|-----|
-| **Arm strip** | Short last-module depth (leave hub vacancy). **T only** (1 through+1 stub): through `ConnectSide` Left|Right half. **Cross** (2 through arms): full CS — never treat as T | `MakeAsphaltUVAtDistance` |
-| **Curb** | Outer aesthetic arc + **constant-width** inward offset (`BuildConstantWidthCurbInner`, depth=mouth edge link). Cross/N shallow sag (no hub tangle). Skip through-hub **and** same-spline | World XY | |
-| **Blank fill** | Full mouth OuterCS (real cut width) + curb/open for **T and Cross/N**. Open/same-spline = OUTER chord. Ear-clip → poly tri. World UV | |
-| **Overlap** | Strips must not dive through hub; fill sits in gap only | No permanent double faces |
+- One slice = a few marks, then stop for the user.
+- After agreement, implement only the agreed items.
+- Prefer small diffs. Do not “clean the whole plugin” in one pass.
 
-### One-click and 4→5 / 5→6
+**Dead / unused during code review (hotkeys, preview, `#if 0`, commented spawn, leftover MetaRoad accessors):**
 
-- **Whole-node recook**, not local patches: re-detect arms → `FinalizeJunctionArmCuts` → polar sort → rebuild strips + N fillets + center.
-- **T→Cross / 4→5 / 5→6**: same full recook; `ClearJunctionCoverMesh` first; `ClearLinks` refreshes unlinked road meshes (purge old trim gaps). Never keep Cross as diamond-only cover.
+- Mark `[审核]` with 栏目：**死路径**.
+- Tell the user what it is and **ask 是否移除**. Do not delete until they say yes.
+- Do not attach new features to a marked dead path.
+- Park the list. Do not turn a feature session into a cleanup sprint.
 
-### Forbidden junction covers
+**Refactor leftover accessors (Lane / Section / Layout):**
 
-- Hub-fan as *primary* asphalt cover, or through-bridge (same-spline / polar long chords)
-- Ear-clip of OuterCS / silhouette alone **without** lane strips (hub-gap ear-clip of InnerCS welds is OK with strips; blank-fill may fan-fallback with world UV)
-- Polar-sorting **individual** cut points so Side edge point order is destroyed
-- Chaining `CornerInfo` with fragile `Dist<=50` without explicit Side→Arc→Side index order
-- Skipping vertex-order audit when publishing junction DynamicMesh
+- Live API is **index + SOffset** (`GetStartSectionIndex`, `GetStartOffset`, `FindSideSection`, `GetLaneByIndex`).
+- After a refactor, delete unused wrappers in the same agreed pass: `GetStartSection` / `GetEndSection` / `GetLeftRightSections` style object-ref getters with **zero callers**.
+- Never return a function-local `static Fallback` object by reference.
+- Symmetric APIs (`Pin`/`Unpin`, generic `EvalAttributeAt`) — mark first; do not delete as “waste” without asking.
+- Full text: `Docs/Agent-Conventions.md` §3.0.
 
-### Strict vertex-order audit (mandatory every junction mesh)
+## Where code lives (by story, not by line count)
 
-**一定要严格审核顶点顺序封面。** Call `ValidateJunctionMeshPointIndices` (or equivalent) on **every** junction mesh publish. If audit fails → **abort** (do not write DynamicMesh).
+**Do not use a line-count threshold** (e.g. 1500). A feature may be 80 lines or 3000; the test is **one file, one story**.
 
-Audit must verify:
+| Story | Declaration | Implementation |
+|-------|-------------|----------------|
+| Lane layout, sampling, road mesh | `MetaLandRoadSplineComponent.h` | matching `.cpp` |
+| Junction cook / cover / audit | `MoKuEditIntersectionActor.h` | matching `.cpp` |
+| Landscape stamp / RDG | `EditSplineRoadInfo.h` (`AWorldSceneManagement` schedules) | stamp/RDG in that `.cpp` or a dedicated stamp `.cpp` **after discussion** |
+| Draw-road input | `MetaLandRoadEditor/Private/Tools/MetaLandRoadInteractiveTool.h` | `*Tool.cpp` lifecycle + `*ToolClick.cpp` (Fig1 `OnClickPress`) + `*ToolDraw.cpp` — **no mesh cook, no Recook** |
+| Viewport overlay | `MetaLandRoadEditor/Private/ComponentVisualizers/*` | Visualizer `.cpp` — **no Recook** |
+| Types / layout data | `MetaLandRoadTypes.h` | `MetaLandRoadTypes.cpp` |
 
-1. **Side cross-section order**: left-outer → lane edges → center → right-outer when **facing toward junction** (`TowardJunction = InnerMid−OuterMid`, then L→R vs `Cross(Toward,Up)`). Do **not** use raw spline-forward (through-arm reverses). Contiguous local indices `0..N-1`; Outer/Inner must share the same L→R.
-2. **Ring order**: `Side₀ → Arc₀ → Side₁ → Arc₁ → …` (polar-sorted arms, CCW). Strip CS stays L→R; ring may use a **reversed copy** of Side for CCW walk — never reverse strip CS for ring alone.
-3. **Seam weld**: `CornerInfo[i].Last` ↔ `CornerInfo[i+1].First` (and last→first) within tight tolerance; log point indices on break
-4. **Corner arc direction (mandatory)**: relative to **intersection/anchor point**, use 2D cross  
-   `Cross(Chord, Mid→Intersect)` to know which side of the chord the hub is on. **Silhouette corner fillets bulge INWARD (向内)** — same side as Intersect/Hub (`CrossInt * CrossArc > 0`, arc mid closer to hub than chord mid). Do **not** build outer 鼓包 (opposite side). Verify with `Dot(BulgeDir, Mid→Intersect) > 0`.
-5. **Winding**: closed `EdgePath` signed area CCW (or documented CW with consistent ear clip)
-6. **Finite coords**, no unintended consecutive duplicates
-7. **Triangle indices** in range after triangulation; normals up (+Z) after flip pass
+**Small change:** add to the owning class (`.h` decl, `.cpp` body).
 
-Log format should include `CornerInfo[i].Side|Corner local=j` and `EdgePath[k]` so point numbers are reviewable in Output Log (`point-index audit`).
+**New file is allowed without asking** when it is a new `UCLASS` / `UInteractiveTool` / Global Shader + `.usf`.
 
-### Data ownership
+**Extract from an existing file:** only after a `[审核]` mark and user OK. Split by **story** (e.g. Landscape overlay vs native key edit), not by size.
 
-- Authoritative: `UMetaLandRoadJunctionComponent` / `FMetaLandRoadJunctionNode` + arm cuts
-- Framework sync: cut cross-section → `CornerInfo` (Side) + road `JunctionConnections`
-- Road trim: `JunctionTrimZones` / mesh spans — refresh roads **before** final junction cover when cuts change
-- Bidirectional: road width/layout change → `RecookJunctionActor`; junction recook → refresh linked roads (guard recursion)
+**Third copy of the same helper:** merge into the owning class `static` / file-local `static`. A `*Utils` file only if several stories share it **and** the user agreed.
 
-## C++ Style (mandatory — strictly enforce)
+**Forbidden:** new `*Generation` / `*Helper` / `*Utils` for a function used once.
 
-**函数声明写在 `.h`，函数实现写在 `.cpp`。不要把函数体写在头文件里。**
+## C++ style
 
-另外，实现函数不套命名空间。
+**Declarations in `.h`, implementations in `.cpp`.** No new function bodies in headers (except unavoidable one-line `FORCEINLINE` getters).
 
-### Declarations in `.h`, implementations in `.cpp`
+`.cpp` may use:
 
-- **`.h`**: class/struct declarations, member function **declarations only**, enums, UPROPERTY/UFUNCTION, small trivial one-liners only when unavoidable (e.g. `FORCEINLINE` getters).
-- **`.cpp`**: **all function bodies** — member functions, free functions, static helpers tied to that module.
-- **Do not** add new member function implementations inside the class body in `.h`.
-- **Do not** add new `inline` / `static inline` helper function bodies in `.h` for MetaLandRoad code.
-- `.cpp` is also used for Unreal/engine glue that must live in one translation unit:
-  - `GENERATED_BODY()` / module `IMPLEMENT_*` / `IMPLEMENT_HIT_PROXY`
-  - `.generated.h` includes
-  - Explicit template instantiations if unavoidable
+- class `private` / `static` members (decl in `.h`)
+- file-local `static` functions
+- **anonymous namespace** for file-local helpers (UE-normal)
 
-### No namespace wrappers on implementations
+Do **not**:
 
-- **Do not** wrap function implementations in `namespace { ... }`, anonymous namespaces, or named namespaces.
-- **Do not** add new `*Private` / `*Utils` namespace blocks for helpers.
-- Prefer instead:
-  - `private` / `protected` **member functions** on the owning class (declared in `.h`, defined in `.cpp`)
-  - `static` member functions on the owning class (declared in `.h`, defined in `.cpp`)
-  - File-local `static` free functions at `.cpp` scope (no namespace wrapper)
+- wrap implementations in `namespace XxxPrivate` as a second module
+- put algorithms in headers
+- put Editor-only APIs in runtime-facing Public headers when adding new code
 
-### Examples
+**Runtime / Editor 打包（对照 MetaRoad）：** [Docs/MetaLandRoad-Runtime-Editor.md](../../../Docs/MetaLandRoad-Runtime-Editor.md)
 
-```cpp
-// ✅ Header — declaration only
-class UMetaLandRoadSplineComponent : public USplineComponent
-{
-public:
-	int32 EditorAddLeftSection(float SplineKey);
+| 模块 | Type | 进谁 |
+|------|------|------|
+| `MetaLandRoad` | Runtime | 游戏 cook |
+| `MetaLandRoadEditor` | Editor | 仅 Editor |
 
-private:
-	static bool IsValidSplitDistance(double S, double Length);
-};
-```
+双模块已落地。新代码按表放：Runtime = 数据/网格/stamp；Editor = Tool/Mode/Visualizer/Gizmo/Slate。Runtime Public 禁止 `#include` UnrealEd / LevelEditor / Interactive Tools。Runtime 调 Editor 用 `FMetaLandRoadEditorHooks`。
 
-```cpp
-// ✅ Source — implementation
-int32 UMetaLandRoadSplineComponent::EditorAddLeftSection(float SplineKey)
-{
-	return SplitSection(SplineKey, EMetaLandRoadLaneSectionSide::Left);
-}
-```
+## Interactive Tool / RDG / materials
 
-```cpp
-// ❌ Implementation in header / ❌ namespace XxxPrivate { ... }
-```
+- **Tool / Mode (all editor modes):** follow [UE-InteractiveTool-Standard.md](../../../Docs/UE-InteractiveTool-Standard.md). `OnClickPress` dispatches only; one session per function/file.
+- **Tool:** `UInteractiveTool` + PropertySet + input. Writes actors/components. Does not triangulate junctions or stamp landscape.
+- **RDG:** Game Thread samples; `ENQUEUE_RENDER_COMMAND` + `FRDGBuilder` + Global Shader / `.usf`. Actor only says *who* and *when* to stamp.
+- **Materials:** one place creates MIDs and sets parameters; keep a name list, do not scatter `SetScalarParameterValue`.
 
-### When editing existing code
+## Junction cook (mandatory)
 
-- **New functions**: declare in `.h`, define in matching `.cpp` — **always**.
-- **Legacy header-only bodies**: do not move unrelated code; when you touch a function, migrate its body into the matching `.cpp` if it is still in `.h`.
-- **Never** revert to header-only style unless the user explicitly asks.
+**正文只认一份：** [Docs/MetaLandRoad-Junction-Spec.md](../../../Docs/MetaLandRoad-Junction-Spec.md)。改 cook 前读完。和 spec 冲突 → `[审核]` 停手。
 
-## MetaRoad mesh entry points (reference only)
+硬规则：先定 T / Cross / N 只改一种；验完 Recook T 对侧 + Cross/图二 + 一条 5 路。同路相邻 = 外弦禁止朝 Hub 圆角。T 孔 = 整嘴 OuterCS + 外沿。Cross/N 孔 = `CS[1]..CS[N-2]` + 内轨。禁止混用。真角失败仍铺直弦。审核失败 abort（现状 soft publish 先 `[审核]`）。
 
-**Viewport preview:** `LaneProxy.cpp` → `MakeLaneProxysFromSpline` → `MakeLaneProxy` → `BuildRoadMesh` → `GetDynamicMeshElements`
+## Mesh entry points
 
-**Editor bake:** `MetaRoadEditor` → `TriangulateRoadTool` + `RoadMeshTools/*`
+**MetaRoad (reference):** `LaneProxy` viewport preview; `TriangulateRoadTool` + `RoadMeshTools` bake.
 
-## MetaLandRoad mesh entry points (project)
+**MetaLandRoad:** `RefreshDynamicRoadMesh` → `GenerateCombinedLaneDynamicMesh`. Junction: `RecookJunctionActor` / `RefreshJunctionCoverMesh` → Fig1 → `ValidateJunctionMeshPointIndices`.
 
-**Primary:** `RefreshDynamicRoadMesh` → `GenerateRoadFromLaneLayoutAsDynamicMesh` → `UMetaLandRoadSplineComponent::GenerateCombinedLaneDynamicMesh`
-
-**Fallback:** `GenerateRoadFromSplineAsDynamicMesh` (fixed-width ribbon)
-
-**Junction (Fig1):** `RecookJunctionActor` / `RefreshJunctionCoverMesh` → arm strips + corner fillets + center fill → `ValidateJunctionMeshPointIndices` → DynamicMesh
-
-## Default: no new source files
-
-1. Find the owning class (Component, Actor, Tool, Types).
-2. Add declaration to the existing `.h`, implementation to the existing `.cpp`.
-3. Keep the diff small; ship one vertical slice at a time.
-
-## Where to put code
-
-| Concern | Declaration (`.h`) | Implementation (`.cpp`) |
-|---------|-------------------|-------------------------|
-| Lane layout, sampling, mesh generation | `MetaLandRoadSplineComponent.h` | `MetaLandRoadSplineComponent.cpp` |
-| Lane debug draw | `MetaLandRoadLaneVisualization.h` | `MetaLandRoadLaneVisualization.cpp` |
-| Edit-mode road actor | `MoKuEditSplineActor.h` | `MoKuEditSplineActor.cpp` |
-| Junction actor / cover / vertex audit | `MoKuEditIntersectionActor.h` | `MoKuEditIntersectionActor.cpp` |
-| Interactive tool | `Tools/MetaLandRoadInteractiveTool.h` | `Tools/MetaLandRoadInteractiveTool.cpp` |
-| Component visualizer | `ComponentVisualizers/*.h` | `ComponentVisualizers/*.cpp` |
-| Data types / Layout | `MetaLandRoadTypes.h` | `MetaLandRoadTypes.cpp` (if needed) |
-
-## Before creating a new `.h`/`.cpp`
-
-**Stop and ask the user** unless they already approved a new module.
-
-## Anti-pattern (do not repeat)
-
-- Putting function bodies in `.h`
-- Splitting logic into new `*Generation.*` / `*Utils.*` files for one-off helpers
-- Wrapping helpers in `namespace XxxPrivate { ... }`
-- Figure-3 fan / single-ring ear-clip as primary junction cover
-- Publishing junction mesh without point-index / vertex-order audit
-
-`GenerateCombinedLaneDynamicMesh` belongs on `UMetaLandRoadSplineComponent` — declare in `.h`, implement in `.cpp`.
+`GenerateCombinedLaneDynamicMesh` stays on `UMetaLandRoadSplineComponent`.

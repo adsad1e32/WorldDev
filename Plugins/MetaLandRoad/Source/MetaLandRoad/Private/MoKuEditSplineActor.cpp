@@ -1,33 +1,25 @@
 #include "MoKuEditSplineActor.h"
+#include "MetaLandRoadTypes.h"
 #include "Kismet/KismetMathLibrary.h"
-#include "UnrealEdGlobals.h"
-#include "EditorModeManager.h"
-#include "MetaLandRoadEditorMode.h"
-#include "Tools/MetaLandRoadInteractiveTool.h"
-#include "SocketMarkbleGizmo.h"
 #include "UObject/UnrealTypePrivate.h"
-#include "MoKuEditorUtils.h"
-#include "LevelEditor.h"
-#include "Tools/EdModeInteractiveToolsContext.h"
 #include "MoKuEditSplinesComponent.h"
 #include "MetaLandRoadProfile.h"
 #include "MetaLandRoadSplineComponent.h"
+#include "MetaLandRoadPropInstances.h"
 #include "MetaLandRoadModule.h"
-#include "ComponentVisualizers/MetaLandRoadSectionComponentVisualizer.h"
-#include "MetaLandRoadModule.h"
-#include "ComponentVisualizers/MetaLandRoadSectionComponentVisualizer.h"
+#include "MoKuEditorUtils.h"
 #include "DynamicMesh/DynamicMesh3.h"
 #include "DynamicMesh/MeshNormals.h"
 #include "EditSplineRoadInfo.h"
 #include "WorldEditorSettings.h"
 #include "MoKuEditIntersectionActor.h"
-#include "Editor.h"
 #include "EngineUtils.h"
-#include "ScopedTransaction.h"
 #include "Misc/ScopeExit.h"
-#include "Components/SceneCaptureComponent2D.h"
+#if WITH_EDITOR
+#include "Editor.h"
+#include "ScopedTransaction.h"
+#endif
 #include "Components/SceneComponent.h"
-#include "Kismet/KismetRenderingLibrary.h"
 
 
 using namespace UE::Geometry;
@@ -47,10 +39,15 @@ AMoKuEditSplineActor::AMoKuEditSplineActor(const FObjectInitializer& ObjectIniti
 
 	SplineComponent = CreateDefaultSubobject<UMoKuEditSplinesComponent>(TEXT("MoKuEditSplinesComponent"));
 	DynamicMeshComponent = CreateDefaultSubobject<UDynamicMeshComponent>(TEXT("MeshObjectResult"));
+	PropInstanceHost = CreateDefaultSubobject<UMetaLandRoadPropInstanceComponent>(TEXT("PropInstanceHost"));
 
 	if (SceneRoot && SplineComponent)
 	{
 		SplineComponent->SetupAttachment(SceneRoot);
+		if (PropInstanceHost)
+		{
+			PropInstanceHost->SetupAttachment(SceneRoot);
+		}
 
 		// Curve (not Linear) — Linear creates hard V corners without mid-angle subdivision.
 		SplineComponent->SetSplinePointType(0, ESplinePointType::Curve);
@@ -78,82 +75,18 @@ AMoKuEditSplineActor::AMoKuEditSplineActor(const FObjectInitializer& ObjectIniti
 }
 
 
-//操作方式待优化
-TArray<FVector> AMoKuEditSplineActor::UpdateInterpolateType(int32 PointIndex,int32 SegmentNum,float Radius)
+TArray<FVector> AMoKuEditSplineActor::UpdateInterpolateType(int32 PointIndex, int32 SegmentNum, float Radius)
 {
-	// Legacy: angle-based corner subdivision (arc insert at sharp bends).
-	// Disabled — road mesh uses MetaRoad BuildLinearApproximation instead.
 	(void)PointIndex;
 	(void)SegmentNum;
 	(void)Radius;
-	return TArray<FVector>();
-
-#if 0
-	TArray<FVector> OutInterpolatePoints;
-	if (SplineComponent)
+	if (!SplineComponent || SplineComponent->GetNumberOfSplinePoints() < 3)
 	{
-		if (SplineComponent->GetNumberOfSplineSegments() > 1)
-		{
-			//for (int i = PointIndex; i < SplineComponent->GetNumberOfSplinePoints(); i++)
-			{
-
-				int32 PrevPoint = PointIndex - 1;
-				FVector PrevLocation = SplineComponent->GetLocationAtSplinePoint(PrevPoint, ESplineCoordinateSpace::World);
-				//if (i == 1)
-				//{
-				//	OutInterpolatePoints.Add(PrevLocation);
-				//}
-
-				int32 NextPoint = PointIndex + 1;
-				FVector NextLocation = SplineComponent->GetLocationAtSplinePoint(NextPoint, ESplineCoordinateSpace::World);
-
-				FVector Location = SplineComponent->GetLocationAtSplinePoint(PointIndex, ESplineCoordinateSpace::World);
-
-				FVector InDir = (Location - PrevLocation).GetSafeNormal();
-				FVector OutDir = (NextLocation - Location).GetSafeNormal();
-
-				float Angle = FMath::RadiansToDegrees(FMath::Acos(FVector::DotProduct(InDir, OutDir)));
-
-				if (Angle > 160.0 || Angle < 30.0f)
-				{
-					//OutInterpolatePoints.Add(Location);
-					//OutInterpolatePoints;
-					//continue;
-					return OutInterpolatePoints;
-				}
-
-				FVector PointStartLocation = Location - InDir * Radius;
-				FVector PointEndLocation = Location + OutDir * Radius;
-				SplineComponent->RemoveSplinePoint(PointIndex);
-				int32 Step = 0;
-				for (int32 j= 0; j <= SegmentNum; j++)
-				{
-					Step++;
-					float TValue = (float)j / (float)SegmentNum;
-					float Invt = 1.0f - TValue;
-					FVector InsertPoint = (Invt * Invt) * PointStartLocation + (2 * Invt * TValue) * Location + (TValue * TValue) * PointEndLocation;
-					SplineComponent->AddSplinePointAtIndex(InsertPoint, Step + PrevPoint, ESplineCoordinateSpace::World);
-					SplineComponent->SetSplinePointType(Step + PrevPoint, ESplinePointType::Linear);
-					//SplineComponent->SetTangentAtSplinePoint(InsertPoint, Step + PrevPoint, ESplineCoordinateSpace::World);
-					//OutInterpolatePoints.Add(InsertPoint);
-				}
-				SplineComponent->UpdateSpline();
-				RefreshDynamicRoadMesh();
-			}
-		}
-		//else
-		//{
-		//	for (int32 i = 0; i < SplineComponent->GetNumberOfSplinePoints(); i++)
-		//	{
-		//		OutInterpolatePoints.Add(SplineComponent->GetLocationAtSplinePoint(i,ESplineCoordinateSpace::Local));
-		//	}
-
-		//}
+		return TArray<FVector>();
 	}
 
-	return OutInterpolatePoints;
-
-#endif
+	SplineComponent->UpdateSplineKeepTangents(/*bUpdateSectionBounds*/ false);
+	return TArray<FVector>();
 }
 
 TSharedRef<FLegacyEdModeWidgetHelper> AMoKuEditSplineActor::CreateWidgetHelper()
@@ -262,21 +195,12 @@ void AMoKuEditSplineActor::SetSplineComponent(UMoKuEditSplinesComponent* InSplin
 	//SplineComponent->DistributeSegmentToSpline();
 	AddCapAssetToSpline();
 	GetGizmoInfo();
-	if (FLevelEditorModule* LevelEditorModule = FModuleManager::GetModulePtr<FLevelEditorModule>(TEXT("LevelEditor")))
+#if WITH_EDITOR
+	if (FMetaLandRoadEditorHooks::NotifySplineComponentSet)
 	{
-		TSharedPtr<ILevelEditor> LevelEditorPtr = LevelEditorModule->GetLevelEditorInstance().Pin();
-
-		if (LevelEditorPtr.IsValid())
-		{
-			UMetaLandRoadEditorMode* EditMode = Cast<UMetaLandRoadEditorMode>(LevelEditorPtr->GetEditorModeManager().GetActiveScriptableMode("EM_MetaLandRoadEditorMode"));
-			UMetaLandRoadInteractiveTool* CurTool = Cast<UMetaLandRoadInteractiveTool>(EditMode->GetToolManager()->GetActiveTool(EToolSide::Left));
-			TMap<TObjectPtr<AMoKuEditBaseActor>, TArray<FSocketGizmoTransformInfo>> GizmoInfo;
-			EditMode->CreateActiveGizmos(this);
-			GizmoInfo.Add(this, GizmoTransformInfos);
-			TMap<TObjectPtr<AMoKuEditBaseActor>, TArray<FSocketGizmoTransformInfo>> GizmoInfos = CurTool->GetGizmoInfo();
-			CurTool->UpdateGizmoInfo(GizmoInfo);
-		}
+		FMetaLandRoadEditorHooks::NotifySplineComponentSet(this);
 	}
+#endif
 }
 void AMoKuEditSplineActor::EnsureRoadComponentHierarchy()
 {
@@ -918,6 +842,16 @@ void AMoKuEditSplineActor::GetJunctionMeshGenerationSpans(TArray<TPair<double, d
 		return;
 	}
 
+	const double MinKeep = MetaLandRoad::MinKeepRoadSpanCm;
+
+	auto EmitSpan = [&OutSpans, MinKeep](double S0, double S1)
+	{
+		if (S1 - S0 >= MinKeep)
+		{
+			OutSpans.Emplace(S0, S1);
+		}
+	};
+
 	if (JunctionTrimZones.Num() > 0)
 	{
 		TArray<TPair<double, double>> Gaps;
@@ -926,6 +860,10 @@ void AMoKuEditSplineActor::GetJunctionMeshGenerationSpans(TArray<TPair<double, d
 		{
 			const double Approach = Zone.ApproachCutS;
 			const double Depart = Zone.DepartCutS;
+			if (!Zone.Junction.IsValid())
+			{
+				continue;
+			}
 			// Always full S-gap for through/stub cuts. T half-CS is cover-only
 			// (ConnectSide); do not skip gaps or roads stay continuous under cover.
 			if (Approach >= 0.0 && Depart >= 0.0 && Approach < Depart)
@@ -952,7 +890,8 @@ void AMoKuEditSplineActor::GetJunctionMeshGenerationSpans(TArray<TPair<double, d
 		TArray<TPair<double, double>> MergedGaps;
 		for (const TPair<double, double>& Gap : Gaps)
 		{
-			if (MergedGaps.Num() == 0 || Gap.Key > MergedGaps.Last().Value + KINDA_SMALL_NUMBER)
+			// Absorb leftover between two cuts into the hub (tiny orange islands).
+			if (MergedGaps.Num() == 0 || Gap.Key > MergedGaps.Last().Value + MetaLandRoad::MinKeepRoadSpanCm)
 			{
 				MergedGaps.Add(Gap);
 			}
@@ -968,13 +907,13 @@ void AMoKuEditSplineActor::GetJunctionMeshGenerationSpans(TArray<TPair<double, d
 		{
 			if (Gap.Key > Cursor + KINDA_SMALL_NUMBER)
 			{
-				OutSpans.Emplace(Cursor, Gap.Key);
+				EmitSpan(Cursor, Gap.Key);
 			}
 			Cursor = FMath::Max(Cursor, Gap.Value);
 		}
 		if (Cursor < Length - KINDA_SMALL_NUMBER)
 		{
-			OutSpans.Emplace(Cursor, Length);
+			EmitSpan(Cursor, Length);
 		}
 		return;
 	}
@@ -987,8 +926,8 @@ void AMoKuEditSplineActor::GetJunctionMeshGenerationSpans(TArray<TPair<double, d
 
 	if (bSameJunctionGap)
 	{
-		OutSpans.Emplace(0.0, FMath::Clamp(EndJunctionMeshTrimS, 0.0, Length));
-		OutSpans.Emplace(FMath::Clamp(StartJunctionMeshTrimS, 0.0, Length), Length);
+		EmitSpan(0.0, FMath::Clamp(EndJunctionMeshTrimS, 0.0, Length));
+		EmitSpan(FMath::Clamp(StartJunctionMeshTrimS, 0.0, Length), Length);
 	}
 	else
 	{
@@ -1002,27 +941,98 @@ void AMoKuEditSplineActor::GetJunctionMeshGenerationSpans(TArray<TPair<double, d
 		{
 			SMax = FMath::Clamp(EndJunctionMeshTrimS, SMin, Length);
 		}
-		if ((SMax - SMin) > KINDA_SMALL_NUMBER)
-		{
-			OutSpans.Emplace(SMin, SMax);
-		}
+		EmitSpan(SMin, SMax);
 	}
 }
 
-void AMoKuEditSplineActor::GetJunctionMeshGenerationRange(double& OutSMin, double& OutSMax) const
+bool AMoKuEditSplineActor::ContainsJunctionMeshStation(double WorldS, double TolCm) const
 {
-	OutSMin = 0.0;
-	OutSMax = SplineComponent ? SplineComponent->GetSplineLength() : 0.0;
+	TArray<TPair<double, double>> Spans;
+	GetJunctionMeshGenerationSpans(Spans);
+	if (Spans.Num() == 0)
+	{
+		return true;
+	}
+
+	const double Tol = FMath::Max(TolCm, 1.0);
+	for (const TPair<double, double>& Span : Spans)
+	{
+		if (WorldS + Tol >= Span.Key && WorldS - Tol <= Span.Value)
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
+double AMoKuEditSplineActor::ClampToNearestJunctionMeshSpan(double WorldS) const
+{
+	TArray<TPair<double, double>> Spans;
+	GetJunctionMeshGenerationSpans(Spans);
+	if (Spans.Num() == 0)
+	{
+		return WorldS;
+	}
+
+	double BestS = WorldS;
+	double BestDist = TNumericLimits<double>::Max();
+	for (const TPair<double, double>& Span : Spans)
+	{
+		if (WorldS + 1.0 >= Span.Key && WorldS - 1.0 <= Span.Value)
+		{
+			return FMath::Clamp(WorldS, Span.Key, Span.Value);
+		}
+		const double Clamped = FMath::Clamp(WorldS, Span.Key, Span.Value);
+		const double Dist = FMath::Abs(Clamped - WorldS);
+		if (Dist < BestDist)
+		{
+			BestDist = Dist;
+			BestS = Clamped;
+		}
+	}
+	return BestS;
+}
+
+bool AMoKuEditSplineActor::ClipRangeToJunctionMeshSpans(
+	double InS0,
+	double InS1,
+	double& OutS0,
+	double& OutS1) const
+{
+	OutS0 = InS0;
+	OutS1 = InS1;
+	if (InS1 <= InS0 + KINDA_SMALL_NUMBER)
+	{
+		return false;
+	}
 
 	TArray<TPair<double, double>> Spans;
 	GetJunctionMeshGenerationSpans(Spans);
 	if (Spans.Num() == 0)
 	{
-		return;
+		return true;
 	}
 
-	OutSMin = Spans[0].Key;
-	OutSMax = Spans.Last().Value;
+	double BestLen = -1.0;
+	bool bFound = false;
+	for (const TPair<double, double>& Span : Spans)
+	{
+		const double Clip0 = FMath::Max(InS0, Span.Key);
+		const double Clip1 = FMath::Min(InS1, Span.Value);
+		if (Clip1 <= Clip0 + KINDA_SMALL_NUMBER)
+		{
+			continue;
+		}
+		const double Len = Clip1 - Clip0;
+		if (Len > BestLen)
+		{
+			BestLen = Len;
+			OutS0 = Clip0;
+			OutS1 = Clip1;
+			bFound = true;
+		}
+	}
+	return bFound;
 }
 
 void AMoKuEditSplineActor::PostActorCreated()
@@ -1050,9 +1060,12 @@ void AMoKuEditSplineActor::RefreshDynamicRoadMesh()
 	const bool bCanRecookLinkedJunctions =
 		!AMoKuEditSplineActor::bSuppressJunctionRecookFromRoadRefresh
 		&& JunctionTrimZones.Num() > 0
-		&& GEditor
 		&& GetWorld()
-		&& !UE::GetIsEditorLoadingPackage();
+		&& !UE::GetIsEditorLoadingPackage()
+#if WITH_EDITOR
+		&& !GIsTransacting
+#endif
+		;
 	if (bCanRecookLinkedJunctions)
 	{
 		TSet<AMoKuEditIntersectionActor*> LinkedJunctions;
@@ -1064,25 +1077,15 @@ void AMoKuEditSplineActor::RefreshDynamicRoadMesh()
 			}
 		}
 
-		if (LinkedJunctions.Num() > 0)
+#if WITH_EDITOR
+		if (LinkedJunctions.Num() > 0 && FMetaLandRoadEditorHooks::RecookJunction)
 		{
-			if (UMetaLandRoadEditorMode* RoadMode =
-				MoKuSplineEditorUtils::GetCurrentEditMode<UMetaLandRoadEditorMode>(
-					UMetaLandRoadEditorMode::EM_MetaLandRoadEditorModeId))
+			for (AMoKuEditIntersectionActor* Junction : LinkedJunctions)
 			{
-				for (AMoKuEditIntersectionActor* Junction : LinkedJunctions)
-				{
-					RoadMode->RecookJunctionActor(Junction, true);
-				}
-			}
-			else
-			{
-				for (AMoKuEditIntersectionActor* Junction : LinkedJunctions)
-				{
-					UMetaLandRoadEditorMode::RecookJunctionActorStatic(Junction, true);
-				}
+				FMetaLandRoadEditorHooks::RecookJunction(Junction, true);
 			}
 		}
+#endif
 	}
 
 	if (DynamicMeshComponent)
@@ -1133,22 +1136,6 @@ void AMoKuEditSplineActor::RefreshDynamicRoadMesh()
 
 	if (bAffectsLandscape && SplineComponent)
 	{
-		// Do NOT auto-rewrite FalloffWidth from road half-width — that locked Details knobs
-		// and made every road look like one giant fused bowl. Seed only when empty.
-		if (RoadHeightmapSettings.FalloffSettings.FalloffWidth <= KINDA_SMALL_NUMBER)
-		{
-			const double HalfWidthCm = FMath::Max(SplineComponent->GetRoadHalfWidthAtS(0.0), 1.0);
-			RoadHeightmapSettings.FalloffSettings.FalloffWidth =
-				static_cast<float>(FMath::Clamp(HalfWidthCm * 0.75, 400.0, 1500.0));
-		}
-		for (TPair<FName, FRoadBodyWeightmapSettings>& Pair : RoadBodyWeightmapSettings)
-		{
-			if (Pair.Value.FalloffWidth <= KINDA_SMALL_NUMBER)
-			{
-				Pair.Value.FalloffWidth = 400.f;
-			}
-		}
-
 		if (!UE::GetIsEditorLoadingPackage())
 		{
 			NotifyLandscapeBrushChanged(true, false, true);
@@ -1156,6 +1143,7 @@ void AMoKuEditSplineActor::RefreshDynamicRoadMesh()
 	}
 
 	SplineComponent->bIsRefreshingRoadMesh = false;
+	UMetaLandRoadPropInstanceComponent::RefreshForRoad(this);
 }
 
 void AMoKuEditSplineActor::DebugRecookLinkedJunctions()
@@ -1232,7 +1220,12 @@ void AMoKuEditSplineActor::DebugRecookLinkedJunctions()
 		}
 		UE_LOG(LogTemp, Log, TEXT("[DebugRecook] road=%s → junction=%s BEGIN"), *GetName(), *Junction->GetName());
 		// Always full pipeline — do not require MetaLandRoad Editor Mode active.
-		UMetaLandRoadEditorMode::RecookJunctionActorStatic(Junction, true);
+#if WITH_EDITOR
+		if (FMetaLandRoadEditorHooks::RecookJunction)
+		{
+			FMetaLandRoadEditorHooks::RecookJunction(Junction, true);
+		}
+#endif
 		const int32 TriCount = Junction->DynamicMeshComponent && Junction->DynamicMeshComponent->GetDynamicMesh()
 			? Junction->DynamicMeshComponent->GetDynamicMesh()->GetTriangleCount()
 			: 0;
@@ -1261,11 +1254,10 @@ void AMoKuEditSplineActor::DebugRecookLinkedJunctions()
 void AMoKuEditSplineActor::DebugFullWorldJunctionRecook()
 {
 #if WITH_EDITOR
-	if (UMetaLandRoadEditorMode* RoadMode =
-		MoKuSplineEditorUtils::GetCurrentEditMode<UMetaLandRoadEditorMode>(
-			UMetaLandRoadEditorMode::EM_MetaLandRoadEditorModeId))
+	if (FMetaLandRoadEditorHooks::NotifySplineComponentSet)
 	{
-		RoadMode->ProcessInteractiveFinishedRoadDraw(this, true);
+		// Debug path: refresh gizmos / editor session for this road.
+		FMetaLandRoadEditorHooks::NotifySplineComponentSet(this);
 	}
 	else if (GEngine)
 	{
@@ -1323,17 +1315,15 @@ void AMoKuEditSplineActor::PostEditChangeChainProperty(FPropertyChangedChainEven
  {
 	 Super::PostEditChangeChainProperty(PropertyChangedEvent);
 	 if (PropertyChangedEvent.MemberProperty
-		 && PropertyChangedEvent.MemberProperty->GetFName() == GET_MEMBER_NAME_CHECKED(AMoKuEditBaseActor, RoadHeightmapSettings)
+		 && PropertyChangedEvent.MemberProperty->GetFName() == GET_MEMBER_NAME_CHECKED(AMoKuEditBaseActor, RoadWeightFalloffWidth)
 		 && PropertyChangedEvent.ChangeType != EPropertyChangeType::Interactive)
 	 {
-		 PushHeightmapFalloffToLandscapeKeys();
-		 NotifyLandscapeBrushChanged(true, false, true);
+		 NotifyLandscapeBrushChanged(true, true, true);
 	 }
 	 //通过反射获取当前参数信息修改屏幕Gizmo显示
 	 FProperty* PropertyThatChanged = PropertyChangedEvent.MemberProperty;
 	 const FEditPropertyChain& PropertyChain = PropertyChangedEvent.PropertyChain;
 	 FProperty* MemberGroup = PropertyChangedEvent.PropertyChain.GetActiveMemberNode()->GetValue();
-	 UMetaLandRoadEditorMode* CurrentEditMode = MoKuSplineEditorUtils::GetCurrentEditMode<UMetaLandRoadEditorMode>(UMetaLandRoadEditorMode::EM_MetaLandRoadEditorModeId);
 	 if (PropertyThatChanged != nullptr)
 	 {
 
@@ -1363,12 +1353,9 @@ void AMoKuEditSplineActor::PostEditChangeChainProperty(FPropertyChangedChainEven
 
 				AddCapAssetToSpline();
 				OnInitGizmo().ExecuteIfBound(this);
-				if (CurrentEditMode)
+				if (FMetaLandRoadEditorHooks::NotifySplineComponentSet)
 				{
-					UMetaLandRoadInteractiveTool* CurTool = Cast<UMetaLandRoadInteractiveTool>(CurrentEditMode->GetToolManager()->GetActiveTool(EToolSide::Left));
-					TMap<TObjectPtr<AMoKuEditBaseActor>, TArray<FSocketGizmoTransformInfo>> GizmoInfo;
-					CurrentEditMode->CreateActiveGizmos(this);
-					GizmoInfo.Add(this, GizmoTransformInfos);
+					FMetaLandRoadEditorHooks::NotifySplineComponentSet(this);
 				}		 
 			 }
 			 else
@@ -1573,16 +1560,12 @@ void AMoKuEditSplineActor::PushHeightmapFalloffToLandscapeKeys()
 
 	int32 TargetSection = 0;
 	int32 TargetKey = INDEX_NONE;
-	if (const TSharedPtr<FMoKuEditSplinesComponentVisualizer> RoadVis =
-		FMetaLandRoadModule::Get().GetRoadComponentVisualizer())
+#if WITH_EDITOR
+	if (FMetaLandRoadEditorHooks::TryGetSelectedLandscapeKey)
 	{
-		if (RoadVis->HasSelectedLandscapeAttributeKey()
-			&& RoadVis->GetEditedMetaLandRoadSpline() == SplineComponent)
-		{
-			TargetSection = RoadVis->GetSelectedSectionIndex();
-			TargetKey = RoadVis->GetSelectedLandscapeKeyDisplayIndex();
-		}
+		FMetaLandRoadEditorHooks::TryGetSelectedLandscapeKey(SplineComponent, TargetSection, TargetKey);
 	}
+#endif
 
 	bSyncingLandscapeHeightFalloff = true;
 	ON_SCOPE_EXIT { bSyncingLandscapeHeightFalloff = false; };
@@ -1656,14 +1639,9 @@ TArray<FSocketGizmoTransformInfo> AMoKuEditSplineActor::GetGizmoInfo()
 void AMoKuEditSplineActor::PostEditUndo()
 {
 	Super::PostEditUndo();
-
-	if (UMoKuEditSplinesComponent* RoadSpline = GetSplineComponent())
-	{
-		TGuardValue<bool> SuppressJunctionRecook(
-			AMoKuEditSplineActor::bSuppressJunctionRecookFromRoadRefresh, true);
-		MetaLandRoadProfile::RecookLocalJunctionsForSpline(RoadSpline);
-		MetaLandRoadProfile::RefreshConnectedRoadMeshes(RoadSpline);
-	}
+	// Undo already restored CutS / trim / spline. Recook here re-cuts mid-transaction
+	// and stacks leftover hub faces. Rebuild derived mesh after the undo tick.
+	MetaLandRoadProfile::NotifyUndoDerivedMeshDirty(this);
 }
 
 void AMoKuEditSplineActor::RemoveAllExtraMesh()

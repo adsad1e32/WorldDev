@@ -20,12 +20,169 @@ namespace MetaLandRoad
 	constexpr float DefaultAsphaltUvTileCm = 1500.0f;
 
 	/**
-	 * MetaRoad mesh subdivision (UMetaRoadSettings defaults):
-	 * - BuildLinearApproximation: uniform steps in spline **input-key** space from S0 to S1
-	 * - ReparamStepsPerSegment = 20, MinNumStepsPerSection = 20
-	 * - Each lane = quad strip between inner/outer offset curves (EvalLaneROffset + EvalROffset)
-	 * Not used: ConvertSplineToPolyLine arc-length sampling, angle-based corner insert, fixed HalfWidth ribbon.
+	 * Fallback mesh step when layout half-width is unknown.
+	 * Live loft uses MeshRibbonStepCm(HalfW, R) — not this constant.
 	 */
+	constexpr double DefaultMeshSampleCm = 90.0;
+	/** One-way reserved along-length vs half-width. 1.75 left 90° outer corners short. */
+	constexpr double CornerFilletRadiusScale = 2.6;
+	/** Mesh fillet ignores turns below this. Guidance step stays under half of it. */
+	constexpr double CornerFilletSkipAngleRad = 18.0 * PI / 180.0;
+	/** Explode guard only — step count still comes from length / chord-step. */
+	constexpr int32 LeaveArriveSampleSegCap = 256;
+	/** Preview rails only. A-bake writes authoring keys, not this sample cap. */
+	constexpr int32 LeaveArrivePreviewSegCap = 64;
+
+	/**
+	 * Polyline step from live R and half-width.
+	 * Sag ε = 0.08×HalfW (chord stays inside inner keep).
+	 * Sweep ≤ half the fillet-skip so baked Linear keys are not rewritten as body fillets.
+	 */
+	inline double LeaveArriveChordStepCm(double RadiusCm, double HalfWidthCm)
+	{
+		const double HalfW = FMath::Max(HalfWidthCm, 1.0);
+		const double R = FMath::Max(FMath::Max(RadiusCm, HalfW), 1.0);
+		const double StepSweep = R * (CornerFilletSkipAngleRad * 0.5);
+		const double StepSag = FMath::Sqrt(8.0 * (HalfW * 0.08) * R);
+		return FMath::Max(FMath::Min(StepSweep, StepSag), 1.0);
+	}
+
+	/**
+	 * Road-strip ring spacing from width + local centerline radius.
+	 * Straight: ~0.45×HalfW. Curve: chord sag ≤ 0.08×HalfW (same as LeaveArrive).
+	 * Floor 0.15×HalfW so a tight bend cannot explode rings.
+	 */
+	inline double MeshRibbonStepCm(double HalfWidthCm, double RadiusCm)
+	{
+		const double HalfW = FMath::Max(HalfWidthCm, 50.0);
+		const double StraightCm = HalfW * 0.45;
+		if (RadiusCm <= KINDA_SMALL_NUMBER || !FMath::IsFinite(RadiusCm))
+		{
+			return StraightCm;
+		}
+		const double CurveCm = LeaveArriveChordStepCm(RadiusCm, HalfW);
+		return FMath::Clamp(CurveCm, HalfW * 0.15, StraightCm);
+	}
+
+	inline int32 LeaveArriveSampleSegs(double LengthCm, double StepCm)
+	{
+		const int32 Need = FMath::Max(
+			2,
+			FMath::CeilToInt(FMath::Max(LengthCm, 1.0) / FMath::Max(StepCm, 1.0)));
+		return FMath::Min(Need, LeaveArriveSampleSegCap);
+	}
+
+	/** Centerline radius from live half-width and turn angle. Inner keep = HalfW * tan(θ/2) * (1+sinθ). */
+	inline double CornerFilletRadiusCm(double HalfWidthCm, double TurnAngleRad)
+	{
+		const double HalfW = FMath::Max(HalfWidthCm, 1.0);
+		const double Angle = FMath::Clamp(TurnAngleRad, 0.0, PI);
+		const double TanHalf = FMath::Tan(FMath::Clamp(Angle * 0.5, 0.0, 1.15));
+		const double Spread = 1.0 + FMath::Sin(Angle);
+		return HalfW * (1.0 + TanHalf) * Spread;
+	}
+
+	inline double CornerFilletNeedAlongCm(double HalfWidthCm, double TurnAngleRad)
+	{
+		const double TanHalf = FMath::Tan(FMath::Clamp(TurnAngleRad * 0.5, 0.0, 1.15));
+		return CornerFilletRadiusCm(HalfWidthCm, TurnAngleRad) * TanHalf;
+	}
+
+	/** Floor: centerline R = HalfW so inner R ≥ 0. Shorter → rails cross. */
+	inline double CornerFilletNeedAlongMinCm(double HalfWidthCm, double TurnAngleRad)
+	{
+		const double TanHalf = FMath::Max(
+			FMath::Tan(FMath::Clamp(TurnAngleRad * 0.5, 0.0, 1.15)),
+			0.08);
+		return FMath::Max(HalfWidthCm, 1.0) * TanHalf;
+	}
+
+	/**
+	 * Width + angle → along-leg. Target = NeedAlongCm; floor = NeedAlongMinCm.
+	 * Use nearly the whole shorter leg (not 45%). MouthBudget < 0 = ignore.
+	 */
+	inline double CornerFilletNeedAlongFitCm(
+		double HalfWidthCm,
+		double TurnAngleRad,
+		double NeighborMinCm,
+		double MouthBudgetCm = -1.0)
+	{
+		const double NeedStd = CornerFilletNeedAlongCm(HalfWidthCm, TurnAngleRad);
+		const double NeedMin = CornerFilletNeedAlongMinCm(HalfWidthCm, TurnAngleRad);
+		double FitMax = FMath::Max(NeighborMinCm - 8.0, 1.0);
+		if (MouthBudgetCm > 1.0)
+		{
+			FitMax = FMath::Min(FitMax, MouthBudgetCm);
+		}
+		if (FitMax >= NeedMin)
+		{
+			return FMath::Clamp(NeedStd, NeedMin, FitMax);
+		}
+		return FitMax;
+	}
+
+	/** Path turn: leave→arrive, or leave→chord→arrive if the chord bends more. */
+	inline double CornerTurnAngleRad(
+		const FVector& LeaveDir,
+		const FVector& ArriveDir,
+		const FVector& ChordDir)
+	{
+		auto Ang = [](const FVector& A, const FVector& B) -> double
+		{
+			const FVector X = A.GetSafeNormal2D();
+			const FVector Y = B.GetSafeNormal2D();
+			if (X.IsNearlyZero() || Y.IsNearlyZero())
+			{
+				return 0.0;
+			}
+			return FMath::Acos(FMath::Clamp(FVector::DotProduct(X, Y), -1.0, 1.0));
+		};
+		return FMath::Clamp(
+			FMath::Max(Ang(LeaveDir, ArriveDir), Ang(LeaveDir, ChordDir) + Ang(ChordDir, ArriveDir)),
+			0.0,
+			PI);
+	}
+
+	/**
+	 * No-overlap radius, then grow if the chord is shorter than 2×NeedAlong
+	 * (Fig3: diffuse first, fuse to target after the inner stays clear).
+	 */
+	inline double CornerDiffuseRadiusCm(
+		double HalfWidthCm,
+		double TurnAngleRad,
+		double ChordLenCm)
+	{
+		const double HalfW = FMath::Max(HalfWidthCm, 1.0);
+		const double ClearR = CornerFilletRadiusCm(HalfW, TurnAngleRad);
+		const double Need = CornerFilletNeedAlongCm(HalfW, TurnAngleRad);
+		const double Chord = FMath::Max(ChordLenCm, 1.0);
+		if (Chord >= Need * 2.0)
+		{
+			return ClearR;
+		}
+		return ClearR * FMath::Clamp((2.0 * Need) / Chord, 1.0, 3.4);
+	}
+
+	/** Share of the fillet window that stays Hermite before mixing into the circle. */
+	inline double CornerFilletLeadFrac(double TurnAngleRad)
+	{
+		return 0.28 + 0.16 * FMath::Sin(FMath::Clamp(TurnAngleRad, 0.0, PI));
+	}
+
+	/** Cursor must sit on the mouth bar, not a world-radius around it. */
+	inline double MouthAdsorbAcceptCm(double MouthWidthCm)
+	{
+		return FMath::Max(MouthWidthCm, 1.0) * 0.38;
+	}
+	/**
+	 * Shorter leftover spans are hub slivers (through-arm Approach/Depart not fully
+	 * merged) or postage-stamp tips. Owner: GetJunctionMeshGenerationSpans.
+	 */
+	constexpr double MinKeepRoadSpanCm = 90.0;
+	/** Blend loft Right to the mouth bar on the last ring only. 80cm twisted the tip into the hub. */
+	constexpr double MouthRightAlignCm = 16.0;
+	/** S0/S1 counts as CutS for mouth-align. Wide windows treated the whole C-bend as a mouth. */
+	constexpr double CutSAlignWindowCm = 8.0;
 	constexpr int32 DefaultReparamStepsPerSegment = 20;
 	constexpr int32 DefaultMinNumStepsPerSection = 20;
 	/** Alt+T editor overlay — denser than mesh so width keys / curves match face fill and boundary lines. */
@@ -59,12 +216,14 @@ struct FMetaLandRoadLayout;
 struct METALANDROAD_API FMetaLandRoadSplinePositionLinearApproximation
 {
 	FVector Position = FVector::ZeroVector;
+	FVector PathCenter = FVector::ZeroVector;
 	float SplineParam = 0.0f;
 
 	FMetaLandRoadSplinePositionLinearApproximation() = default;
 
 	FMetaLandRoadSplinePositionLinearApproximation(const FVector& InPosition, float InSplineParam)
 		: Position(InPosition)
+		, PathCenter(InPosition)
 		, SplineParam(InSplineParam)
 	{
 	}
@@ -450,11 +609,6 @@ struct METALANDROAD_API FMetaLandRoadLane
 	int GetEndSectionIndex() const { return EndSectionIndex; }
 	int GetLaneIndex() const { return LaneIndex; }
 
-	const struct FMetaLandRoadLaneSection& GetStartSection() const;
-	struct FMetaLandRoadLaneSection& GetStartSection();
-	const struct FMetaLandRoadLaneSection& GetEndSection() const;
-	struct FMetaLandRoadLaneSection& GetEndSection();
-
 	double GetStartOffset() const;
 	double GetEndOffset() const { return SOffsetEnd_Cached; }
 
@@ -528,7 +682,6 @@ struct METALANDROAD_API FMetaLandRoadLaneSection
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = LaneSection)
 	FString Label;
 
-	bool IsSectionValid() const;
 	const FMetaLandRoadLane& GetLaneByIndex(int LaneIndex) const;
 	FMetaLandRoadLane& GetLaneByIndex(int LaneIndex);
 	bool CheckLaneIndex(int LaneIndex) const;
@@ -544,7 +697,6 @@ struct METALANDROAD_API FMetaLandRoadLaneSection
 	double EvalLaneROffset(int LaneIndex, double InSOffset, double Alpha = 1.0) const;
 
 	bool operator<(const FMetaLandRoadLaneSection& Other) const { return SOffset < Other.SOffset; }
-	bool IsSectionEmpty() const { return Left.IsEmpty() && Right.IsEmpty(); }
 
 private:
 	TWeakPtr<FMetaLandRoadLayout*> OwnedRoadLayout;
@@ -589,17 +741,16 @@ struct METALANDROAD_API FMetaLandRoadLayout
 	double EvalROffset(double S) const;
 	int FindSideSection(int SectionIndex, EMetaLandRoadLaneSectionSide Side) const;
 	int FindSectionAtSOffset(double S) const;
-
-	TPair<FMetaLandRoadLaneSection&, FMetaLandRoadLaneSection&> GetLeftRightSections(int SectionIndex);
-	TPair<const FMetaLandRoadLaneSection&, const FMetaLandRoadLaneSection&> GetLeftRightSections(int SectionIndex) const;
-
-	TPair<TArray<FMetaLandRoadLane>&, TArray<FMetaLandRoadLane>&> GetLeftRightLanes(int SectionIndex);
-	TPair<const TArray<FMetaLandRoadLane>&, const TArray<FMetaLandRoadLane>&> GetLeftRightLanes(int SectionIndex) const;
+	/** Host at S, then the Left/Right section that owns LaneIndex (CutS L|R pair). */
+	int FindSectionForLaneAtS(double S, int LaneIndex) const;
 
 	uint64 GetLayoutVersion() const { return LayoutVersion; }
 	uint64 GetAttributesVersion() const { return AttributesVersion; }
 	void UpdateAttributesVersion() { ++AttributesVersion; }
 	void UpdateLayoutVersion() { ++LayoutVersion; }
+
+	/** Span section → lane-data section (side-aware). Layout query — not viewport pick. */
+	int32 ResolveLaneSectionIndex(int32 SpanSectionIndex, int32 LaneIndex) const;
 
 private:
 	TSharedPtr<FMetaLandRoadLayout*> ThisShared;
@@ -672,3 +823,41 @@ public:
 	void DisconnectAll();
 	FTransform EvalTransform() const;
 };
+
+namespace MetaLandRoad
+{
+	METALANDROAD_API int32 ResolveLaneSectionIndexForSpan(
+		const UMetaLandRoadSplineComponent* SplineComp,
+		int32 SpanSectionIndex,
+		int32 LaneIndex);
+	METALANDROAD_API bool IsLaneValidOnSpanSection(
+		const UMetaLandRoadSplineComponent* SplineComp,
+		int32 SpanSectionIndex,
+		int32 LaneIndex);
+	METALANDROAD_API double ClampMouthAnchorSToVisibleMesh(
+		const UMetaLandRoadSplineComponent* SplineComp,
+		double PreferredAnchorS,
+		EMetaLandRoadMouthSide MouthSide);
+	/** Remaining-road span tips (CutS / free ends). EndSnap / overlay / mix. Empty spans → 0 and Length. */
+	METALANDROAD_API void CollectVisibleMouthStations(
+		const UMetaLandRoadSplineComponent* SplineComp,
+		TArray<TPair<double, EMetaLandRoadMouthSide>>& OutStations);
+	/**
+	 * Free-end-only stations (0 / Length if that side still has mesh).
+	 * EndSnap pick uses CollectVisibleMouthStations — free-end-only wrapped to the far mouth.
+	 */
+	METALANDROAD_API void CollectEndSnapMouthStations(
+		const UMetaLandRoadSplineComponent* SplineComp,
+		TArray<TPair<double, EMetaLandRoadMouthSide>>& OutStations);
+	METALANDROAD_API bool ResolveMouthOutwardTangent(
+		const UMetaLandRoadSplineComponent* SplineComp,
+		const FMetaLandRoadDrawAnchor& Anchor,
+		FVector& OutOutwardTangent);
+	METALANDROAD_API bool ComputeAnchorMouthRailFrame(
+		const UMetaLandRoadSplineComponent* SplineComp,
+		const FMetaLandRoadDrawAnchor& Anchor,
+		FVector& OutTipLeft,
+		FVector& OutTipRight,
+		FVector& OutTipCenter,
+		FVector& OutOutwardTangent);
+}

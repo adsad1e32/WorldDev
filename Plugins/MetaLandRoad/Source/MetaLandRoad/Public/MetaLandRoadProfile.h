@@ -6,6 +6,8 @@
 #include "MetaLandRoadProfile.generated.h"
 
 class UMetaLandRoadSplineComponent;
+class AMoKuEditSplineActor;
+class AMoKuEditIntersectionActor;
 
 /** Lightweight lane description used when creating a new road (MetaRoad FRoadLaneProfile equivalent). */
 USTRUCT(BlueprintType)
@@ -48,10 +50,10 @@ namespace MetaLandRoadProfile
 	/** Apply default lanes when the spline has no sections yet. */
 	METALANDROAD_API void EnsureDefaultRoadProfile(UMetaLandRoadSplineComponent* TargetSpline);
 
-	/** One door: Begin/End on every section. bIncludeMouthKeys adds CutS keys (Show / junction recook). */
+	/** One door: Begin/End on every section. bIncludeMouthKeys = cook only: through/T-through CutS mid-keys. */
 	METALANDROAD_API void PrepareLandscapeKeys(UMetaLandRoadSplineComponent* TargetSpline, bool bIncludeMouthKeys = false);
 
-	/** True when WorldS is on remaining road mesh (junction trim / CutS inclusive). */
+	/** Overlay: remaining-road S. Forwards to AMoKuEditSplineActor::ContainsJunctionMeshStation. */
 	METALANDROAD_API bool IsLandscapeOverlayStationVisible(
 		const class AMoKuEditSplineActor* Road,
 		double WorldS,
@@ -72,11 +74,34 @@ namespace MetaLandRoadProfile
 		double WorldS,
 		double TolCm = 80.0);
 
-	/** Visit drawable Landscape keys (WorldS is display S). Return false from Visit to stop. */
+	/**
+	 * Overlay dots along one actor, sorted by World S: Begin, Key1, Key2, … End.
+	 * Junction splits still share this sequence. WorldS is the draw station.
+	 */
 	METALANDROAD_API void ForEachVisibleLandscapeKey(
 		const UMetaLandRoadSplineComponent* Spline,
 		const class AMoKuEditSplineActor* Road,
 		TFunctionRef<bool(int32 SectionIndex, int32 KeyIndex, double WorldS)> Visit);
+
+	/** Find or add a Landscape key on the section that owns WorldS. */
+	METALANDROAD_API bool EnsureLandscapeKeyAtWorldS(
+		UMetaLandRoadSplineComponent* Spline,
+		double WorldS,
+		int32& OutSectionIndex,
+		int32& OutKeyIndex,
+		double DuplicateTolCm = 50.0);
+
+	/** Write a real key at every visible overlay station so mouths are selectable. */
+	METALANDROAD_API void EnsureLandscapeOverlayDisplayKeys(UMetaLandRoadSplineComponent* Spline);
+
+	/** 0-based rank in the actor-wide overlay sequence (Begin=0, End=Count-1). */
+	METALANDROAD_API bool GetLandscapeOverlayKeyOrdinal(
+		const class AMoKuEditSplineActor* Road,
+		const UMetaLandRoadSplineComponent* Spline,
+		int32 SectionIndex,
+		int32 KeyIndex,
+		int32& OutIndex,
+		int32& OutCount);
 
 	/**
 	 * [KEY-ALGO] Auto-write Left + Right faces on every road (1 lane or N lanes).
@@ -128,6 +153,10 @@ namespace MetaLandRoadProfile
 
 	/** Re-cut + rebuild cover for junction hubs linked to this road only (not full-world scan). */
 	METALANDROAD_API void RecookLocalJunctionsForSpline(UMetaLandRoadSplineComponent* TargetSpline);
+
+	/** Undo/redo: queue derived mesh rebuild after the transaction finishes. Never Recook mid-undo. */
+	METALANDROAD_API void NotifyUndoDerivedMeshDirty(AMoKuEditSplineActor* Road);
+	METALANDROAD_API void NotifyUndoDerivedMeshDirty(AMoKuEditIntersectionActor* Junction);
 
 	/** Add one left/right lane on the selected span section only (not the whole road). */
 	struct FMetaLandRoadAddLaneResult

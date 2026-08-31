@@ -91,8 +91,8 @@ struct FOnRoadBodyChangedParams
 };
 
 
-UCLASS(MinimalAPI, Blueprintable, config = Engine, Abstract, HideCategories = (Tags, Activation, Cooking, Replication, Input, Actor, AssetUserData))
-class AMoKuEditBaseActor : public AActor, public IRoadBrushActorInterface
+UCLASS(Blueprintable, config = Engine, Abstract, HideCategories = (Tags, Activation, Cooking, Replication, Input, Actor, AssetUserData))
+class METALANDROAD_API AMoKuEditBaseActor : public AActor, public IRoadBrushActorInterface
 {
 	GENERATED_BODY()
 
@@ -101,6 +101,8 @@ public:
 
 	//~ Begin IRoadBrushActorInterface interface
 	virtual bool AffectsLandscape() const override;
+	virtual bool AffectsWeightmapLayer(FName LayerName) const override;
+	virtual float GetRoadWeightFalloffWidth() const override;
 #if WITH_EDITOR
 	virtual void PostActorCreated() override;
 	virtual void OnPostEditChangeProperty(FOnRoadBodyChangedParams& InOutOnWaterBodyChangedParams);
@@ -151,22 +153,27 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite,Category = "Terrain")
 	bool bAffectsLandscape;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain",meta = (EditCondition = "bAffectsLandscape"))
+	/** Road weightmap soft edge (cm). Profile PS WeightMode==Road only. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain", meta = (EditCondition = "bAffectsLandscape", ClampMin = "1.0", ClampMax = "2500.0", DisplayName = "Road Weight Falloff Width"))
+	float RoadWeightFalloffWidth = 180.0f;
+
+	/** Hidden leftover JF height struct. Height authority is Landscape Key. */
+	UPROPERTY()
 	FSplineRoadHeightmapSettings RoadHeightmapSettings;
 
-
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain",meta = (EditCondition = "bAffectsLandscape"))
+	/** Hidden leftover JF TMap. Migrated to RoadWeightFalloffWidth on load. */
+	UPROPERTY()
 	TMap<FName, FRoadBodyWeightmapSettings> RoadBodyWeightmapSettings;
 
 
 	void OnRoadBodyChanged(const FOnRoadBodyChangedParams& InParams);
 
-	/** Ensures default height/weightmap terrain settings when influence is enabled. @return true if DF-affecting params changed. */
+	/** Migrate old JF TMap, keep RoadWeightFalloffWidth finite. @return true if values changed. */
 	bool EnsureDefaultTerrainInfluenceSettings();
 
 	/**
-	 * Seed Road/Dirty weight layers if missing, then broadcast brush change so WorldEditor
-	 * rebuilds height + weight (roads AND junctions that inherit this base).
+	 * Broadcast brush change so WorldEditor rebuilds height + weight
+	 * (roads AND junctions that inherit this base).
 	 */
 	void NotifyLandscapeBrushChanged(bool bShapeOrPositionChanged = true, bool bWeightmapSettingsChanged = true, bool bUserTriggered = false);
 	void InvalidateLandscapeDistanceFieldCache();

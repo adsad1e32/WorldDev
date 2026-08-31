@@ -77,7 +77,7 @@ Plugins/MetaLandRoad/Source/MetaLandRoad/   ← 约 75 个源文件，Editor + R
 
 | 维度 | MetaRoad | MetaLandRoad |
 |------|----------|--------------|
-| 模块划分 | **MetaRoad + MetaRoadEditor** 分离 | **单模块** MetaLandRoad |
+| 模块划分 | **MetaRoad + MetaRoadEditor** 分离 | **MetaLandRoad + MetaLandRoadEditor** 分离。表见 [MetaLandRoad-Runtime-Editor.md](./MetaLandRoad-Runtime-Editor.md) |
 | Mesh 渲染载体 | `FLaneProxy` + `FRoadSplineSceneProxy`（Component 自带 SceneProxy） | `UDynamicMeshComponent` 挂在 `AMoKuEditSplineActor` |
 | Mesh 烘焙工具 | `UTriangulateRoadTool` + `RoadMeshTools/*` | 无对等工具；画路时直接 `RefreshDynamicRoadMesh` |
 | Lane 可视化 | `FLaneProxy::DrawLane`（SceneProxy PDI） | `LineBatchComponent` + `ComponentVisualizer` |

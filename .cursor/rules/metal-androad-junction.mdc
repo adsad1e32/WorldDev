@@ -1,0 +1,29 @@
+---
+description: MetaLandRoad junction cook — Fig1 T/Cross/N hard rules. Read Docs/MetaLandRoad-Junction-Spec.md before any cover/hole/fillet/audit change.
+globs: Plugins/MetaLandRoad/Source/MetaLandRoad/**/*Intersection*,Plugins/MetaLandRoad/Source/MetaLandRoad/**/*Junction*,Docs/MetaLandRoad-Junction-Spec.md
+alwaysApply: false
+---
+
+# Junction cook — 严格执行
+
+正文：`Docs/MetaLandRoad-Junction-Spec.md`。冲突则 `[审核]` 停手。
+
+## 改之前
+
+- 先定拓扑：T / Cross / N。只改这一种。
+- 验完必须 Recook：**T 对侧、Cross/图二角、一条 5 路。**
+
+## 禁止
+
+- 同路相邻当圆角（T 对侧会被掐进去）。同路 = 外弦。
+- 用修 N 的办法改 T 孔，或反过来。
+- 一次 cook 混用「整嘴外沿」和「内沿」孔。
+- 真角条带失败就关 `bMeshFillet`（图二漏三角）。直弦也要铺。
+- 2 点嘴把对侧外沿当内沿。
+- 为吸附交点改 cook 孔策略。
+- 审核失败仍写网：先 `[审核]`（现状 soft publish 曾保 T）。
+
+## 孔环
+
+- T = 整嘴 OuterCS + 外沿/外弦。
+- Cross / N = `CS[1]..CS[N-2]` + 内轨；外楔子靠不同路条带。

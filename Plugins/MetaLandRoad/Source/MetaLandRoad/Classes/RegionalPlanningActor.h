@@ -1,8 +1,7 @@
-﻿#pragma once
+#pragma once
 
 #include "CoreMinimal.h"
 #include "UObject/Object.h"
-#include "ToolContextInterfaces.h"
 #include "Components/DynamicMeshComponent.h"
 
 

@@ -23,6 +23,8 @@ float LandscapeCmPerQuad;
 float2 RoadBoundsMin;
 float2 RoadBoundsMax;
 uint WeightMode;
+Texture2D T_Weight;
+int2 BlurAxis;
 
 float Hash21(float2 P)
 {
@@ -77,6 +79,11 @@ float4 EvaluateRoadProfile(uint2 Id)
 	float BestT = 0.0;
 	uint BestIndex = 0;
 	bool bHit = false;
+	bool bHasCoverRing = false;
+	int CoverWinding = 0;
+	float CoverDist = 1e9;
+	float CoverT = 0.0;
+	uint CoverIndex = 0;
 
 	for (uint SampleIndex = 0; SampleIndex + 1 < NumSamples; ++SampleIndex)
 	{
@@ -91,6 +98,37 @@ float4 EvaluateRoadProfile(uint2 Id)
 		float2 PointB = SampleB.PosS.xy;
 		float2 Segment = PointB - PointA;
 		float SegmentLengthSq = dot(Segment, Segment);
+
+		// Closed cover ring: signed distance to EdgePath, not a hub-radius ribbon.
+		if (SampleA.Extra.x >= 1.5 && SampleB.Extra.x >= 1.5)
+		{
+			bHasCoverRing = true;
+			if (abs(PointB.y - PointA.y) > 1e-4)
+			{
+				if ((PointA.y <= WorldXY.y && PointB.y > WorldXY.y) || (PointA.y > WorldXY.y && PointB.y <= WorldXY.y))
+				{
+					float WindT = (WorldXY.y - PointA.y) / (PointB.y - PointA.y);
+					if (WorldXY.x < PointA.x + WindT * (PointB.x - PointA.x))
+					{
+						CoverWinding += (PointA.y <= WorldXY.y) ? 1 : -1;
+					}
+				}
+			}
+			if (SegmentLengthSq >= 1.0)
+			{
+				float TRaw = dot(WorldXY - PointA, Segment) / SegmentLengthSq;
+				float T = saturate(TRaw);
+				float Dist = distance(WorldXY, PointA + Segment * T);
+				if (Dist < CoverDist)
+				{
+					CoverDist = Dist;
+					CoverT = T;
+					CoverIndex = SampleIndex;
+				}
+			}
+			continue;
+		}
+
 		if (SegmentLengthSq < 1.0)
 		{
 			continue;
@@ -132,6 +170,8 @@ float4 EvaluateRoadProfile(uint2 Id)
 		float SideFalloff = max(lerp(SampleA.Falloff.y, SampleB.Falloff.y, T), 1.0);
 		float SolidHalf = HalfWidth + SideOffset;
 		float LatOut = abs(Lateral) - SolidHalf;
+		// Box SDF: remaining-road rectangle, then Falloff is a constant-width
+		// rounded offset. Not a stadium (half-width disk) at CutS.
 		float Dist = HybridSolidDistance(LatOut, EndOver, SideFalloff);
 		if (Dist >= BestSigned)
 		{
@@ -141,6 +181,17 @@ float4 EvaluateRoadProfile(uint2 Id)
 		BestSigned = Dist;
 		BestT = T;
 		BestIndex = SampleIndex;
+		bHit = true;
+	}
+
+	if (bHasCoverRing && CoverDist < 1e8)
+	{
+		FRoadProfileSample CoverA = Samples[CoverIndex];
+		FRoadProfileSample CoverB = Samples[CoverIndex + 1];
+		float CoverOffset = max(lerp(CoverA.Falloff.x, CoverB.Falloff.x, CoverT), 0.0);
+		BestSigned = ((CoverWinding != 0) ? -CoverDist : CoverDist) - CoverOffset;
+		BestT = CoverT;
+		BestIndex = CoverIndex;
 		bHit = true;
 	}
 
@@ -160,7 +211,8 @@ float4 EvaluateRoadProfile(uint2 Id)
 	float DistFromSolid = BestSigned;
 	float Taper = saturate(max(DistFromSolid, 0.0) / SideFalloff);
 	float SmoothT = Taper * Taper * Taper * (Taper * (Taper * 6.0 - 15.0) + 10.0);
-	float Alpha = (1.0 - SmoothT) * LayerFactor;
+	// Road bed follows spline/mesh Z. Falloff only blends outside the solid.
+	float Alpha = (DistFromSolid <= 0.0) ? LayerFactor : (1.0 - SmoothT) * LayerFactor;
 	if (WeightMode > 0)
 	{
 		float CombinedW = Combined.r;
@@ -168,8 +220,10 @@ float4 EvaluateRoadProfile(uint2 Id)
 		float Weight = 0.0;
 		if (WeightMode == 1)
 		{
-			float AA = max(LandscapeCmPerQuad * 1.5, 1.0);
-			Weight = saturate(1.0 - DistFromMesh / AA) * LayerFactor;
+			float Fade = max(SideFalloff, max(LandscapeCmPerQuad * 1.5, 1.0));
+			float Taper = saturate(max(DistFromMesh, 0.0) / Fade);
+			float SmoothT = Taper * Taper * Taper * (Taper * (Taper * 6.0 - 15.0) + 10.0);
+			Weight = (1.0 - SmoothT) * LayerFactor;
 		}
 		else
 		{
@@ -208,4 +262,31 @@ float4 EvaluateRoadProfile(uint2 Id)
 void RoadLandscapeProfilePS(float4 SvPosition : SV_POSITION, out float4 OutColor : SV_Target0)
 {
 	OutColor = EvaluateRoadProfile(uint2(SvPosition.xy));
+}
+
+// Temporary weight-only soften (no JumpFlood). Height does not use this.
+float4 EvaluateWeightBlur(uint2 Id)
+{
+	if (any(Id >= (uint2)RTSize))
+	{
+		return 0.0;
+	}
+
+	const int Offsets[5] = { -2, -1, 0, 1, 2 };
+	const float Kernel[5] = { 1.0, 4.0, 6.0, 4.0, 1.0 };
+	float Acc = 0.0;
+	float SumW = 0.0;
+	for (int Tap = 0; Tap < 5; ++Tap)
+	{
+		int2 SampleId = int2(Id) + BlurAxis * Offsets[Tap];
+		SampleId = clamp(SampleId, int2(0, 0), RTSize - 1);
+		Acc += T_Weight.Load(int3(SampleId, 0)).r * Kernel[Tap];
+		SumW += Kernel[Tap];
+	}
+	return float4(Acc / max(SumW, 1.0), 0.0, 0.0, 1.0);
+}
+
+void RoadWeightBlurPS(float4 SvPosition : SV_POSITION, out float4 OutColor : SV_Target0)
+{
+	OutColor = EvaluateWeightBlur(uint2(SvPosition.xy));
 }

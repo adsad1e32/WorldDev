@@ -91,7 +91,7 @@ public:
 
 
 UCLASS(Blueprintable, hidecategories = (Replication, Input, LOD, Actor, Cooking, Rendering))
-class  AMoKuEditIntersectionActor : public AMoKuEditBaseActor
+class METALANDROAD_API AMoKuEditIntersectionActor : public AMoKuEditBaseActor
 {
 	GENERATED_BODY()
 
@@ -125,8 +125,11 @@ class  AMoKuEditIntersectionActor : public AMoKuEditBaseActor
 		/** Recalculate arm cuts from linked road geometry and rebuild fill mesh. */
 		void RecookFromLinkedRoads();
 
-		/** Write NewAnchor into JunctionNode.AnchorWorld (no spline-point edits). */
+		/** Write NewAnchor; stretch each arm's hub tip / through-intersect by ΔXY. */
 		void ApplyAuthoringAnchorDelta(const FVector& OldAnchor, const FVector& NewAnchor);
+
+		/** Recompute each arm IntersectDistanceS from the current hub XY. */
+		void SyncArmIntersectSFromAnchor(const FVector& AnchorWorld);
 
 		/** Rebuild linked road meshes so EvalLanePosition picks up this hub Z. */
 		void RefreshLinkedRoadMeshesForAuthoring();
@@ -155,6 +158,7 @@ class  AMoKuEditIntersectionActor : public AMoKuEditBaseActor
 
 #if WITH_EDITOR
 		virtual void PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent) override;
+		virtual void PostEditUndo() override;
 		virtual void PostEditMove(bool bFinished) override;
 		virtual void EditorApplyTranslation(const FVector& DeltaTranslation, bool bAltDown, bool bShiftDown, bool bCtrlDown) override;
 #endif
@@ -191,6 +195,7 @@ class  AMoKuEditIntersectionActor : public AMoKuEditBaseActor
 		/** Gizmo drag: skip per-tick recook; cover mesh rides the actor. */
 		bool bJunctionAuthoringDrag = false;
 		FVector JunctionDragStartAnchor = FVector::ZeroVector;
+		FVector JunctionDragLastAnchor = FVector::ZeroVector;
 		/** After a Z drag, do not rebuild cover from road samples (that shears the hub). */
 		bool bHoldCoverAfterAuthoringMove = false;
 		//void SPawnGizmoInfo(const FVector& InRefVector);

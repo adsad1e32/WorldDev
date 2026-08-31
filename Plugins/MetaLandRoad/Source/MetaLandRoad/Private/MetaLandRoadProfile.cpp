@@ -1,11 +1,13 @@
 #include "MetaLandRoadProfile.h"
 #include "MetaLandRoadLaneAttribute.h"
-#include "MetaLandRoadEditorMode.h"
 #include "MetaLandRoadSplineComponent.h"
-#include "MetaLandRoadLaneVisualization.h"
+#include "MetaLandRoadModule.h"
 #include "MoKuEditIntersectionActor.h"
 #include "MoKuEditSplineActor.h"
 #include "Misc/ScopeExit.h"
+#if WITH_EDITOR
+#include "Containers/Ticker.h"
+#endif
 
 namespace MetaLandRoadProfile
 {
@@ -13,6 +15,7 @@ namespace MetaLandRoadProfile
 	static constexpr int32 DefaultLongitudinalSectionCount = 2;
 
 	static void RefreshRoadActorMesh(UMetaLandRoadSplineComponent* Spline);
+	void EnsureLandscapeOverlayDisplayKeys(UMetaLandRoadSplineComponent* Spline);
 
 	static FMetaLandRoadLane CreateLane(const FMetaLandRoadLaneProfile& Src)
 	{
@@ -226,13 +229,6 @@ namespace MetaLandRoadProfile
 			return;
 		}
 
-		TArray<TPair<double, double>> Spans;
-		Road->GetJunctionMeshGenerationSpans(Spans);
-		if (Spans.Num() == 0)
-		{
-			return;
-		}
-
 		TArray<FMetaLandRoadLaneSection>& Sections = TargetSpline->GetLaneSectionsMutable();
 		for (int32 SectionIndex = 0; SectionIndex < Sections.Num(); ++SectionIndex)
 		{
@@ -251,32 +247,12 @@ namespace MetaLandRoadProfile
 				}
 
 				const double WorldS = Sections[SectionIndex].SOffset + Track->Keys[KeyIndex].SOffset;
-				bool bInside = false;
-				for (const TPair<double, double>& Span : Spans)
-				{
-					if (WorldS + 1.0 >= Span.Key && WorldS - 1.0 <= Span.Value)
-					{
-						bInside = true;
-						break;
-					}
-				}
-				if (bInside)
+				if (Road->ContainsJunctionMeshStation(WorldS, 1.0))
 				{
 					continue;
 				}
 
-				double BestS = WorldS;
-				double BestDist = TNumericLimits<double>::Max();
-				for (const TPair<double, double>& Span : Spans)
-				{
-					const double Clamped = FMath::Clamp(WorldS, Span.Key, Span.Value);
-					const double Dist = FMath::Abs(Clamped - WorldS);
-					if (Dist < BestDist)
-					{
-						BestDist = Dist;
-						BestS = Clamped;
-					}
-				}
+				const double BestS = Road->ClampToNearestJunctionMeshSpan(WorldS);
 				Track->Keys[KeyIndex].SOffset = BestS - Sections[SectionIndex].SOffset;
 			}
 			Track->SortKeys();
@@ -305,13 +281,6 @@ namespace MetaLandRoadProfile
 			}
 
 			Track->EnsureBeginAndEndKeys(GetSectionLocalLength(TargetSpline, SectionIndex));
-			if (PrevKeyCount == 0)
-			{
-				if (const AMoKuEditSplineActor* Road = Cast<AMoKuEditSplineActor>(TargetSpline->GetOwner()))
-				{
-					Track->ApplyFalloffToAllKeys(Road->RoadHeightmapSettings.FalloffSettings);
-				}
-			}
 			if (Track->Keys.Num() != PrevKeyCount)
 			{
 				bChanged = true;
@@ -324,6 +293,41 @@ namespace MetaLandRoadProfile
 		}
 
 		ClampLandscapeKeysToVisibleSpans(TargetSpline);
+	}
+
+	static void SeedUnsetRoadWeightFalloffOnKeys(UMetaLandRoadSplineComponent* TargetSpline)
+	{
+		AMoKuEditSplineActor* Road = Cast<AMoKuEditSplineActor>(TargetSpline ? TargetSpline->GetOwner() : nullptr);
+		if (!Road)
+		{
+			return;
+		}
+		const float ActorW = Road->GetRoadWeightFalloffWidth();
+		TArray<FMetaLandRoadLaneSection>& Sections = TargetSpline->GetLaneSectionsMutable();
+		for (FMetaLandRoadLaneSection& Section : Sections)
+		{
+			FMetaLandRoadLaneAttribute* Track = Section.FindAttribute(
+				FMetaLandRoadAttributeRegistry::TypeLandscape);
+			if (!Track)
+			{
+				continue;
+			}
+			for (int32 KeyIndex = 0; KeyIndex < Track->Keys.Num(); ++KeyIndex)
+			{
+				FMetaLandRoadLandscapeAttributeValue Value;
+				if (const FMetaLandRoadLandscapeAttributeValue* Existing =
+					Track->Keys[KeyIndex].Value.GetPtr<FMetaLandRoadLandscapeAttributeValue>())
+				{
+					Value = *Existing;
+				}
+				if (Value.RoadWeightFalloffWidth >= 1.0f)
+				{
+					continue;
+				}
+				Value.RoadWeightFalloffWidth = ActorW;
+				Track->Keys[KeyIndex].Value.InitializeAs<FMetaLandRoadLandscapeAttributeValue>(Value);
+			}
+		}
 	}
 
 	static void EnsureJunctionMouthLandscapeKeys(UMetaLandRoadSplineComponent* TargetSpline)
@@ -341,25 +345,27 @@ namespace MetaLandRoadProfile
 
 		EnsureLandscapeAttributeOnSections(TargetSpline);
 
+		// Through / T-through / Cross-through: two mouths on one spline → two mid keys.
+		// Stub / T-stem: one cut → Begin or End is drawn at CutS; do not insert a third key.
 		TArray<double> MouthStations;
-		if (Road->StartJunctionMeshTrimS >= 0.0)
-		{
-			MouthStations.Add(Road->StartJunctionMeshTrimS);
-		}
-		if (Road->EndJunctionMeshTrimS >= 0.0)
-		{
-			MouthStations.Add(Road->EndJunctionMeshTrimS);
-		}
 		for (const FMetaLandRoadJunctionTrimZone& Zone : Road->JunctionTrimZones)
 		{
-			if (Zone.ApproachCutS >= 0.0)
+			if (Zone.ApproachCutS >= 0.0 && Zone.DepartCutS >= 0.0 && Zone.ApproachCutS < Zone.DepartCutS)
 			{
 				MouthStations.Add(Zone.ApproachCutS);
-			}
-			if (Zone.DepartCutS >= 0.0)
-			{
 				MouthStations.Add(Zone.DepartCutS);
 			}
+		}
+		const bool bThroughSameHub = Road->StartOfJunction.IsValid()
+			&& Road->EndOfJunction.IsValid()
+			&& Road->StartOfJunction.Get() == Road->EndOfJunction.Get()
+			&& Road->StartJunctionMeshTrimS >= 0.0
+			&& Road->EndJunctionMeshTrimS >= 0.0
+			&& Road->EndJunctionMeshTrimS < Road->StartJunctionMeshTrimS;
+		if (bThroughSameHub)
+		{
+			MouthStations.Add(Road->EndJunctionMeshTrimS);
+			MouthStations.Add(Road->StartJunctionMeshTrimS);
 		}
 		if (MouthStations.Num() == 0)
 		{
@@ -396,23 +402,13 @@ namespace MetaLandRoadProfile
 		if (bIncludeMouthKeys)
 		{
 			EnsureJunctionMouthLandscapeKeys(TargetSpline);
+			SeedUnsetRoadWeightFalloffOnKeys(TargetSpline);
 			return;
 		}
 
 		EnsureLandscapeAttributeOnSections(TargetSpline);
-	}
-
-	static bool CollectVisibleLandscapeSpans(
-		const AMoKuEditSplineActor* Road,
-		TArray<TPair<double, double>>& OutSpans)
-	{
-		OutSpans.Reset();
-		if (!Road)
-		{
-			return false;
-		}
-		Road->GetJunctionMeshGenerationSpans(OutSpans);
-		return OutSpans.Num() > 0;
+		EnsureLandscapeOverlayDisplayKeys(TargetSpline);
+		SeedUnsetRoadWeightFalloffOnKeys(TargetSpline);
 	}
 
 	bool IsLandscapeOverlayStationVisible(
@@ -420,21 +416,7 @@ namespace MetaLandRoadProfile
 		double WorldS,
 		double TolCm)
 	{
-		TArray<TPair<double, double>> Spans;
-		if (!CollectVisibleLandscapeSpans(Road, Spans))
-		{
-			return true;
-		}
-
-		const double Tol = FMath::Max(TolCm, 1.0);
-		for (const TPair<double, double>& Span : Spans)
-		{
-			if (WorldS + Tol >= Span.Key && WorldS - Tol <= Span.Value)
-			{
-				return true;
-			}
-		}
-		return false;
+		return !Road || Road->ContainsJunctionMeshStation(WorldS, TolCm);
 	}
 
 	double GetLandscapeAttributeDisplayS(
@@ -443,17 +425,21 @@ namespace MetaLandRoadProfile
 		int32 KeyIndex,
 		double StoredWorldS)
 	{
+		if (!Road || !Track)
+		{
+			return StoredWorldS;
+		}
+		if (Road->ContainsJunctionMeshStation(StoredWorldS, 1.0))
+		{
+			return StoredWorldS;
+		}
+
 		TArray<TPair<double, double>> Spans;
-		if (!CollectVisibleLandscapeSpans(Road, Spans) || !Track)
+		Road->GetJunctionMeshGenerationSpans(Spans);
+		if (Spans.Num() == 0)
 		{
 			return StoredWorldS;
 		}
-
-		if (IsLandscapeOverlayStationVisible(Road, StoredWorldS, 1.0))
-		{
-			return StoredWorldS;
-		}
-
 		if (Track->IsBeginKey(KeyIndex))
 		{
 			return Spans[0].Key;
@@ -480,9 +466,14 @@ namespace MetaLandRoadProfile
 		{
 			return true;
 		}
+		if (!Road)
+		{
+			return false;
+		}
 
 		TArray<TPair<double, double>> Spans;
-		if (!CollectVisibleLandscapeSpans(Road, Spans))
+		Road->GetJunctionMeshGenerationSpans(Spans);
+		if (Spans.Num() == 0)
 		{
 			return false;
 		}
@@ -495,14 +486,99 @@ namespace MetaLandRoadProfile
 		return false;
 	}
 
-	void ForEachVisibleLandscapeKey(
-		const UMetaLandRoadSplineComponent* Spline,
+	static void CollectLandscapeOverlaySpans(
 		const AMoKuEditSplineActor* Road,
-		TFunctionRef<bool(int32 SectionIndex, int32 KeyIndex, double WorldS)> Visit)
+		const UMetaLandRoadSplineComponent* Spline,
+		TArray<TPair<double, double>>& OutSpans)
 	{
-		if (!Spline)
+		OutSpans.Reset();
+		if (Road)
+		{
+			Road->GetJunctionMeshGenerationSpans(OutSpans);
+		}
+		if (OutSpans.Num() > 0 || !Spline)
 		{
 			return;
+		}
+		const double Length = Spline->GetSplineLength();
+		if (Length > 1.0)
+		{
+			OutSpans.Emplace(0.0, Length);
+		}
+	}
+
+	static void CollectVisibleLandscapeOverlayStations(
+		const AMoKuEditSplineActor* Road,
+		const UMetaLandRoadSplineComponent* Spline,
+		TArray<double>& OutStations,
+		double MergeTolCm = 80.0)
+	{
+		OutStations.Reset();
+		TArray<TPair<double, double>> Spans;
+		CollectLandscapeOverlaySpans(Road, Spline, Spans);
+
+		auto AddUnique = [&OutStations, MergeTolCm](double StationS)
+		{
+			for (const double Existing : OutStations)
+			{
+				if (FMath::Abs(Existing - StationS) <= MergeTolCm)
+				{
+					return;
+				}
+			}
+			OutStations.Add(StationS);
+		};
+
+		for (const TPair<double, double>& Span : Spans)
+		{
+			AddUnique(Span.Key);
+			AddUnique(Span.Value);
+		}
+
+		if (Spline)
+		{
+			const TArray<FMetaLandRoadLaneSection>& Sections = Spline->GetLaneSections();
+			for (int32 SectionIndex = 0; SectionIndex < Sections.Num(); ++SectionIndex)
+			{
+				const FMetaLandRoadLaneAttribute* Track =
+					Sections[SectionIndex].FindAttribute(FMetaLandRoadAttributeRegistry::TypeLandscape);
+				if (!Track)
+				{
+					continue;
+				}
+				for (int32 KeyIndex = 0; KeyIndex < Track->Keys.Num(); ++KeyIndex)
+				{
+					if (Track->IsBeginKey(KeyIndex) || Track->IsEndKey(KeyIndex))
+					{
+						continue;
+					}
+					const double StoredWorldS = Sections[SectionIndex].SOffset + Track->Keys[KeyIndex].SOffset;
+					if (ShouldHideLandscapeAttributeKey(Road, Track, KeyIndex, StoredWorldS))
+					{
+						continue;
+					}
+					AddUnique(GetLandscapeAttributeDisplayS(Road, Track, KeyIndex, StoredWorldS));
+				}
+			}
+		}
+
+		OutStations.Sort();
+	}
+
+	static bool FindNearestLandscapeKeyAtS(
+		const UMetaLandRoadSplineComponent* Spline,
+		const AMoKuEditSplineActor* Road,
+		double TargetS,
+		int32& OutSectionIndex,
+		int32& OutKeyIndex,
+		double& OutDist)
+	{
+		OutSectionIndex = INDEX_NONE;
+		OutKeyIndex = INDEX_NONE;
+		OutDist = TNumericLimits<double>::Max();
+		if (!Spline)
+		{
+			return false;
 		}
 
 		const TArray<FMetaLandRoadLaneSection>& Sections = Spline->GetLaneSections();
@@ -514,21 +590,167 @@ namespace MetaLandRoadProfile
 			{
 				continue;
 			}
-
 			for (int32 KeyIndex = 0; KeyIndex < Track->Keys.Num(); ++KeyIndex)
 			{
 				const double StoredWorldS = Sections[SectionIndex].SOffset + Track->Keys[KeyIndex].SOffset;
-				if (ShouldHideLandscapeAttributeKey(Road, Track, KeyIndex, StoredWorldS))
-				{
-					continue;
-				}
 				const double DisplayS = GetLandscapeAttributeDisplayS(Road, Track, KeyIndex, StoredWorldS);
-				if (!Visit(SectionIndex, KeyIndex, DisplayS))
+				const double Dist = FMath::Min(
+					FMath::Abs(StoredWorldS - TargetS),
+					FMath::Abs(DisplayS - TargetS));
+				if (Dist < OutDist)
 				{
-					return;
+					OutDist = Dist;
+					OutSectionIndex = SectionIndex;
+					OutKeyIndex = KeyIndex;
 				}
 			}
 		}
+		return OutSectionIndex != INDEX_NONE;
+	}
+
+	void ForEachVisibleLandscapeKey(
+		const UMetaLandRoadSplineComponent* Spline,
+		const AMoKuEditSplineActor* Road,
+		TFunctionRef<bool(int32 SectionIndex, int32 KeyIndex, double WorldS)> Visit)
+	{
+		if (!Spline)
+		{
+			return;
+		}
+
+		TArray<double> Stations;
+		CollectVisibleLandscapeOverlayStations(Road, Spline, Stations);
+		if (Stations.Num() == 0)
+		{
+			return;
+		}
+
+		for (const double StationS : Stations)
+		{
+			int32 SectionIndex = INDEX_NONE;
+			int32 KeyIndex = INDEX_NONE;
+			double Dist = TNumericLimits<double>::Max();
+			FindNearestLandscapeKeyAtS(Spline, Road, StationS, SectionIndex, KeyIndex, Dist);
+			if (SectionIndex == INDEX_NONE)
+			{
+				continue;
+			}
+			if (!Visit(SectionIndex, KeyIndex, StationS))
+			{
+				return;
+			}
+		}
+	}
+
+	bool EnsureLandscapeKeyAtWorldS(
+		UMetaLandRoadSplineComponent* Spline,
+		double WorldS,
+		int32& OutSectionIndex,
+		int32& OutKeyIndex,
+		double DuplicateTolCm)
+	{
+		OutSectionIndex = INDEX_NONE;
+		OutKeyIndex = INDEX_NONE;
+		if (!Spline)
+		{
+			return false;
+		}
+
+		const int32 SectionIndex = Spline->GetRoadLayout().FindSectionAtSOffset(WorldS);
+		if (SectionIndex == INDEX_NONE)
+		{
+			return false;
+		}
+
+		FMetaLandRoadLaneSection& Section = Spline->GetLaneSection(SectionIndex);
+		FMetaLandRoadLaneAttribute* Track = Section.PinAttribute(FMetaLandRoadAttributeRegistry::TypeLandscape);
+		if (!Track)
+		{
+			return false;
+		}
+
+		const double LocalS = WorldS - Section.SOffset;
+		const int32 Existing = Track->FindKeyIndex(LocalS, DuplicateTolCm);
+		if (Existing != INDEX_NONE)
+		{
+			OutSectionIndex = SectionIndex;
+			OutKeyIndex = Existing;
+			return true;
+		}
+
+		Spline->Modify();
+		OutKeyIndex = Track->AddKey(LocalS, DuplicateTolCm);
+		OutSectionIndex = SectionIndex;
+		return OutKeyIndex != INDEX_NONE;
+	}
+
+	void EnsureLandscapeOverlayDisplayKeys(UMetaLandRoadSplineComponent* Spline)
+	{
+		if (!Spline)
+		{
+			return;
+		}
+
+		const AMoKuEditSplineActor* Road = Cast<AMoKuEditSplineActor>(Spline->GetOwner());
+		TArray<TPair<double, double>> Spans;
+		CollectLandscapeOverlaySpans(Road, Spline, Spans);
+		for (const TPair<double, double>& Span : Spans)
+		{
+			int32 SectionIndex = INDEX_NONE;
+			int32 KeyIndex = INDEX_NONE;
+			EnsureLandscapeKeyAtWorldS(Spline, Span.Key, SectionIndex, KeyIndex);
+			EnsureLandscapeKeyAtWorldS(Spline, Span.Value, SectionIndex, KeyIndex);
+		}
+	}
+
+	bool GetLandscapeOverlayKeyOrdinal(
+		const AMoKuEditSplineActor* Road,
+		const UMetaLandRoadSplineComponent* Spline,
+		int32 SectionIndex,
+		int32 KeyIndex,
+		int32& OutIndex,
+		int32& OutCount)
+	{
+		OutIndex = 0;
+		OutCount = 0;
+		if (!Spline || !Spline->GetLaneSections().IsValidIndex(SectionIndex))
+		{
+			return false;
+		}
+
+		const FMetaLandRoadLaneSection& Section = Spline->GetLaneSections()[SectionIndex];
+		const FMetaLandRoadLaneAttribute* Track =
+			Section.FindAttribute(FMetaLandRoadAttributeRegistry::TypeLandscape);
+		if (!Track || !Track->Keys.IsValidIndex(KeyIndex))
+		{
+			return false;
+		}
+
+		TArray<double> Stations;
+		CollectVisibleLandscapeOverlayStations(Road, Spline, Stations);
+		OutCount = Stations.Num();
+		if (OutCount == 0)
+		{
+			OutIndex = Track->IsEndKey(KeyIndex) ? 1 : 0;
+			OutCount = Track->Keys.Num() > 1 ? 2 : 1;
+			return true;
+		}
+
+		const double StoredWorldS = Section.SOffset + Track->Keys[KeyIndex].SOffset;
+		const double DisplayS = GetLandscapeAttributeDisplayS(Road, Track, KeyIndex, StoredWorldS);
+		int32 BestIndex = 0;
+		double BestDist = TNumericLimits<double>::Max();
+		for (int32 StationIndex = 0; StationIndex < Stations.Num(); ++StationIndex)
+		{
+			const double Dist = FMath::Abs(DisplayS - Stations[StationIndex]);
+			if (Dist < BestDist)
+			{
+				BestDist = Dist;
+				BestIndex = StationIndex;
+			}
+		}
+		OutIndex = BestIndex;
+		return true;
 	}
 
 	void EnsureDefaultRoadProfile(UMetaLandRoadSplineComponent* TargetSpline)
@@ -762,7 +984,7 @@ namespace MetaLandRoadProfile
 		// section — do NOT force-fill the opposite face when user picked 3-of-4 / one side.
 		for (int32 LaneIndex : LaneIndices)
 		{
-			const int32 LaneSectionIndex = MetaLandRoadLaneVisualization::ResolveLaneSectionIndexForSpan(
+			const int32 LaneSectionIndex = MetaLandRoad::ResolveLaneSectionIndexForSpan(
 				SourceSpline, Anchor.SectionIndex, LaneIndex);
 			FMetaLandRoadLaneProfile LaneProfile;
 			if (!TryMakeLaneProfileAtS(SourceSpline, LaneSectionIndex, LaneIndex, WidthS, LaneProfile))
@@ -995,7 +1217,7 @@ namespace MetaLandRoadProfile
 
 		if (LaneIndex != LANE_INDEX_NONE)
 		{
-			const int32 Resolved = MetaLandRoadLaneVisualization::ResolveLaneSectionIndexForSpan(
+			const int32 Resolved = MetaLandRoad::ResolveLaneSectionIndexForSpan(
 				TargetSpline, SpanSectionIndex, LaneIndex);
 			if (Resolved != INDEX_NONE
 				&& Layout.Sections.IsValidIndex(Resolved)
@@ -1102,7 +1324,121 @@ namespace MetaLandRoadProfile
 		{
 			RoadActor->RefreshDynamicRoadMesh();
 		}
-		MetaLandRoadLaneVisualization::RefreshLaneVisualization(Spline);
+#if WITH_EDITOR
+		if (FMetaLandRoadEditorHooks::RefreshLaneVisualization)
+		{
+			FMetaLandRoadEditorHooks::RefreshLaneVisualization(Spline);
+		}
+#endif
+	}
+
+#if WITH_EDITOR
+	static TSet<TWeakObjectPtr<AMoKuEditSplineActor>> GUndoRoads;
+	static TSet<TWeakObjectPtr<AMoKuEditIntersectionActor>> GUndoJunctions;
+	static bool bUndoMeshSyncQueued = false;
+
+	static void FlushUndoDerivedMeshes()
+	{
+		bUndoMeshSyncQueued = false;
+		TSet<TWeakObjectPtr<AMoKuEditIntersectionActor>> Junctions = GUndoJunctions;
+		TArray<TWeakObjectPtr<AMoKuEditSplineActor>> Roads;
+		for (const TWeakObjectPtr<AMoKuEditSplineActor>& RoadWeak : GUndoRoads)
+		{
+			Roads.Add(RoadWeak);
+			if (AMoKuEditSplineActor* Road = RoadWeak.Get())
+			{
+				if (AMoKuEditIntersectionActor* StartJ = Road->StartOfJunction.Get())
+				{
+					Junctions.Add(StartJ);
+				}
+				if (AMoKuEditIntersectionActor* EndJ = Road->EndOfJunction.Get())
+				{
+					Junctions.Add(EndJ);
+				}
+				for (const FMetaLandRoadJunctionTrimZone& Zone : Road->JunctionTrimZones)
+				{
+					if (AMoKuEditIntersectionActor* J = Zone.Junction.Get())
+					{
+						Junctions.Add(J);
+					}
+				}
+			}
+		}
+		GUndoRoads.Reset();
+		GUndoJunctions.Reset();
+
+		TSet<AMoKuEditSplineActor*> RoadsCoveredByJunction;
+		TGuardValue<bool> SuppressRecook(
+			AMoKuEditSplineActor::bSuppressJunctionRecookFromRoadRefresh, true);
+
+		for (const TWeakObjectPtr<AMoKuEditIntersectionActor>& JWeak : Junctions)
+		{
+			AMoKuEditIntersectionActor* Junction = JWeak.Get();
+			if (!Junction || !Junction->JunctionData)
+			{
+				continue;
+			}
+			for (AMoKuEditSplineActor* Linked : Junction->JunctionData->LinkedRoadActors)
+			{
+				RoadsCoveredByJunction.Add(Linked);
+			}
+			if (Junction->JunctionData->JunctionNode.Arms.Num() >= 2)
+			{
+				Junction->RefreshJunctionCoverMesh();
+			}
+			else
+			{
+				Junction->ClearJunctionCoverMesh();
+			}
+		}
+
+		for (const TWeakObjectPtr<AMoKuEditSplineActor>& RoadWeak : Roads)
+		{
+			AMoKuEditSplineActor* Road = RoadWeak.Get();
+			if (Road && !RoadsCoveredByJunction.Contains(Road))
+			{
+				Road->RefreshDynamicRoadMesh();
+			}
+		}
+	}
+
+	static void QueueUndoDerivedMeshSync()
+	{
+		if (bUndoMeshSyncQueued)
+		{
+			return;
+		}
+		bUndoMeshSyncQueued = true;
+		FTSTicker::GetCoreTicker().AddTicker(
+			FTickerDelegate::CreateLambda([](float)
+			{
+				FlushUndoDerivedMeshes();
+				return false;
+			}),
+			0.0f);
+	}
+#endif
+
+	void NotifyUndoDerivedMeshDirty(AMoKuEditSplineActor* Road)
+	{
+#if WITH_EDITOR
+		if (Road)
+		{
+			GUndoRoads.Add(Road);
+			QueueUndoDerivedMeshSync();
+		}
+#endif
+	}
+
+	void NotifyUndoDerivedMeshDirty(AMoKuEditIntersectionActor* Junction)
+	{
+#if WITH_EDITOR
+		if (Junction)
+		{
+			GUndoJunctions.Add(Junction);
+			QueueUndoDerivedMeshSync();
+		}
+#endif
 	}
 
 	void RecookLocalJunctionsForSpline(UMetaLandRoadSplineComponent* TargetSpline)
@@ -1111,6 +1447,12 @@ namespace MetaLandRoadProfile
 		{
 			return;
 		}
+#if WITH_EDITOR
+		if (GIsTransacting)
+		{
+			return;
+		}
+#endif
 
 		AMoKuEditSplineActor* RoadActor = Cast<AMoKuEditSplineActor>(TargetSpline->GetOwner());
 		if (!RoadActor || !RoadActor->GetWorld() || UE::GetIsEditorLoadingPackage())
@@ -1151,7 +1493,12 @@ namespace MetaLandRoadProfile
 			AMoKuEditSplineActor::bSuppressJunctionRecookFromRoadRefresh, true);
 		for (AMoKuEditIntersectionActor* Junction : LocalJunctions)
 		{
-			UMetaLandRoadEditorMode::RecookJunctionActorStatic(Junction, true);
+#if WITH_EDITOR
+			if (FMetaLandRoadEditorHooks::RecookJunction)
+			{
+				FMetaLandRoadEditorHooks::RecookJunction(Junction, true);
+			}
+#endif
 		}
 	}
 
@@ -1263,7 +1610,7 @@ namespace MetaLandRoadProfile
 		int32 TemplateLaneIndex = LaneIndex;
 		if (TemplateLaneIndex == LANE_INDEX_NONE || !TargetSection.CheckLaneIndex(TemplateLaneIndex))
 		{
-			const int32 Resolved = MetaLandRoadLaneVisualization::ResolveLaneSectionIndexForSpan(
+			const int32 Resolved = MetaLandRoad::ResolveLaneSectionIndexForSpan(
 				TargetSpline, SpanSectionIndex, LaneIndex);
 			if (Resolved != INDEX_NONE
 				&& Sections.IsValidIndex(Resolved)

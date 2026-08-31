@@ -1,14 +1,17 @@
 #include "MoKuEditIntersectionActor.h"
+#include "MetaLandRoadProfile.h"
 #include "MetaLandRoadLaneAttribute.h"
 #include "MoKuEditSplinesComponent.h"
 #include "MetaLandRoadSplineComponent.h"
-#include "MetaLandRoadEditorMode.h"
+#include "MetaLandRoadModule.h"
 #include "Algo/Reverse.h"
 #include "CompGeom/PolygonTriangulation.h"
 #include "CurveOps/TriangulateCurvesOp.h"
 #include "DynamicMesh/MeshNormals.h"
+#if WITH_EDITOR
 #include "Editor.h"
 #include "ScopedTransaction.h"
+#endif
 #include "MoKuEditSplineActor.h"
 #include "Components/DynamicMeshComponent.h"
 #include "MoKuEditorUtils.h"
@@ -17,7 +20,6 @@
 #include "StaticMeshOperations.h"
 #include "WorldEditorSettings.h"
 #include "EditSplineRoadInfo.h"
-#include "RoadBrushCacheContainer.h"
 #include "MetaLandRoadProfile.h"
 
 
@@ -460,7 +462,7 @@ static bool IsLaneLinkPolylineValid(const TArray<FVector3d>& Poly, double ChordL
 			}
 		}
 	}
-	return PolyLen <= ChordLen * 2.2;
+	return PolyLen <= ChordLen * 2.8;
 }
 
 /** Smooth inward Bezier (4–10 segs). Avoids circular long-way flips → jagged red polylines. */
@@ -483,7 +485,7 @@ static void BuildSmoothInwardLaneBezier(
 	}
 	const double Chord = FVector::Dist2D(Start, End);
 	// Quadratic mid P(0.5)=Mid+0.5*(Apex-Mid); Apex at 2*Sag so curve reaches TargetSag.
-	const double Sag = FMath::Clamp(SagittaCm, 30.0, FMath::Min(Chord * 0.42, 220.0));
+	const double Sag = FMath::Clamp(SagittaCm, 30.0, FMath::Min(Chord * 0.55, 480.0));
 	const FVector Apex = Mid + TowardHub * (2.0 * Sag);
 	const int32 Segs = FMath::Clamp(NumSegments, 8, 20);
 	OutArc.Reserve(Segs + 1);
@@ -520,6 +522,42 @@ static bool PointInPolygon2D(const FVector2d& P, const TArray<FVector2d>& Poly)
 		}
 	}
 	return bInside;
+}
+
+/** Facing hub: CS[0]=left-outer … CS.Last()=right-outer. 2-pt mouths (snap tip /
+ *  layout miss) must not keep only L/R — GetEdgeLanePair would treat the far
+ *  outer as the lane inner and the hub ring crosses itself. */
+static void EnsureFig1MouthCSLanePair(TArray<FVector>& CS, const FVector& Anchor)
+{
+	if (CS.Num() < 2)
+	{
+		return;
+	}
+
+	const FVector Mid = (CS[0] + CS.Last()) * 0.5;
+	FVector TowardHub = (Anchor - Mid).GetSafeNormal2D();
+	if (!TowardHub.IsNearlyZero())
+	{
+		const FVector RightFacing = FVector::CrossProduct(TowardHub, FVector::UpVector).GetSafeNormal2D();
+		if (FVector::DotProduct(CS[0] - Mid, RightFacing)
+			> FVector::DotProduct(CS.Last() - Mid, RightFacing))
+		{
+			Algo::Reverse(CS);
+		}
+	}
+
+	if (CS.Num() >= 4)
+	{
+		return;
+	}
+
+	const FVector Left = CS[0];
+	const FVector Right = CS.Last();
+	CS.Reset();
+	CS.Add(Left);
+	CS.Add(FMath::Lerp(Left, Right, 0.25));
+	CS.Add(FMath::Lerp(Left, Right, 0.75));
+	CS.Add(Right);
 }
 
 UMetaLandRoadJunctionComponent::UMetaLandRoadJunctionComponent()
@@ -1056,10 +1094,6 @@ void AMoKuEditIntersectionActor::SyncTerrainInfluenceFromLinkedRoads()
 		return;
 	}
 
-	const UWorldEditorSettings* Settings = GetDefault<UWorldEditorSettings>();
-	const FName RoadLayer = Settings ? Settings->GetDefaultRoadWeightmapLayerName() : FName(TEXT("Road"));
-	const FName ShoulderLayer = Settings ? Settings->GetDefaultShoulderWeightmapLayerName() : FName(TEXT("Dirty"));
-
 	for (AMoKuEditSplineActor* LinkedRoad : JunctionData->LinkedRoadActors)
 	{
 		if (!LinkedRoad || !LinkedRoad->bAffectsLandscape)
@@ -1067,47 +1101,14 @@ void AMoKuEditIntersectionActor::SyncTerrainInfluenceFromLinkedRoads()
 			continue;
 		}
 
-		const FSplineRoadHeightmapSettings& SrcH = LinkedRoad->RoadHeightmapSettings;
-		FRoadFalloffSettings& DstFalloff = RoadHeightmapSettings.FalloffSettings;
-		// Only fill seed/empty junction values — never overwrite artist edits on the hub.
-		if (DstFalloff.FalloffWidth <= KINDA_SMALL_NUMBER
-			|| FMath::IsNearlyEqual(DstFalloff.FalloffWidth, 800.f, 1.f))
+		if (FMath::IsNearlyEqual(RoadWeightFalloffWidth, 180.0f, 1.0f)
+			&& LinkedRoad->RoadWeightFalloffWidth > KINDA_SMALL_NUMBER)
 		{
-			if (SrcH.FalloffSettings.FalloffWidth > KINDA_SMALL_NUMBER)
-			{
-				DstFalloff.FalloffWidth = SrcH.FalloffSettings.FalloffWidth;
-			}
-		}
-		if (FMath::IsNearlyZero(DstFalloff.ZOffset) && !FMath::IsNearlyZero(SrcH.FalloffSettings.ZOffset))
-		{
-			DstFalloff.ZOffset = SrcH.FalloffSettings.ZOffset;
+			RoadWeightFalloffWidth = LinkedRoad->GetRoadWeightFalloffWidth();
 		}
 
-		auto CopyWeightIfSeed = [this](FName LayerName, const AMoKuEditSplineActor* SrcRoad)
-		{
-			if (LayerName == NAME_None || !SrcRoad)
-			{
-				return;
-			}
-			const FRoadBodyWeightmapSettings* SrcW = SrcRoad->RoadBodyWeightmapSettings.Find(LayerName);
-			FRoadBodyWeightmapSettings* DstW = RoadBodyWeightmapSettings.Find(LayerName);
-			if (!SrcW || !DstW)
-			{
-				return;
-			}
-			if (DstW->FalloffWidth <= KINDA_SMALL_NUMBER
-				|| FMath::IsNearlyEqual(DstW->FalloffWidth, 400.f, 1.f))
-			{
-				DstW->FalloffWidth = SrcW->FalloffWidth;
-				DstW->EdgeOffset = SrcW->EdgeOffset;
-				DstW->TextureInfluence = SrcW->TextureInfluence;
-			}
-		};
-		CopyWeightIfSeed(RoadLayer, LinkedRoad);
-		CopyWeightIfSeed(ShoulderLayer, LinkedRoad);
-
-		UE_LOG(LogTemp, Log, TEXT("[RoadLandscape] Junction %s synced Terrain from linked road %s (HeightFalloff=%.0f)"),
-			*GetName(), *LinkedRoad->GetName(), RoadHeightmapSettings.FalloffSettings.FalloffWidth);
+		UE_LOG(LogTemp, Log, TEXT("[RoadLandscape] Junction %s synced RoadWeightFalloffWidth=%.0f from %s"),
+			*GetName(), RoadWeightFalloffWidth, *LinkedRoad->GetName());
 		break;
 	}
 }
@@ -1168,24 +1169,6 @@ void AMoKuEditIntersectionActor::RefreshJunctionCoverMesh()
 
 	// Hub cover is the brush silhouette for WorldEditor height/weight (same base Terrain UPROPERTY).
 	SyncTerrainInfluenceFromLinkedRoads();
-
-	// Mark linked-road DF caches dirty (shape changed during suppress) then one landscape tick.
-	InitSceneManagement();
-	if (AWorldSceneManagement* Mgr = SceneManagement.Get())
-	{
-		for (AMoKuEditSplineActor* LinkedRoad : JunctionData->LinkedRoadActors)
-		{
-			if (!LinkedRoad)
-			{
-				continue;
-			}
-			if (URoadBodyBrushCacheContainer* CacheObj = Cast<URoadBodyBrushCacheContainer>(
-					Mgr->GetActorCache(LinkedRoad, URoadBodyBrushCacheContainer::StaticClass())))
-			{
-				CacheObj->Cache.CacheIsValid = false;
-			}
-		}
-	}
 	NotifyLandscapeBrushChanged(/*bShape=*/true, /*bWeight=*/true, /*bUser=*/false);
 }
 
@@ -1601,19 +1584,23 @@ bool AMoKuEditIntersectionActor::BuildFig1JunctionCoverMesh()
 	};
 
 	const FVector Anchor = Node.AnchorWorld.IsNearlyZero() ? GetActorLocation() : Node.AnchorWorld;
-	bool bTJunction = (Node.Topology == EMetaLandRoadJunctionTopology::T);
-	if (!bTJunction)
+	int32 ThroughArmCount = 0;
+	int32 StubArmCount = 0;
+	for (const FMetaLandRoadJunctionArmRef& Arm : Node.Arms)
 	{
-		// Recook/create may leave Topology stale; half ConnectSide implies T through.
-		for (const FMetaLandRoadJunctionArmRef& Arm : Node.Arms)
+		if (Arm.bThroughArm)
 		{
-			if (Arm.bThroughArm && Arm.ConnectSide != EMetaLandRoadJunctionConnectSide::Both)
-			{
-				bTJunction = true;
-				break;
-			}
+			++ThroughArmCount;
+		}
+		else
+		{
+			++StubArmCount;
 		}
 	}
+	const bool bTJunction =
+		Node.Arms.Num() == 2
+		&& ThroughArmCount == 1
+		&& StubArmCount == 1;
 	TArray<FFig1ArmSlice> ArmSlices;
 
 	// Aug2: half at CS.Num()/2 so T mouth stays ≥3 pts and ends on EdgeC (weld to T-open).
@@ -1654,7 +1641,14 @@ bool AMoKuEditIntersectionActor::BuildFig1JunctionCoverMesh()
 		}
 		if (FMath::IsNearlyEqual(CutS, IntersectS, 1.0))
 		{
-			return;
+			const double Nudge = 50.0;
+			const double Len = Spline->GetSplineLength();
+			CutS = (CutS <= IntersectS) ? (IntersectS - Nudge) : (IntersectS + Nudge);
+			CutS = FMath::Clamp(CutS, 10.0, FMath::Max(Len - 10.0, 10.0));
+			if (FMath::IsNearlyEqual(CutS, IntersectS, 1.0))
+			{
+				return;
+			}
 		}
 
 		const double SampleS = CutS;
@@ -1783,6 +1777,7 @@ bool AMoKuEditIntersectionActor::BuildFig1JunctionCoverMesh()
 				Slice.OuterCS.Last() = ClosestEdge(Slice.OuterCS.Last());
 			}
 		}
+		EnsureFig1MouthCSLanePair(Slice.OuterCS, Anchor);
 
 		Slice.InnerCS = Slice.OuterCS;
 		const FVector MouthMid = (Slice.OuterCS[0] + Slice.OuterCS.Last()) * 0.5;
@@ -1814,16 +1809,11 @@ bool AMoKuEditIntersectionActor::BuildFig1JunctionCoverMesh()
 		}
 
 		const double StripDepthCm = 0.0;
-		const bool bTrueTHalf =
-			bTJunction
-			&& Node.Arms.Num() == 2
-			&& Arm.bThroughArm
-			&& Arm.ConnectSide != EMetaLandRoadJunctionConnectSide::Both;
-		const EMetaLandRoadJunctionConnectSide SliceSide = bTrueTHalf
-			? Arm.ConnectSide
-			: EMetaLandRoadJunctionConnectSide::Both;
+		const EMetaLandRoadJunctionConnectSide SliceSide = EMetaLandRoadJunctionConnectSide::Both;
 
-		if (Arm.bThroughArm)
+		const bool bTwoMouths = Arm.CutDistanceS > KINDA_SMALL_NUMBER
+			&& Arm.DepartCutS > Arm.CutDistanceS + KINDA_SMALL_NUMBER;
+		if (Arm.bThroughArm || bTwoMouths)
 		{
 			if (Arm.CutDistanceS > KINDA_SMALL_NUMBER)
 			{
@@ -1933,12 +1923,16 @@ bool AMoKuEditIntersectionActor::BuildFig1JunctionCoverMesh()
 		if (bRight)
 		{
 			OutOuter = CS.Last();
-			OutInner = (CS.Num() >= 3) ? CS[CS.Num() - 2] : CS[0];
+			OutInner = (CS.Num() >= 4)
+				? CS[CS.Num() - 2]
+				: FMath::Lerp(CS.Last(), CS[0], 0.25);
 		}
 		else
 		{
 			OutOuter = CS[0];
-			OutInner = (CS.Num() >= 3) ? CS[1] : CS.Last();
+			OutInner = (CS.Num() >= 4)
+				? CS[1]
+				: FMath::Lerp(CS[0], CS.Last(), 0.25);
 		}
 		return true;
 	};
@@ -1981,7 +1975,10 @@ bool AMoKuEditIntersectionActor::BuildFig1JunctionCoverMesh()
 		const double HalfOuterChord = OuterChord * 0.5;
 
 		const bool bSameSplineCorner = (Port.Spline != nullptr && Port.Spline == NextPort.Spline);
-		const bool bTOpenSide = bTJunction && bSameSplineCorner;
+		const EMetaLandRoadJunctionConnectSide PortTSide = ResolveTConnectSideForSlice(Port);
+		// Far-half strip is leftover half-CS T. Full Both mouths close with a straight outer chord.
+		const bool bTOpenSide = bTJunction && bSameSplineCorner
+			&& PortTSide != EMetaLandRoadJunctionConnectSide::Both;
 		const bool bRealCorner = !bSameSplineCorner && OuterChord > 10.0 && InnerChord > 10.0;
 		bMeshFillet[PortIndex] = bRealCorner;
 
@@ -1992,9 +1989,9 @@ bool AMoKuEditIntersectionActor::BuildFig1JunctionCoverMesh()
 			// Fig2/3: Bezier on green-arrow outers (few segs) + parallel inner at laneW.
 			// Circular long-way flip + 12鈥?8 segs 鈫?jagged/folded red polylines & deformation.
 			const double TargetSag = FMath::Clamp(
-				FMath::Min3(HalfOuterChord * 0.28, DistHub * 0.28, LaneW * 1.05),
+				FMath::Min3(HalfOuterChord * 0.42, DistHub * 0.40, LaneW * 1.6),
 				40.0,
-				FMath::Min(LaneW * 1.35, 220.0));
+				FMath::Min(LaneW * 2.0, 480.0));
 			const int32 ArcSegs = FMath::Clamp(FMath::CeilToInt(OuterChord / 55.0), 10, 18);
 			MaxCornerSegs = FMath::Max(MaxCornerSegs, ArcSegs);
 
@@ -2028,8 +2025,8 @@ bool AMoKuEditIntersectionActor::BuildFig1JunctionCoverMesh()
 			{
 				CurbOuterArcs[PortIndex] = { OuterRight, OuterLeft };
 				CurbInnerArcs[PortIndex] = { InnerRight, InnerLeft };
-				bMeshFillet[PortIndex] = false;
-				UE_LOG(LogTemp, Warning, TEXT("[Fig1/LaneLink] port%d rails invalid — straight lane"), PortIndex);
+				bMeshFillet[PortIndex] = true;
+				UE_LOG(LogTemp, Warning, TEXT("[Fig1/LaneLink] port%d rails invalid — straight lane still meshed"), PortIndex);
 			}
 			else
 			{
@@ -2126,6 +2123,22 @@ bool AMoKuEditIntersectionActor::BuildFig1JunctionCoverMesh()
 	}
 	TArray<TArray<FVector3d>> ExtraFarOuter;
 	TArray<TArray<FVector3d>> ExtraFarInner;
+	if (bTJunction && !bHaveTOpen)
+	{
+		bool bAnyHalfSide = false;
+		for (const FMetaLandRoadJunctionArmRef& Arm : Node.Arms)
+		{
+			if (Arm.ConnectSide != EMetaLandRoadJunctionConnectSide::Both)
+			{
+				bAnyHalfSide = true;
+				break;
+			}
+		}
+		if (!bAnyHalfSide)
+		{
+			bHaveTOpen = true;
+		}
+	}
 	if (bTJunction && !bHaveTOpen)
 	{
 		for (int32 A = 0; A < ArmSlices.Num(); ++A)
@@ -2299,7 +2312,7 @@ bool AMoKuEditIntersectionActor::BuildFig1JunctionCoverMesh()
 			{
 				continue;
 			}
-			// T / half-CS mouths (<4): FULL OuterCS — mid-chord left a blue hole in 丁字口.
+			// T / half-CS mouths (<4): FULL OuterCS — mid-chord left a hole in 丁字口.
 			// Cross with full CS: CS[1]..CS[N-2] + curb inner (edge lanes = strips).
 			const bool bFullMouthHole = bTJunction || MouthOuter.Num() < 4;
 			if (bFullMouthHole)
@@ -2446,6 +2459,95 @@ bool AMoKuEditIntersectionActor::BuildFig1JunctionCoverMesh()
 	return true;
 }
 
+static int32 FindSplinePointNearXY(const USplineComponent* Spline, const FVector& WorldXY, double RadiusCm)
+{
+	if (!Spline)
+	{
+		return INDEX_NONE;
+	}
+
+	int32 BestIndex = INDEX_NONE;
+	double BestDistSq = RadiusCm * RadiusCm;
+	const int32 NumPoints = Spline->GetNumberOfSplinePoints();
+	for (int32 PointIndex = 0; PointIndex < NumPoints; ++PointIndex)
+	{
+		const FVector World = Spline->GetLocationAtSplinePoint(PointIndex, ESplineCoordinateSpace::World);
+		const double DistSq = FVector::DistSquared2D(World, WorldXY);
+		if (DistSq < BestDistSq)
+		{
+			BestDistSq = DistSq;
+			BestIndex = PointIndex;
+		}
+	}
+	return BestIndex;
+}
+
+static int32 FindOrInsertHubFollowPoint(
+	USplineComponent* Spline,
+	const FVector& HubWorld,
+	double HubS,
+	bool bThroughArm)
+{
+	if (!Spline || Spline->GetNumberOfSplinePoints() < 2)
+	{
+		return INDEX_NONE;
+	}
+
+	constexpr double NearHubRadiusCm = 250.0;
+	const int32 Existing = FindSplinePointNearXY(Spline, HubWorld, NearHubRadiusCm);
+	if (Existing != INDEX_NONE)
+	{
+		return Existing;
+	}
+
+	const int32 NumPoints = Spline->GetNumberOfSplinePoints();
+	if (!bThroughArm)
+	{
+		const FVector Start = Spline->GetLocationAtSplinePoint(0, ESplineCoordinateSpace::World);
+		const FVector End = Spline->GetLocationAtSplinePoint(NumPoints - 1, ESplineCoordinateSpace::World);
+		return FVector::DistSquared2D(Start, HubWorld) <= FVector::DistSquared2D(End, HubWorld)
+			? 0
+			: NumPoints - 1;
+	}
+
+	const double SplineLength = Spline->GetSplineLength();
+	const double ClampedS = FMath::Clamp(HubS, 0.0, SplineLength);
+	int32 InsertAt = NumPoints;
+	for (int32 PointIndex = 0; PointIndex < NumPoints; ++PointIndex)
+	{
+		if (Spline->GetDistanceAlongSplineAtSplinePoint(PointIndex) > ClampedS)
+		{
+			InsertAt = PointIndex;
+			break;
+		}
+	}
+	const FVector InsertWorld = Spline->GetLocationAtDistanceAlongSpline(
+		ClampedS,
+		ESplineCoordinateSpace::World);
+	Spline->AddSplinePointAtIndex(InsertWorld, InsertAt, ESplineCoordinateSpace::World, false);
+	return InsertAt;
+}
+
+void AMoKuEditIntersectionActor::SyncArmIntersectSFromAnchor(const FVector& AnchorWorld)
+{
+	if (!JunctionData)
+	{
+		return;
+	}
+
+	for (FMetaLandRoadJunctionArmRef& Arm : JunctionData->JunctionNode.Arms)
+	{
+		UMetaLandRoadSplineComponent* Spline = Arm.Spline.Get();
+		if (!Spline)
+		{
+			continue;
+		}
+		Arm.IntersectDistanceS = Spline->GetDistanceAlongSplineAtLocation(
+			AnchorWorld,
+			ESplineCoordinateSpace::World);
+	}
+}
+
 void AMoKuEditIntersectionActor::ApplyAuthoringAnchorDelta(const FVector& OldAnchor, const FVector& NewAnchor)
 {
 	if (!JunctionData)
@@ -2455,11 +2557,58 @@ void AMoKuEditIntersectionActor::ApplyAuthoringAnchorDelta(const FVector& OldAnc
 	Modify();
 	JunctionData->Modify();
 	JunctionData->JunctionNode.AnchorWorld = NewAnchor;
+
+	const FVector DeltaXY(NewAnchor.X - OldAnchor.X, NewAnchor.Y - OldAnchor.Y, 0.0);
+	if (DeltaXY.SizeSquared2D() > 1.0)
+	{
+		TSet<UMetaLandRoadSplineComponent*> MovedSplines;
+		for (const FMetaLandRoadJunctionArmRef& Arm : JunctionData->JunctionNode.Arms)
+		{
+			UMetaLandRoadSplineComponent* Spline = Arm.Spline.Get();
+			if (!Spline || Spline->GetNumberOfSplinePoints() < 2 || MovedSplines.Contains(Spline))
+			{
+				continue;
+			}
+
+			AMoKuEditSplineActor* Road = Cast<AMoKuEditSplineActor>(Spline->GetOwner());
+			if (Road)
+			{
+				Road->Modify();
+			}
+			Spline->Modify();
+
+			const int32 PointIndex = FindOrInsertHubFollowPoint(
+				Spline,
+				OldAnchor,
+				Arm.IntersectDistanceS,
+				Arm.bThroughArm);
+			if (PointIndex == INDEX_NONE)
+			{
+				continue;
+			}
+
+			const FVector World = Spline->GetLocationAtSplinePoint(PointIndex, ESplineCoordinateSpace::World);
+			Spline->SetLocationAtSplinePoint(
+				PointIndex,
+				World + DeltaXY,
+				ESplineCoordinateSpace::World,
+				false);
+			Spline->UpdateSpline();
+			MovedSplines.Add(Spline);
+		}
+
+		SyncArmIntersectSFromAnchor(NewAnchor);
+	}
+
 	UE_LOG(
 		LogTemp,
 		Log,
-		TEXT("[JunctionMove] anchor %s Z %.1f → %.1f"),
+		TEXT("[JunctionMove] anchor %s XY %.1f,%.1f → %.1f,%.1f Z %.1f → %.1f"),
 		*GetName(),
+		OldAnchor.X,
+		OldAnchor.Y,
+		NewAnchor.X,
+		NewAnchor.Y,
 		OldAnchor.Z,
 		NewAnchor.Z);
 }
@@ -2526,10 +2675,21 @@ void AMoKuEditIntersectionActor::RecookFromLinkedRoads()
 	}
 
 	// Cover path refreshes linked roads once — avoid double RefreshArmMesh (卡).
-	UMetaLandRoadEditorMode::RecookJunctionActorStatic(this, /*bRefreshLinkedRoadMeshes=*/false);
+#if WITH_EDITOR
+	if (FMetaLandRoadEditorHooks::RecookJunction)
+	{
+		FMetaLandRoadEditorHooks::RecookJunction(this, /*bRefreshLinkedRoads=*/false);
+	}
+#endif
 }
 
 #if WITH_EDITOR
+void AMoKuEditIntersectionActor::PostEditUndo()
+{
+	Super::PostEditUndo();
+	MetaLandRoadProfile::NotifyUndoDerivedMeshDirty(this);
+}
+
 void AMoKuEditIntersectionActor::PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent)
 {
 	Super::PostEditChangeProperty(PropertyChangedEvent);
@@ -2568,29 +2728,33 @@ void AMoKuEditIntersectionActor::PostEditMove(bool bFinished)
 		return;
 	}
 
+	const FVector Now = GetActorLocation();
 	if (!bJunctionAuthoringDrag)
 	{
 		bJunctionAuthoringDrag = true;
 		JunctionDragStartAnchor = JunctionData->JunctionNode.AnchorWorld.IsNearlyZero()
-			? GetActorLocation()
+			? Now
 			: JunctionData->JunctionNode.AnchorWorld;
+		JunctionDragLastAnchor = JunctionDragStartAnchor;
 	}
-	JunctionData->JunctionNode.AnchorWorld = GetActorLocation();
-	RefreshLinkedRoadMeshesForAuthoring();
+	JunctionData->JunctionNode.AnchorWorld = Now;
 
 	if (bFinished)
 	{
-		ApplyAuthoringAnchorDelta(JunctionDragStartAnchor, GetActorLocation());
+		ApplyAuthoringAnchorDelta(JunctionDragStartAnchor, Now);
+		SyncArmIntersectSFromAnchor(Now);
 		bJunctionAuthoringDrag = false;
-		bHoldCoverAfterAuthoringMove = true;
+		JunctionDragLastAnchor = Now;
 		ApplyJunctionTerrainDefaultsIfSeed();
-		NotifyLandscapeBrushChanged(/*bShape=*/true, /*bWeight=*/true, /*bUser=*/true);
+		RecookFromLinkedRoads();
 		UE_LOG(
 			LogTemp,
 			Log,
-			TEXT("[JunctionMove] commit %s hubZ=%.1f linked=%d"),
+			TEXT("[JunctionMove] commit %s hubXY=%.1f,%.1f hubZ=%.1f linked=%d"),
 			*GetName(),
-			GetActorLocation().Z,
+			Now.X,
+			Now.Y,
+			Now.Z,
 			JunctionData->LinkedRoadActors.Num());
 	}
 }
@@ -2605,12 +2769,12 @@ void AMoKuEditIntersectionActor::EditorApplyTranslation(
 	{
 		bJunctionAuthoringDrag = true;
 		JunctionDragStartAnchor = GetActorLocation();
+		JunctionDragLastAnchor = JunctionDragStartAnchor;
 	}
 	Super::EditorApplyTranslation(DeltaTranslation, bAltDown, bShiftDown, bCtrlDown);
 	if (JunctionData)
 	{
 		JunctionData->JunctionNode.AnchorWorld = GetActorLocation();
-		RefreshLinkedRoadMeshesForAuthoring();
 	}
 }
 #endif

@@ -1,9 +1,9 @@
 #include "MetaLandRoadSplineComponent.h"
-#include "MetaLandRoadLaneVisualization.h"
-#include "MetaLandRoadLaneEditPick.h"
+#include "MetaLandRoadTypes.h"
 #include "MetaLandRoadProfile.h"
 #include "MetaLandRoadModule.h"
 #include "MoKuEditSplineActor.h"
+#include "MoKuEditSplinesComponent.h"
 #include "MoKuEditIntersectionActor.h"
 #include "Components/LineBatchComponent.h"
 #include "SceneManagement.h"
@@ -23,6 +23,673 @@ static FVector FlattenHorizontalRight(const FVector& Right)
 	}
 	return Flat;
 }
+
+static FVector HorizontalRightFromTravel(const FVector& Travel)
+{
+	return FlattenHorizontalRight(FVector::CrossProduct(FVector::UpVector, Travel));
+}
+
+#if 0
+static FVector HorizontalRightFromTravel(const FVector& Travel)
+{
+	return FlattenHorizontalRight(FVector::CrossProduct(FVector::UpVector, Travel));
+}
+
+static bool IntersectOffsetLines2D(
+	const FVector& Center,
+	const FVector& InDir,
+	const FVector& OutDir,
+	double Offset,
+	FVector& OutMiter)
+{
+	const FVector RightIn = HorizontalRightFromTravel(InDir);
+	const FVector RightOut = HorizontalRightFromTravel(OutDir);
+	const double A11 = InDir.X;
+	const double A12 = -OutDir.X;
+	const double A21 = InDir.Y;
+	const double A22 = -OutDir.Y;
+	const double Det = A11 * A22 - A12 * A21;
+	if (FMath::Abs(Det) < 1.0e-8)
+	{
+		return false;
+	}
+
+	const double Bx = (RightOut.X - RightIn.X) * Offset;
+	const double By = (RightOut.Y - RightIn.Y) * Offset;
+	const double T = (Bx * A22 - A12 * By) / Det;
+	OutMiter = Center + RightIn * Offset + InDir * T;
+	OutMiter.Z = Center.Z;
+	return true;
+}
+
+/** Sweep offset of one authored-center sample. PathCenter stays on the spline. */
+static FVector SweepRailPoint(
+	const FVector& PrevCenter,
+	const FVector& Center,
+	const FVector& NextCenter,
+	double Off,
+	const FVector& FallbackRight,
+	double HalfW)
+{
+	FVector InDir = (Center - PrevCenter).GetSafeNormal2D();
+	FVector OutDir = (NextCenter - Center).GetSafeNormal2D();
+	if (InDir.IsNearlyZero())
+	{
+		InDir = OutDir;
+	}
+	if (OutDir.IsNearlyZero())
+	{
+		OutDir = InDir;
+	}
+	FVector Right = HorizontalRightFromTravel((InDir + OutDir).GetSafeNormal2D());
+	if (Right.IsNearlyZero())
+	{
+		Right = FallbackRight;
+	}
+	if (!FallbackRight.IsNearlyZero() && FVector::DotProduct(Right, FallbackRight) < 0.0)
+	{
+		Right = -Right;
+	}
+
+	if (InDir.IsNearlyZero() && OutDir.IsNearlyZero())
+	{
+		return Center + Right * Off;
+	}
+
+	const double Cross = InDir.X * OutDir.Y - InDir.Y * OutDir.X;
+	const double Turn = FMath::Acos(FMath::Clamp(FVector::DotProduct(InDir, OutDir), -1.0, 1.0));
+	const bool bInner = (Off * Cross) < 0.0;
+	double UseOff = Off;
+	if (bInner && Turn > 1.0e-3)
+	{
+		const double Chord = FVector::Dist2D(PrevCenter, NextCenter);
+		const double SinTurn = FMath::Sin(Turn);
+		const double Radius = (SinTurn > 1.0e-6 && Chord > 1.0)
+			? (Chord / (2.0 * SinTurn))
+			: 0.0;
+		const double MinKeep = FMath::Max(HalfW * 0.08, 25.0);
+		if (Radius > 1.0)
+		{
+			const double MaxInner = FMath::Max(Radius - MinKeep, MinKeep);
+			if (FMath::Abs(UseOff) > MaxInner)
+			{
+				UseOff = FMath::Sign(UseOff) * MaxInner;
+			}
+		}
+	}
+
+	FVector Miter = FVector::ZeroVector;
+	if (Turn > MetaLandRoad::CornerFilletSkipAngleRad
+		&& IntersectOffsetLines2D(Center, InDir, OutDir, UseOff, Miter))
+	{
+		FVector Delta = Miter - Center;
+		Delta.Z = 0.0;
+		const FVector Side = Right * (UseOff >= 0.0 ? 1.0 : -1.0);
+		if (FVector::DotProduct(Delta, Side) < 0.0)
+		{
+			return Center + Right * UseOff;
+		}
+		const double MaxLen = FMath::Abs(UseOff) / FMath::Max(FMath::Sin(Turn * 0.5), 0.20);
+		if (Delta.Size2D() > MaxLen)
+		{
+			Delta = Delta.GetSafeNormal2D() * MaxLen;
+		}
+		FVector Out = Center;
+		Out.X += Delta.X;
+		Out.Y += Delta.Y;
+		Out.Z = Center.Z;
+		return Out;
+	}
+	return Center + Right * UseOff;
+}
+
+static void UncrossSweepRail(const TArray<FVector>& Centers, TArray<FVector>& Rails)
+{
+	if (Centers.Num() != Rails.Num() || Rails.Num() < 2)
+	{
+		return;
+	}
+	for (int32 i = 1; i < Rails.Num(); ++i)
+	{
+		FVector CenterMove = Centers[i] - Centers[i - 1];
+		CenterMove.Z = 0.0;
+		FVector RailMove = Rails[i] - Rails[i - 1];
+		RailMove.Z = 0.0;
+		if (CenterMove.SizeSquared2D() < 1.0)
+		{
+			continue;
+		}
+		if (FVector::DotProduct(RailMove, CenterMove) >= 0.0 && RailMove.SizeSquared2D() >= 0.25)
+		{
+			continue;
+		}
+		const FVector Step = CenterMove.GetSafeNormal2D() * FMath::Max(CenterMove.Size2D(), 1.0);
+		Rails[i] = Rails[i - 1] + Step;
+		Rails[i].Z = Centers[i].Z;
+	}
+}
+
+struct FCornerFillet
+{
+	double SEnter = 0.0;
+	double SLeave = 0.0;
+	FVector CircleCenter = FVector::ZeroVector;
+	FVector T1 = FVector::ZeroVector;
+	FVector T2 = FVector::ZeroVector;
+	FVector InDir = FVector::ForwardVector;
+	FVector OutDir = FVector::ForwardVector;
+	double Radius = 1.0;
+	double MinInnerRadius = 40.0;
+	double NeedAlong = 0.0;
+	double LeadFrac = 0.22;
+	double AngleEnter = 0.0;
+	double AngleLeave = 0.0;
+	FVector RightEnter = FVector::ZeroVector;
+	FVector RightLeave = FVector::ZeroVector;
+};
+
+static FVector EvalFilletHermitePoint(
+	const FVector& A,
+	const FVector& B,
+	const FVector& DirA,
+	const FVector& DirB,
+	double HandleA,
+	double HandleB,
+	double Alpha)
+{
+	const double T = FMath::Clamp(Alpha, 0.0, 1.0);
+	const double T2 = T * T;
+	const double T3 = T2 * T;
+	const FVector M0 = DirA * HandleA;
+	const FVector M1 = DirB * HandleB;
+	FVector Point = A * (2.0 * T3 - 3.0 * T2 + 1.0)
+		+ M0 * (T3 - 2.0 * T2 + T)
+		+ B * (-2.0 * T3 + 3.0 * T2)
+		+ M1 * (T3 - T2);
+	Point.Z = FMath::Lerp(A.Z, B.Z, static_cast<float>(T));
+	return Point;
+}
+
+static FVector EvalFilletHermiteTangent(
+	const FVector& A,
+	const FVector& B,
+	const FVector& DirA,
+	const FVector& DirB,
+	double HandleA,
+	double HandleB,
+	double Alpha)
+{
+	const double T = FMath::Clamp(Alpha, 0.0, 1.0);
+	const double T2 = T * T;
+	const FVector M0 = DirA * HandleA;
+	const FVector M1 = DirB * HandleB;
+	const FVector D = A * (6.0 * T2 - 6.0 * T)
+		+ M0 * (3.0 * T2 - 4.0 * T + 1.0)
+		+ B * (-6.0 * T2 + 6.0 * T)
+		+ M1 * (3.0 * T2 - 2.0 * T);
+	return D.GetSafeNormal2D();
+}
+
+static void EvalFilletCircleFrame(
+	const FCornerFillet& Fillet,
+	double CircleU,
+	FVector& OutCenter,
+	FVector& OutRight,
+	FVector* OutTangent = nullptr)
+{
+	const double U = FMath::Clamp(CircleU, 0.0, 1.0);
+	const double Ang = FMath::Lerp(Fillet.AngleEnter, Fillet.AngleLeave, U);
+	OutCenter = Fillet.CircleCenter
+		+ FVector(FMath::Cos(Ang), FMath::Sin(Ang), 0.0) * Fillet.Radius;
+	OutCenter.Z = FMath::Lerp(Fillet.T1.Z, Fillet.T2.Z, U);
+
+	FVector Tangent(-FMath::Sin(Ang), FMath::Cos(Ang), 0.0);
+	if (Fillet.AngleLeave < Fillet.AngleEnter)
+	{
+		Tangent = -Tangent;
+	}
+	if (OutTangent)
+	{
+		*OutTangent = Tangent.GetSafeNormal2D();
+	}
+	OutRight = HorizontalRightFromTravel(Tangent);
+	if (FVector::DotProduct(OutRight, Fillet.RightEnter) < 0.0)
+	{
+		OutRight = -OutRight;
+	}
+}
+#endif
+
+/** Layout half-width only. Must not call GetRoadEdgePointsAtS / EvalLanePosition. */
+static double LayoutHalfWidthAtS(const UMetaLandRoadSplineComponent* Spline, double S)
+{
+	if (!Spline || Spline->GetLaneSectionsNum() == 0)
+	{
+		return MetaLandRoad::DefaultRoadLaneWidth;
+	}
+
+	const FMetaLandRoadLayout& Layout = Spline->GetRoadLayout();
+	const int32 SectionIndex = Layout.FindSectionAtSOffset(S);
+	if (SectionIndex == INDEX_NONE)
+	{
+		return MetaLandRoad::DefaultRoadLaneWidth;
+	}
+
+	double HalfW = 0.0;
+	const int32 LeftSectionIndex = Layout.FindSideSection(SectionIndex, EMetaLandRoadLaneSectionSide::Left);
+	if (LeftSectionIndex != INDEX_NONE)
+	{
+		const FMetaLandRoadLaneSection& LeftSection = Spline->GetLaneSection(LeftSectionIndex);
+		if (!LeftSection.Left.IsEmpty())
+		{
+			HalfW = FMath::Max(
+				HalfW,
+				FMath::Abs(LeftSection.EvalLaneROffset(-LeftSection.Left.Num(), S, 1.0) + Spline->EvalROffset(S)));
+		}
+	}
+
+	const int32 RightSectionIndex = Layout.FindSideSection(SectionIndex, EMetaLandRoadLaneSectionSide::Right);
+	if (RightSectionIndex != INDEX_NONE)
+	{
+		const FMetaLandRoadLaneSection& RightSection = Spline->GetLaneSection(RightSectionIndex);
+		if (!RightSection.Right.IsEmpty())
+		{
+			HalfW = FMath::Max(
+				HalfW,
+				FMath::Abs(RightSection.EvalLaneROffset(RightSection.Right.Num(), S, 1.0) + Spline->EvalROffset(S)));
+		}
+	}
+
+	return FMath::Max(HalfW, 80.0);
+}
+
+/** Real CutS / trim-zone mouths only. Spline 0 / Length are caps, not body-corner bans. */
+static bool IsProtectedMouthStation(const UMetaLandRoadSplineComponent* Spline, double KeyS)
+{
+	if (!Spline)
+	{
+		return true;
+	}
+
+	auto NearCutS = [KeyS](double CutS)
+	{
+		return CutS >= 0.0 && FMath::Abs(KeyS - CutS) <= 80.0;
+	};
+
+	if (const AMoKuEditSplineActor* Road = Cast<AMoKuEditSplineActor>(Spline->GetOwner()))
+	{
+		if (NearCutS(Road->StartJunctionMeshTrimS) || NearCutS(Road->EndJunctionMeshTrimS))
+		{
+			return true;
+		}
+		for (const FMetaLandRoadJunctionTrimZone& Zone : Road->JunctionTrimZones)
+		{
+			if (NearCutS(Zone.ApproachCutS) || NearCutS(Zone.DepartCutS))
+			{
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+#if 0
+static bool FilletWindowHitsMouth(
+	const UMetaLandRoadSplineComponent* Spline,
+	double KeyS,
+	double NeedAlong)
+{
+	if (!Spline)
+	{
+		return true;
+	}
+
+	(void)NeedAlong;
+	return IsProtectedMouthStation(Spline, KeyS);
+}
+
+/** Longest NeedAlong that stays off spline ends and CutS. Preview does not own this. */
+static double MaxNeedAlongBeforeMouth(const UMetaLandRoadSplineComponent* Spline, double KeyS)
+{
+	if (!Spline)
+	{
+		return 0.0;
+	}
+
+	const double Length = Spline->GetSplineLength();
+	double Budget = FMath::Min(KeyS - 8.0, Length - 8.0 - KeyS);
+	auto LimitByCutS = [KeyS, &Budget](double CutS)
+	{
+		if (CutS >= 0.0)
+		{
+			Budget = FMath::Min(Budget, FMath::Abs(KeyS - CutS) - 40.0);
+		}
+	};
+
+	if (const AMoKuEditSplineActor* Road = Cast<AMoKuEditSplineActor>(Spline->GetOwner()))
+	{
+		LimitByCutS(Road->StartJunctionMeshTrimS);
+		LimitByCutS(Road->EndJunctionMeshTrimS);
+		for (const FMetaLandRoadJunctionTrimZone& Zone : Road->JunctionTrimZones)
+		{
+			LimitByCutS(Zone.ApproachCutS);
+			LimitByCutS(Zone.DepartCutS);
+		}
+		TArray<TPair<double, double>> Spans;
+		Road->GetJunctionMeshGenerationSpans(Spans);
+		for (const TPair<double, double>& Span : Spans)
+		{
+			LimitByCutS(Span.Key);
+			LimitByCutS(Span.Value);
+		}
+	}
+	return FMath::Max(Budget, 0.0);
+}
+#endif
+
+static bool IsCutSStation(const UMetaLandRoadSplineComponent* Spline, double S)
+{
+	if (!Spline)
+	{
+		return false;
+	}
+	const double Length = Spline->GetSplineLength();
+	const double TipW = MetaLandRoad::CutSAlignWindowCm;
+	if (S <= TipW || S >= Length - TipW)
+	{
+		return true;
+	}
+	auto Near = [S](double CutS)
+	{
+		return CutS >= 0.0 && FMath::Abs(S - CutS) <= MetaLandRoad::CutSAlignWindowCm;
+	};
+	if (const AMoKuEditSplineActor* Road = Cast<AMoKuEditSplineActor>(Spline->GetOwner()))
+	{
+		if (Near(Road->StartJunctionMeshTrimS) || Near(Road->EndJunctionMeshTrimS))
+		{
+			return true;
+		}
+		for (const FMetaLandRoadJunctionTrimZone& Zone : Road->JunctionTrimZones)
+		{
+			if (Near(Zone.ApproachCutS) || Near(Zone.DepartCutS))
+			{
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+#if 0
+static bool TryEvalFilletFrame(
+	const TArray<FCornerFillet>& Fillets,
+	double S,
+	FVector& OutCenter,
+	FVector& OutRight)
+{
+	for (const FCornerFillet& Fillet : Fillets)
+	{
+		if (S < Fillet.SEnter || S > Fillet.SLeave)
+		{
+			continue;
+		}
+
+		const double Span = FMath::Max(Fillet.SLeave - Fillet.SEnter, 1.0);
+		const double U = FMath::Clamp((S - Fillet.SEnter) / Span, 0.0, 1.0);
+		if (U <= 0.02)
+		{
+			OutCenter = Fillet.T1;
+			OutRight = Fillet.RightEnter;
+			return true;
+		}
+		if (U >= 0.98)
+		{
+			OutCenter = Fillet.T2;
+			OutRight = Fillet.RightLeave.IsNearlyZero() ? Fillet.RightEnter : Fillet.RightLeave;
+			return true;
+		}
+
+		const double Lead = FMath::Clamp(Fillet.LeadFrac, 0.12, 0.46);
+		const double HandleExtend = FMath::Max(Fillet.NeedAlong * Lead * 1.45, Fillet.Radius * Lead * 1.2);
+		const double HandleArrive = FMath::Max(Fillet.NeedAlong * Lead * 0.70, Fillet.Radius * Lead * 0.65);
+		if (U < Lead)
+		{
+			FVector CirclePt = Fillet.T1;
+			FVector CircleRight = Fillet.RightEnter;
+			FVector CircleTan = Fillet.InDir;
+			EvalFilletCircleFrame(Fillet, Lead, CirclePt, CircleRight, &CircleTan);
+			const double Local = U / Lead;
+			OutCenter = EvalFilletHermitePoint(
+				Fillet.T1, CirclePt, Fillet.InDir, CircleTan, HandleExtend, HandleArrive, Local);
+			const FVector Travel = EvalFilletHermiteTangent(
+				Fillet.T1, CirclePt, Fillet.InDir, CircleTan, HandleExtend, HandleArrive, Local);
+			OutRight = HorizontalRightFromTravel(Travel.IsNearlyZero() ? Fillet.InDir : Travel);
+			if (FVector::DotProduct(OutRight, Fillet.RightEnter) < 0.0)
+			{
+				OutRight = -OutRight;
+			}
+			return true;
+		}
+		if (U > 1.0 - Lead)
+		{
+			FVector CirclePt = Fillet.T2;
+			FVector CircleRight = Fillet.RightLeave;
+			FVector CircleTan = Fillet.OutDir;
+			EvalFilletCircleFrame(Fillet, 1.0 - Lead, CirclePt, CircleRight, &CircleTan);
+			const double Local = (U - (1.0 - Lead)) / Lead;
+			OutCenter = EvalFilletHermitePoint(
+				CirclePt, Fillet.T2, CircleTan, Fillet.OutDir, HandleArrive, HandleExtend, Local);
+			const FVector Travel = EvalFilletHermiteTangent(
+				CirclePt, Fillet.T2, CircleTan, Fillet.OutDir, HandleArrive, HandleExtend, Local);
+			const FVector Prefer = Fillet.RightLeave.IsNearlyZero() ? Fillet.RightEnter : Fillet.RightLeave;
+			OutRight = HorizontalRightFromTravel(Travel.IsNearlyZero() ? Fillet.OutDir : Travel);
+			if (FVector::DotProduct(OutRight, Prefer) < 0.0)
+			{
+				OutRight = -OutRight;
+			}
+			return true;
+		}
+
+		const double CircleU = (U - Lead) / FMath::Max(1.0 - 2.0 * Lead, 0.08);
+		EvalFilletCircleFrame(Fillet, CircleU, OutCenter, OutRight);
+		return true;
+	}
+	return false;
+}
+
+/** Keep the offset rail on the path side of the fillet core. Crossing the center still has large Dist. */
+static FVector ClampOffsetToFilletInnerKeep(
+	const TArray<FCornerFillet>& Fillets,
+	double S,
+	const FVector& PathCenter,
+	const FVector& Point)
+{
+	FVector Out = Point;
+	for (const FCornerFillet& Fillet : Fillets)
+	{
+		if (S < Fillet.SEnter || S > Fillet.SLeave)
+		{
+			continue;
+		}
+
+		const double Span = FMath::Max(Fillet.SLeave - Fillet.SEnter, 1.0);
+		const double U = FMath::Clamp((S - Fillet.SEnter) / Span, 0.0, 1.0);
+		const double Lead = FMath::Clamp(Fillet.LeadFrac, 0.12, 0.46);
+		if (U < Lead || U > 1.0 - Lead)
+		{
+			return Out;
+		}
+
+		FVector Radial = PathCenter - Fillet.CircleCenter;
+		Radial.Z = 0.0;
+		if (Radial.SizeSquared2D() < 1.0)
+		{
+			Radial = FVector(FMath::Cos(Fillet.AngleEnter), FMath::Sin(Fillet.AngleEnter), 0.0);
+		}
+
+		FVector Delta = Out - Fillet.CircleCenter;
+		Delta.Z = 0.0;
+		const double MinR = FMath::Max(Fillet.MinInnerRadius, 40.0);
+		const bool bCrossedCore = FVector::DotProduct(Delta, Radial) < 0.0;
+		if (!bCrossedCore && Delta.Size2D() >= MinR)
+		{
+			return Out;
+		}
+
+		Delta = Radial.GetSafeNormal2D() * MinR;
+		Out.X = Fillet.CircleCenter.X + Delta.X;
+		Out.Y = Fillet.CircleCenter.Y + Delta.Y;
+		return Out;
+	}
+	return Out;
+}
+
+/** Parked: loft no longer replaces the authored centerline. Ask before deleting. */
+static thread_local int32 GCollectCornerFilletsDepth = 0;
+
+static void CollectCornerFillets(
+	const UMetaLandRoadSplineComponent* Spline,
+	double S0,
+	double S1,
+	ESplineCoordinateSpace::Type CoordinateSpace,
+	TArray<FCornerFillet>& OutFillets)
+{
+	OutFillets.Reset();
+	if (!Spline || GCollectCornerFilletsDepth > 0)
+	{
+		return;
+	}
+	TGuardValue<int32> DepthGuard(GCollectCornerFilletsDepth, 1);
+
+	const int32 NumPts = Spline->GetNumberOfSplinePoints();
+	if (NumPts < 3)
+	{
+		return;
+	}
+
+	const double SpanMin = FMath::Min(S0, S1);
+	const double SpanMax = FMath::Max(S0, S1);
+	for (int32 KeyIdx = 1; KeyIdx <= NumPts - 2; ++KeyIdx)
+	{
+		const double KeyS = Spline->GetDistanceAlongSplineAtSplinePoint(KeyIdx);
+		if (KeyS < SpanMin - 10.0 || KeyS > SpanMax + 10.0)
+		{
+			continue;
+		}
+		if (IsProtectedMouthStation(Spline, KeyS))
+		{
+			continue;
+		}
+
+		const FVector Prev = Spline->GetLocationAtSplinePoint(KeyIdx - 1, CoordinateSpace);
+		const FVector Cur = Spline->GetLocationAtSplinePoint(KeyIdx, CoordinateSpace);
+		const FVector Next = Spline->GetLocationAtSplinePoint(KeyIdx + 1, CoordinateSpace);
+		const FVector InDir = (Cur - Prev).GetSafeNormal2D();
+		const FVector OutDir = (Next - Cur).GetSafeNormal2D();
+		if (InDir.IsNearlyZero() || OutDir.IsNearlyZero())
+		{
+			continue;
+		}
+
+		const double Angle = FMath::Acos(FMath::Clamp(FVector::DotProduct(InDir, OutDir), -1.0, 1.0));
+		if (Angle < MetaLandRoad::CornerFilletSkipAngleRad || Angle > FMath::DegreesToRadians(170.0))
+		{
+			continue;
+		}
+
+		const double HalfW = LayoutHalfWidthAtS(Spline, KeyS);
+		const double TanHalf = FMath::Max(
+			FMath::Tan(FMath::Clamp(Angle * 0.5, 0.0, 1.15)),
+			0.08);
+		const double MouthBudget = MaxNeedAlongBeforeMouth(Spline, KeyS);
+		const double SegIn = FMath::Max(FVector::Dist2D(Prev, Cur), 1.0);
+		const double SegOut = FMath::Max(FVector::Dist2D(Cur, Next), 1.0);
+		const double NeedAlong = MetaLandRoad::CornerFilletNeedAlongFitCm(
+			HalfW,
+			Angle,
+			FMath::Min(SegIn, SegOut),
+			MouthBudget);
+		const double Radius = NeedAlong / TanHalf;
+		if (NeedAlong < 20.0)
+		{
+			continue;
+		}
+
+		FVector T1 = Cur - InDir * NeedAlong;
+		FVector T2 = Cur + OutDir * NeedAlong;
+		T1.Z = Cur.Z;
+		T2.Z = Cur.Z;
+
+		const bool bLeftTurn = (InDir.X * OutDir.Y - InDir.Y * OutDir.X) > 0.0;
+		const FVector RightIn = HorizontalRightFromTravel(InDir);
+		const FVector RightOut = HorizontalRightFromTravel(OutDir);
+		const FVector InwardIn = bLeftTurn ? -RightIn : RightIn;
+		const FVector InwardOut = bLeftTurn ? -RightOut : RightOut;
+		const FVector C1 = T1 + InwardIn * Radius;
+		const FVector C2 = T2 + InwardOut * Radius;
+		if (FVector::Dist2D(C1, C2) > 8.0)
+		{
+			continue;
+		}
+
+		FCornerFillet Fillet;
+		Fillet.CircleCenter = (C1 + C2) * 0.5;
+		Fillet.CircleCenter.Z = Cur.Z;
+		Fillet.T1 = T1;
+		Fillet.T2 = T2;
+		Fillet.InDir = InDir;
+		Fillet.OutDir = OutDir;
+		Fillet.Radius = Radius;
+		Fillet.NeedAlong = NeedAlong;
+		Fillet.LeadFrac = MetaLandRoad::CornerFilletLeadFrac(Angle);
+		Fillet.MinInnerRadius = (Radius > HalfW + 1.0)
+			? FMath::Max(Radius - HalfW, HalfW * TanHalf)
+			: FMath::Max(Radius * 0.15, 25.0);
+		const double WindowAlong = (MouthBudget > 1.0)
+			? FMath::Min(NeedAlong, MouthBudget)
+			: NeedAlong;
+		Fillet.SEnter = KeyS - WindowAlong;
+		Fillet.SLeave = KeyS + WindowAlong;
+		Fillet.RightEnter = RightIn;
+		Fillet.RightLeave = RightOut;
+		Fillet.AngleEnter = FMath::Atan2(T1.Y - Fillet.CircleCenter.Y, T1.X - Fillet.CircleCenter.X);
+		Fillet.AngleLeave = FMath::Atan2(T2.Y - Fillet.CircleCenter.Y, T2.X - Fillet.CircleCenter.X);
+		if (bLeftTurn)
+		{
+			while (Fillet.AngleLeave <= Fillet.AngleEnter)
+			{
+				Fillet.AngleLeave += 2.0 * PI;
+			}
+		}
+		else
+		{
+			while (Fillet.AngleLeave >= Fillet.AngleEnter)
+			{
+				Fillet.AngleLeave -= 2.0 * PI;
+			}
+		}
+		bool bOverlaps = false;
+		for (int32 Existing = 0; Existing < OutFillets.Num(); ++Existing)
+		{
+			const FCornerFillet& Other = OutFillets[Existing];
+			if (Fillet.SLeave < Other.SEnter + 8.0 || Fillet.SEnter > Other.SLeave - 8.0)
+			{
+				continue;
+			}
+			bOverlaps = true;
+			if ((Fillet.SLeave - Fillet.SEnter) > (Other.SLeave - Other.SEnter))
+			{
+				OutFillets[Existing] = Fillet;
+			}
+			break;
+		}
+		if (!bOverlaps)
+		{
+			OutFillets.Add(Fillet);
+		}
+	}
+}
+#endif
 
 static float SumFaceWidths(const TArray<float>& Widths)
 {
@@ -87,6 +754,32 @@ static FMetaLandRoadLane MakeBlendWidthLane(float StartW, float EndW, float Leng
 	const FKeyHandle H1 = Lane.Width.AddKey(FMath::Max(LengthCm, 1.0f), FMath::Max(EndW, 8.0f));
 	Lane.Width.SetKeyInterpMode(H1, ERichCurveInterpMode::RCIM_Linear);
 	return Lane;
+}
+
+static float SumLaneWidthsAtTime(const TArray<FMetaLandRoadLane>& Face, float Time)
+{
+	float Sum = 0.0f;
+	for (const FMetaLandRoadLane& Lane : Face)
+	{
+		Sum += FMath::Max(Lane.Width.Eval(Time), 1.0f);
+	}
+	return Sum;
+}
+
+static void WriteLaneBodyToTipWidth(
+	FMetaLandRoadLane& Lane,
+	float SectionLen,
+	float BodyW,
+	float TipW,
+	bool bTipAtStart)
+{
+	Lane.Width.Reset();
+	const float StartW = FMath::Max(bTipAtStart ? TipW : BodyW, 8.0f);
+	const float EndW = FMath::Max(bTipAtStart ? BodyW : TipW, 8.0f);
+	const FKeyHandle H0 = Lane.Width.AddKey(0.0f, StartW);
+	Lane.Width.SetKeyInterpMode(H0, ERichCurveInterpMode::RCIM_Linear);
+	const FKeyHandle H1 = Lane.Width.AddKey(FMath::Max(SectionLen, 1.0f), EndW);
+	Lane.Width.SetKeyInterpMode(H1, ERichCurveInterpMode::RCIM_Linear);
 }
 
 // =============================================================================
@@ -172,13 +865,13 @@ namespace MetaLandRoadLaneMeshPrivate
 	}
 
 	/**
-	 * Inner rail must share Outer ring S keys. Index-lerp of a separately adaptive
-	 * approximation puts Inner[i] at a different S than Outer[i] → fan/sliver quads
-	 * at section boundaries (orange-box dense band).
+	 * Inner rail shares Outer S and the same PathCenter (sweep frame).
+	 * Offset along the outer lateral so inner does not re-eval a raw V.
 	 */
 	static void BuildInnerRingMatchingOuterS(
 		UMetaLandRoadSplineComponent* Component,
 		int32 SectionIndex,
+		int32 OuterLaneIndex,
 		int32 InnerLaneIndex,
 		double InnerAlpha,
 		double S0,
@@ -204,13 +897,30 @@ namespace MetaLandRoadLaneMeshPrivate
 			{
 				S = S1;
 			}
-			OutInner[i].Position = Component->EvalLanePosition(
-				SectionIndex,
-				InnerLaneIndex,
-				S,
-				InnerAlpha,
-				ESplineCoordinateSpace::Local);
+
+			const double InnerOff = Component->GetLaneSection(SectionIndex).EvalLaneROffset(InnerLaneIndex, S, InnerAlpha)
+				+ Component->EvalROffset(S);
+			const double OuterOff = Component->GetLaneSection(SectionIndex).EvalLaneROffset(OuterLaneIndex, S, 1.0)
+				+ Component->EvalROffset(S);
+			FVector Lateral = OuterPoints[i].Position - OuterPoints[i].PathCenter;
+			Lateral.Z = 0.0;
+			if (Lateral.SizeSquared2D() <= 1.0 && i > 0)
+			{
+				Lateral = OutInner[i - 1].Position - OutInner[i - 1].PathCenter;
+				Lateral.Z = 0.0;
+			}
+			if (Lateral.SizeSquared2D() > 1.0 && FMath::Abs(OuterOff) > 1.0)
+			{
+				OutInner[i].Position = OuterPoints[i].PathCenter + Lateral * (InnerOff / OuterOff);
+				OutInner[i].Position.Z = OuterPoints[i].Position.Z;
+			}
+			else
+			{
+				OutInner[i].Position = OuterPoints[i].PathCenter;
+				OutInner[i].Position.Z = OuterPoints[i].Position.Z;
+			}
 			OutInner[i].SplineParam = Component->GetInputKeyValueAtDistanceAlongSpline(S);
+			OutInner[i].PathCenter = OuterPoints[i].PathCenter;
 		}
 	}
 
@@ -227,9 +937,27 @@ namespace MetaLandRoadLaneMeshPrivate
 			return;
 		}
 		const int32 Idx = bStart ? 0 : Points.Num() - 1;
-		Points[Idx].Position = Component->EvalLanePosition(
-			SectionIndex, LaneIndex, S, 1.0, ESplineCoordinateSpace::Local);
+		const FVector RawCenter = Component->GetLocationAtDistanceAlongSpline(
+			S, ESplineCoordinateSpace::Local);
+		if (FVector::Dist2D(RawCenter, Points[Idx].PathCenter) > 15.0)
+		{
+			return;
+		}
+		const FVector Center = RawCenter;
+		const FVector Right = FlattenHorizontalRight(
+			Component->GetRightVectorAtDistanceAlongSpline(S, ESplineCoordinateSpace::Local));
+		const int32 Sec = SectionIndex;
+		double Off = Component->EvalROffset(S);
+		if (Component->GetLaneSections().IsValidIndex(Sec)
+			&& LaneIndex != LANE_INDEX_NONE)
+		{
+			Off += Component->GetLaneSection(Sec).EvalLaneROffset(LaneIndex, S, 1.0);
+		}
 		Points[Idx].SplineParam = Component->GetInputKeyValueAtDistanceAlongSpline(S);
+		Points[Idx].PathCenter = Component->ApplyLinkedJunctionHeightToPosition(
+			Center, S, ESplineCoordinateSpace::Local);
+		Points[Idx].Position = Component->ApplyLinkedJunctionHeightToPosition(
+			Center + Right * Off, S, ESplineCoordinateSpace::Local);
 	}
 
 	bool BuildLaneRoadMesh(
@@ -309,11 +1037,9 @@ namespace MetaLandRoadLaneMeshPrivate
 		// so both sides face up in the preview mesh (MetaRoad SceneProxy uses a different facing).
 		for (int32 i = 0; i < N - 1; ++i)
 		{
-			// Drop needle/sliver quads: either ring collapsed → radiating crack tris.
-			constexpr double MinWidthSq = 1.0; // 1cm
 			const double InnerWidthSq = FVector::DistSquared(InnerSide[i].Position, OuterSide[i].Position);
 			const double NextInnerWidthSq = FVector::DistSquared(InnerSide[i + 1].Position, OuterSide[i + 1].Position);
-			if (InnerWidthSq < MinWidthSq || NextInnerWidthSq < MinWidthSq)
+			if (InnerWidthSq < 1.0e-4 && NextInnerWidthSq < 1.0e-4)
 			{
 				continue;
 			}
@@ -355,9 +1081,10 @@ namespace MetaLandRoadLaneMeshPrivate
 		TArray<FMetaLandRoadSplinePositionLinearApproximation> OuterPoints;
 		Component->BuildLinearApproximation(
 			OuterPoints,
-			[&Section, OuterLaneIndex, Component](double S)
+			[Component, SectionIndex, OuterLaneIndex](double S)
 			{
-				return Section.EvalLaneROffset(OuterLaneIndex, S, 1.0) + Component->EvalROffset(S);
+				return Component->GetLaneSection(SectionIndex).EvalLaneROffset(OuterLaneIndex, S, 1.0)
+					+ Component->EvalROffset(S);
 			},
 			S0,
 			S1,
@@ -377,6 +1104,7 @@ namespace MetaLandRoadLaneMeshPrivate
 		BuildInnerRingMatchingOuterS(
 			Component,
 			SectionIndex,
+			OuterLaneIndex,
 			InnerLaneIndex,
 			InnerAlpha,
 			S0,
@@ -427,26 +1155,19 @@ namespace MetaLandRoadLaneMeshPrivate
 			return;
 		}
 
-		int32 InnerLaneIndex = LANE_INDEX_NONE;
-		double InnerAlpha = 0.0;
-		for (int32 LaneArrayIndex = 0; LaneArrayIndex < Lanes.Num(); ++LaneArrayIndex)
-		{
-			const int32 OuterLaneIndex = LaneSign > 0 ? (LaneArrayIndex + 1) : -(LaneArrayIndex + 1);
-			AppendLaneMeshForSection(
-				Component,
-				LaneSectionIndex,
-				OuterLaneIndex,
-				InnerLaneIndex,
-				InnerAlpha,
-				S0,
-				S1,
-				MinNumSteps,
-				RoadHeightOffset,
-				bGenerateUVs,
-				OutMesh);
-			InnerLaneIndex = OuterLaneIndex;
-			InnerAlpha = 1.0;
-		}
+		const int32 OuterLaneIndex = LaneSign > 0 ? Lanes.Num() : -Lanes.Num();
+		AppendLaneMeshForSection(
+			Component,
+			LaneSectionIndex,
+			OuterLaneIndex,
+			LANE_INDEX_NONE,
+			0.0,
+			S0,
+			S1,
+			MinNumSteps,
+			RoadHeightOffset,
+			bGenerateUVs,
+			OutMesh);
 	}
 
 }
@@ -480,7 +1201,7 @@ UMetaLandRoadSplineComponent::UMetaLandRoadSplineComponent(const FObjectInitiali
 	: Super(ObjectInitializer)
 {
 	bHiddenInGame = true;
-	bDrawDebug = true;
+	bDrawDebug = false;
 
 	PredecessorConnection = CreateDefaultSubobject<UMetaLandRoadConnection>(TEXT("PredecessorConnection"));
 	SuccessorConnection = CreateDefaultSubobject<UMetaLandRoadConnection>(TEXT("SuccessorConnection"));
@@ -846,11 +1567,94 @@ void UMetaLandRoadSplineComponent::UpdateSpline()
 	UpdateAutoTangents();
 	Super::UpdateSpline();
 	UpdateLaneSectionBounds();
+	if (const UMoKuEditSplinesComponent* MoKu = Cast<UMoKuEditSplinesComponent>(this);
+		MoKu && MoKu->bDeferRoadMeshRefresh)
+	{
+		return;
+	}
 	RefreshLaneVisualization();
 #if WITH_EDITOR
 	// Spline changed while editing — redraw ComponentVisualizer PDI overlay.
 	RedrawNativeEditViewport(this);
 #endif
+}
+
+void UMetaLandRoadSplineComponent::UpdateSplineKeepTangents(bool bUpdateSectionBounds)
+{
+	FixUpSegments();
+	USplineComponent::UpdateSpline();
+	if (bUpdateSectionBounds)
+	{
+		UpdateLaneSectionBounds();
+	}
+}
+
+bool UMetaLandRoadSplineComponent::ApplyAngleAwareCornerTangent(
+	int32 PointIndex,
+	bool bUpdateSplineAfter,
+	int32* OutNetPointsAdded,
+	bool bAllowInsert)
+{
+	if (OutNetPointsAdded)
+	{
+		*OutNetPointsAdded = 0;
+	}
+
+	const int32 NumPts = GetNumberOfSplinePoints();
+	if (PointIndex <= 0 || PointIndex >= NumPts - 1)
+	{
+		return false;
+	}
+
+	const FVector Prev = GetLocationAtSplinePoint(PointIndex - 1, ESplineCoordinateSpace::World);
+	const FVector Cur = GetLocationAtSplinePoint(PointIndex, ESplineCoordinateSpace::World);
+	const FVector Next = GetLocationAtSplinePoint(PointIndex + 1, ESplineCoordinateSpace::World);
+	const FVector InDir = (Cur - Prev).GetSafeNormal2D();
+	const FVector OutDir = (Next - Cur).GetSafeNormal2D();
+	if (InDir.IsNearlyZero() || OutDir.IsNearlyZero())
+	{
+		return false;
+	}
+
+	const double Angle = FMath::Acos(FMath::Clamp(FVector::DotProduct(InDir, OutDir), -1.0, 1.0));
+	if (Angle < MetaLandRoad::CornerFilletSkipAngleRad)
+	{
+		if (GetSplinePointType(PointIndex) == ESplinePointType::Linear
+			|| GetSplinePointType(PointIndex) == ESplinePointType::Constant)
+		{
+			SetSplinePointType(PointIndex, ESplinePointType::Curve, false);
+			if (bUpdateSplineAfter)
+			{
+				UpdateSplineKeepTangents(/*bUpdateSectionBounds*/ false);
+			}
+			return true;
+		}
+		return false;
+	}
+	if (Angle > FMath::DegreesToRadians(170.0))
+	{
+		return false;
+	}
+
+	const double KeyS = GetDistanceAlongSplineAtSplinePoint(PointIndex);
+	if (IsProtectedMouthStation(this, KeyS)
+		|| !IsSplinePointOnDisplaySpan(PointIndex)
+		|| !IsSplinePointOnDisplaySpan(PointIndex - 1)
+		|| !IsSplinePointOnDisplaySpan(PointIndex + 1))
+	{
+		return false;
+	}
+
+	(void)bAllowInsert;
+	if (GetSplinePointType(PointIndex) != ESplinePointType::Curve)
+	{
+		SetSplinePointType(PointIndex, ESplinePointType::Curve, false);
+	}
+	if (bUpdateSplineAfter)
+	{
+		UpdateSplineKeepTangents(/*bUpdateSectionBounds*/ false);
+	}
+	return true;
 }
 
 float UMetaLandRoadSplineComponent::GetSplinePointInputKey(int32 PointIndex) const
@@ -860,6 +1664,26 @@ float UMetaLandRoadSplineComponent::GetSplinePointInputKey(int32 PointIndex) con
 		return 0.0f;
 	}
 	return SplineCurves.Position.Points[PointIndex].InVal;
+}
+
+bool UMetaLandRoadSplineComponent::IsSplinePointOnDisplaySpan(int32 PointIndex, double TolCm) const
+{
+	const AMoKuEditSplineActor* Road = Cast<AMoKuEditSplineActor>(GetOwner());
+	if (!Road || !SplineCurves.Position.Points.IsValidIndex(PointIndex))
+	{
+		return true;
+	}
+	return Road->ContainsJunctionMeshStation(
+		GetDistanceAlongSplineAtSplinePoint(PointIndex),
+		FMath::Max(TolCm, 1.0));
+}
+
+bool UMetaLandRoadSplineComponent::IsSplineSegmentOnDisplaySpan(int32 SegmentIndex, double TolCm) const
+{
+	const int32 NumPts = GetNumberOfSplinePoints();
+	const int32 I1 = IsClosedLoop() ? ((SegmentIndex + 1) % NumPts) : (SegmentIndex + 1);
+	return IsSplinePointOnDisplaySpan(SegmentIndex, TolCm)
+		&& IsSplinePointOnDisplaySpan(I1, TolCm);
 }
 
 void UMetaLandRoadSplineComponent::BuildCenterLineWorldPolyline(
@@ -874,22 +1698,29 @@ void UMetaLandRoadSplineComponent::BuildCenterLineWorldPolyline(
 		return;
 	}
 
-	const int32 Steps = FMath::Clamp(StepsPerSegment, 4, 64);
 	for (int32 Seg = 0; Seg < NumSeg; ++Seg)
 	{
 		const int32 I0 = Seg;
 		const int32 I1 = IsClosedLoop() ? ((Seg + 1) % NumPts) : (Seg + 1);
 		if (!SplineCurves.Position.Points.IsValidIndex(I0)
-			|| !SplineCurves.Position.Points.IsValidIndex(I1))
+			|| !SplineCurves.Position.Points.IsValidIndex(I1)
+			|| !IsSplineSegmentOnDisplaySpan(Seg))
 		{
 			continue;
 		}
 
+		const bool bLinearSeg =
+			GetSplinePointType(I0) == ESplinePointType::Linear
+			&& GetSplinePointType(I1) == ESplinePointType::Linear;
+		const int32 Steps = bLinearSeg ? 1 : FMath::Clamp(StepsPerSegment, 4, 64);
 		const float Key0 = GetSplinePointInputKey(I0);
 		const float Key1 = IsClosedLoop() && I1 == 0
 			? GetSplinePointInputKey(I0) + 1.0f
 			: GetSplinePointInputKey(I1);
-		const int32 StartStep = (Seg == 0) ? 0 : 1;
+		const bool bContinueChain = OutPoints.Num() > 0
+			&& Seg > 0
+			&& IsSplineSegmentOnDisplaySpan(Seg - 1);
+		const int32 StartStep = bContinueChain ? 1 : 0;
 		for (int32 Step = StartStep; Step <= Steps; ++Step)
 		{
 			const float Alpha = static_cast<float>(Step) / static_cast<float>(Steps);
@@ -925,19 +1756,37 @@ void UMetaLandRoadSplineComponent::DrawMainCenterLinePDI(
 		return;
 	}
 
-	TArray<FVector> Points;
-	BuildCenterLineWorldPolyline(Points, 32);
 	const FVector Raise(0.0f, 0.0f, GetMainCenterLineHeightOffset());
-	for (int32 PointIndex = 1; PointIndex < Points.Num(); ++PointIndex)
+	const int32 NumPts = GetNumberOfSplinePoints();
+	const int32 NumSeg = GetNumberOfSplineSegments();
+	for (int32 Seg = 0; Seg < NumSeg; ++Seg)
 	{
-		PDI->DrawLine(
-			Points[PointIndex - 1] + Raise,
-			Points[PointIndex] + Raise,
-			Color,
-			SDPG_Foreground,
-			Thickness,
-			0.0f,
-			true);
+		if (!IsSplineSegmentOnDisplaySpan(Seg))
+		{
+			continue;
+		}
+		const int32 I0 = Seg;
+		const int32 I1 = IsClosedLoop() ? ((Seg + 1) % NumPts) : (Seg + 1);
+		const bool bLinearSeg =
+			GetSplinePointType(I0) == ESplinePointType::Linear
+			&& GetSplinePointType(I1) == ESplinePointType::Linear;
+		const int32 Steps = bLinearSeg ? 1 : FMath::Clamp(32, 4, 64);
+		const float Key0 = GetSplinePointInputKey(I0);
+		const float Key1 = IsClosedLoop() && I1 == 0
+			? GetSplinePointInputKey(I0) + 1.0f
+			: GetSplinePointInputKey(I1);
+		FVector Prev = GetLocationAtSplinePoint(I0, ESplineCoordinateSpace::World) + Raise;
+		for (int32 Step = 1; Step <= Steps; ++Step)
+		{
+			const float Alpha = static_cast<float>(Step) / static_cast<float>(Steps);
+			const FVector Cur = ((Step == Steps)
+				? GetLocationAtSplinePoint(I1, ESplineCoordinateSpace::World)
+				: GetLocationAtSplineInputKey(
+					FMath::Lerp(Key0, Key1, Alpha), ESplineCoordinateSpace::World))
+				+ Raise;
+			PDI->DrawLine(Prev, Cur, Color, SDPG_Foreground, Thickness, 0.0f, true);
+			Prev = Cur;
+		}
 	}
 }
 
@@ -948,6 +1797,11 @@ void UMetaLandRoadSplineComponent::UpdateSpline(int32 EditingPointIndex)
 	UpdateAutoTangents(EditingPointIndex);
 	Super::UpdateSpline();
 	UpdateLaneSectionBounds();
+	if (const UMoKuEditSplinesComponent* MoKu = Cast<UMoKuEditSplinesComponent>(this);
+		MoKu && MoKu->bDeferRoadMeshRefresh)
+	{
+		return;
+	}
 	RefreshLaneVisualization();
 #if WITH_EDITOR
 	RedrawNativeEditViewport(this);
@@ -974,7 +1828,12 @@ void UMetaLandRoadSplineComponent::TrimLaneSections(double Tolerance)
 
 void UMetaLandRoadSplineComponent::RefreshLaneVisualization()
 {
-	MetaLandRoadLaneVisualization::RefreshLaneVisualization(this);
+#if WITH_EDITOR
+	if (FMetaLandRoadEditorHooks::RefreshLaneVisualization)
+	{
+		FMetaLandRoadEditorHooks::RefreshLaneVisualization(this);
+	}
+#endif
 }
 
 #if WITH_EDITOR
@@ -1230,7 +2089,7 @@ bool UMetaLandRoadSplineComponent::GetRoadCrossSectionPointsForLaneIndicesAtS(
 
 	auto ResolveSectionForLane = [this, HostSectionIndex](int32 LaneIndex) -> int32
 	{
-		const int32 Resolved = MetaLandRoadLaneVisualization::ResolveLaneSectionIndexForSpan(
+		const int32 Resolved = MetaLandRoad::ResolveLaneSectionIndexForSpan(
 			this, HostSectionIndex, LaneIndex);
 		return Resolved;
 	};
@@ -1359,9 +2218,6 @@ bool UMetaLandRoadSplineComponent::GenerateCombinedLaneDynamicMesh(
 		return false;
 	}
 
-	// Existing actors may still have Linear keys — convert before sampling mesh.
-	EnsureAllCurvePointTypesForSmoothCorners();
-
 	if (bGenerateUVs)
 	{
 		OutMesh.EnableVertexUVs(FVector2f::Zero());
@@ -1379,34 +2235,70 @@ bool UMetaLandRoadSplineComponent::GenerateCombinedLaneDynamicMesh(
 	{
 		RoadActor->GetJunctionMeshGenerationSpans(MeshSpans);
 	}
+	// Stamp already falls back to full length when MinKeep drops every span.
+	// Overlay also draws [0, Length]. Empty spans here left lane lines + terrain, no mesh.
 	if (MeshSpans.Num() == 0)
 	{
 		MeshSpans.Emplace(0.0, SplineLength);
 	}
 
+	if (MeshSpans.Num() > 1)
+	{
+		TArray<TPair<double, double>> MergedSpans;
+		MergedSpans.Add(MeshSpans[0]);
+		for (int32 SpanIdx = 1; SpanIdx < MeshSpans.Num(); ++SpanIdx)
+		{
+			if (MeshSpans[SpanIdx].Key <= MergedSpans.Last().Value + 1.0)
+			{
+				MergedSpans.Last().Value = FMath::Max(MergedSpans.Last().Value, MeshSpans[SpanIdx].Value);
+			}
+			else
+			{
+				MergedSpans.Add(MeshSpans[SpanIdx]);
+			}
+		}
+		MeshSpans = MoveTemp(MergedSpans);
+	}
+
 	/**
-	 * Aug2 baseline (ugit-stash/8fcbde9 Junction测试第三):
-	 * Independent face timelines — Left breaks only at Left/Both, Right at Right/Both.
+	 * Face loft breaks when this face's lane count changes (appear/disappear or
+	 * Both→Both add/remove). Empty opposite face still resolves via FindSideSection
+	 * after the break — adsorb / mouth CS are unchanged.
+	 * Zero-length L|R markers share S with the real span; they are not break hosts.
 	 */
-	auto CollectSideBreaks = [this](bool bLeftFace, double MeshSMin, double MeshSMax) -> TArray<double>
+	auto FaceLaneCount = [](const FMetaLandRoadLaneSection& Section, bool bLeftFace) -> int32
+	{
+		if (bLeftFace)
+		{
+			return MetaLandRoad::HasLeftSide(Section.Side) ? Section.Left.Num() : 0;
+		}
+		return MetaLandRoad::HasRightSide(Section.Side) ? Section.Right.Num() : 0;
+	};
+
+	auto CollectSideBreaks = [this, &FaceLaneCount](bool bLeftFace, double MeshSMin, double MeshSMax) -> TArray<double>
 	{
 		TArray<double> Breaks;
 		Breaks.Add(MeshSMin);
+		bool bHavePrevCount = false;
+		int32 PrevCount = 0;
 		for (int32 SectionIndex = 0; SectionIndex < GetLaneSectionsNum(); ++SectionIndex)
 		{
 			const FMetaLandRoadLaneSection& Section = GetLaneSection(SectionIndex);
-			if (Section.SOffset <= MeshSMin + KINDA_SMALL_NUMBER
-				|| Section.SOffset >= MeshSMax - KINDA_SMALL_NUMBER)
+			if (Section.SOffsetEnd_Cached <= Section.SOffset + KINDA_SMALL_NUMBER)
 			{
 				continue;
 			}
-			const bool bBreaksThisFace = bLeftFace
-				? MetaLandRoad::HasLeftSide(Section.Side)
-				: MetaLandRoad::HasRightSide(Section.Side);
-			if (bBreaksThisFace)
+
+			const int32 Count = FaceLaneCount(Section, bLeftFace);
+			if (bHavePrevCount
+				&& Count != PrevCount
+				&& Section.SOffset > MeshSMin + KINDA_SMALL_NUMBER
+				&& Section.SOffset < MeshSMax - KINDA_SMALL_NUMBER)
 			{
 				Breaks.Add(Section.SOffset);
 			}
+			PrevCount = Count;
+			bHavePrevCount = true;
 		}
 		Breaks.Add(MeshSMax);
 		Breaks.Sort();
@@ -1415,7 +2307,7 @@ bool UMetaLandRoadSplineComponent::GenerateCombinedLaneDynamicMesh(
 		Unique.Reserve(Breaks.Num());
 		for (double S : Breaks)
 		{
-			if (Unique.Num() == 0 || !FMath::IsNearlyEqual(Unique.Last(), S, KINDA_SMALL_NUMBER))
+			if (Unique.Num() == 0 || !FMath::IsNearlyEqual(Unique.Last(), S, 1.0))
 			{
 				Unique.Add(S);
 			}
@@ -1439,7 +2331,7 @@ bool UMetaLandRoadSplineComponent::GenerateCombinedLaneDynamicMesh(
 	{
 		const double MeshSMin = Span.Key;
 		const double MeshSMax = Span.Value;
-		if ((MeshSMax - MeshSMin) < KINDA_SMALL_NUMBER)
+		if ((MeshSMax - MeshSMin) < MetaLandRoad::MinKeepRoadSpanCm)
 		{
 			continue;
 		}
@@ -1452,10 +2344,7 @@ bool UMetaLandRoadSplineComponent::GenerateCombinedLaneDynamicMesh(
 			{
 				const double S0 = Breaks[BreakIdx];
 				const double S1 = Breaks[BreakIdx + 1];
-				// Tiny face spans + MinSteps → dense fan. Still keep the terminal span to
-				// MeshSMax so Left/Right asphalt tips both reach CutS (L/R section stagger).
-				const bool bTerminalToTip = FMath::IsNearlyEqual(S1, MeshSMax, 1.0);
-				if ((S1 - S0) < 10.0 && !bTerminalToTip)
+				if ((S1 - S0) < KINDA_SMALL_NUMBER)
 				{
 					continue;
 				}
@@ -1588,41 +2477,23 @@ int32 UMetaLandRoadSplineComponent::SplitSectionAtSplinePoint(int32 PointIndex, 
 
 int32 UMetaLandRoadSplineComponent::EditorAddLeftSection(float SplineKey)
 {
-	UE_LOG(LogTemp, Warning, TEXT("[MetaLandRoad] EditorAddLeftSection ENTER  SplineKey=%f  Sections=%d  SplineLength=%f"),
-		SplineKey,
-		GetLaneSectionsNum(),
-		GetSplineLength());
-	const int32 Result = SplitSection(SplineKey, EMetaLandRoadLaneSectionSide::Left);
-	UE_LOG(LogTemp, Warning, TEXT("[MetaLandRoad] EditorAddLeftSection EXIT   Result=%d"), Result);
-	return Result;
+	return SplitSection(SplineKey, EMetaLandRoadLaneSectionSide::Left);
 }
 
 int32 UMetaLandRoadSplineComponent::EditorAddRightSection(float SplineKey)
 {
-	UE_LOG(LogTemp, Warning, TEXT("[MetaLandRoad] EditorAddRightSection ENTER SplineKey=%f  Sections=%d  SplineLength=%f"),
-		SplineKey,
-		GetLaneSectionsNum(),
-		GetSplineLength());
-	const int32 Result = SplitSection(SplineKey, EMetaLandRoadLaneSectionSide::Right);
-	UE_LOG(LogTemp, Warning, TEXT("[MetaLandRoad] EditorAddRightSection EXIT  Result=%d"), Result);
-	return Result;
+	return SplitSection(SplineKey, EMetaLandRoadLaneSectionSide::Right);
 }
 
 int32 UMetaLandRoadSplineComponent::EditorAddLeftSectionAtDistanceAlongSpline(double DistanceAlongSpline)
 {
 	const float SplineKey = GetInputKeyValueAtDistanceAlongSpline(DistanceAlongSpline);
-	UE_LOG(LogTemp, Warning, TEXT("[MetaLandRoad] EditorAddLeftSectionAtDistanceAlongSpline  Distance=%f  SplineKey=%f"),
-		DistanceAlongSpline,
-		SplineKey);
 	return EditorAddLeftSection(SplineKey);
 }
 
 int32 UMetaLandRoadSplineComponent::EditorAddRightSectionAtDistanceAlongSpline(double DistanceAlongSpline)
 {
 	const float SplineKey = GetInputKeyValueAtDistanceAlongSpline(DistanceAlongSpline);
-	UE_LOG(LogTemp, Warning, TEXT("[MetaLandRoad] EditorAddRightSectionAtDistanceAlongSpline Distance=%f  SplineKey=%f"),
-		DistanceAlongSpline,
-		SplineKey);
 	return EditorAddRightSection(SplineKey);
 }
 
@@ -1800,7 +2671,7 @@ UMetaLandRoadSplineComponent::FMetaLandRoadLaneRange UMetaLandRoadSplineComponen
 		return Range;
 	}
 
-	const int32 LaneSectionIndex = MetaLandRoadLaneVisualization::ResolveLaneSectionIndexForSpan(
+	const int32 LaneSectionIndex = MetaLandRoad::ResolveLaneSectionIndexForSpan(
 		this, SectionIndex, LaneIndex);
 	if (LaneSectionIndex == INDEX_NONE || !RoadLayout.Sections.IsValidIndex(LaneSectionIndex))
 	{
@@ -1828,7 +2699,7 @@ bool UMetaLandRoadSplineComponent::BuildDrawAnchorForLaneMouth(
 	FMetaLandRoadDrawAnchor& OutAnchor) const
 {
 	OutAnchor = FMetaLandRoadDrawAnchor();
-	if (!MetaLandRoadLaneEditPick::IsLaneValidOnSpanSection(this, SpanSectionIndex, LaneIndex))
+	if (!MetaLandRoad::IsLaneValidOnSpanSection(this, SpanSectionIndex, LaneIndex))
 	{
 		return false;
 	}
@@ -1852,7 +2723,7 @@ bool UMetaLandRoadSplineComponent::EvalMouthTransform(
 		return false;
 	}
 
-	const int32 LaneSectionIndex = MetaLandRoadLaneVisualization::ResolveLaneSectionIndexForSpan(
+	const int32 LaneSectionIndex = MetaLandRoad::ResolveLaneSectionIndexForSpan(
 		this, Anchor.SectionIndex, Anchor.LaneIndex);
 	if (LaneSectionIndex == INDEX_NONE || !GetLaneSections().IsValidIndex(LaneSectionIndex))
 	{
@@ -1865,14 +2736,14 @@ bool UMetaLandRoadSplineComponent::EvalMouthTransform(
 	}
 
 	FMetaLandRoadDrawAnchor VisibleAnchor = Anchor;
-	VisibleAnchor.AnchorS = MetaLandRoadLaneEditPick::ClampMouthAnchorSToVisibleMesh(
+	VisibleAnchor.AnchorS = MetaLandRoad::ClampMouthAnchorSToVisibleMesh(
 		this, Anchor.AnchorS, Anchor.MouthSide);
 
 	FVector TipLeft;
 	FVector TipRight;
 	FVector TipCenter;
 	FVector OutwardTangent;
-	if (!MetaLandRoadLaneEditPick::ComputeAnchorMouthRailFrame(
+	if (!MetaLandRoad::ComputeAnchorMouthRailFrame(
 		this, VisibleAnchor, TipLeft, TipRight, TipCenter, OutwardTangent))
 	{
 		return false;
@@ -1906,7 +2777,7 @@ void UMetaLandRoadSplineComponent::FitSplineToAnchor(const FMetaLandRoadDrawAnch
 	FVector TipRight;
 	FVector TipCenter;
 	FVector OutwardTangent;
-	if (MetaLandRoadLaneEditPick::ComputeAnchorMouthRailFrame(
+	if (MetaLandRoad::ComputeAnchorMouthRailFrame(
 		SourceSpline, Anchor, TipLeft, TipRight, TipCenter, OutwardTangent))
 	{
 		MouthLoc = TipCenter;
@@ -2109,6 +2980,13 @@ bool UMetaLandRoadSplineComponent::BlendEndWidthToTargetMouth(
 	(void)SpanMode;
 	(void)BlendLengthCm;
 
+	// Native roads may already have authored multi-section widths (thin then thick).
+	// Collapsing to one Start→End blend is what turns 图二 into the 图一 blob.
+	if (GetLaneSectionsNum() > 1)
+	{
+		return false;
+	}
+
 	if (MinLaneCount <= 1)
 	{
 		// 2合1 / N合1：按最小车道=1 的中线切开，左右各 1 条，只混 width。
@@ -2126,70 +3004,150 @@ bool UMetaLandRoadSplineComponent::BlendEndWidthToTargetMouth(
 		UpdateRoadLayout();
 	}
 
-	const double LenFinal = GetSplineLength();
-	const float StartR = 0.0f;
-	const float EndR = 0.0f;
-
 	UpdateLaneSectionBounds();
 	UpdateSpline();
+	return true;
+}
 
-	FVector EndLeft = FVector::ZeroVector;
-	FVector EndRight = FVector::ZeroVector;
-	FVector EndCenter = FVector::ZeroVector;
-	FVector EndOut = FVector::ZeroVector;
-	const bool bHaveEndFrame = MetaLandRoadLaneEditPick::ComputeAnchorMouthRailFrame(
-		TargetSpline, TargetAnchor, EndLeft, EndRight, EndCenter, EndOut);
-	const FVector TipWorld = GetLocationAtSplinePoint(
-		GetNumberOfSplinePoints() - 1, ESplineCoordinateSpace::World);
-	const double TipHalf = GetRoadHalfWidthAtS(LenFinal);
-	const double TargetHalf = FVector::Dist2D(EndLeft, EndRight) * 0.5;
-	const double CenterErr = bHaveEndFrame ? FVector::Dist2D(TipWorld, EndCenter) : -1.0;
-	const double WidthErr = bHaveEndFrame ? FMath::Abs(TipHalf - TargetHalf) : -1.0;
-	UE_LOG(
-		LogTemp,
-		Warning,
-		TEXT("[MetaLandRoad] BlendEndWidth srcSum=%.1f tgtSum=%.1f lanes=%d startR=%.1f endR=%.1f tipHalf=%.1f tgtHalf=%.1f centerErr=%.1f widthErr=%.1f"),
-		SourceMouthSum,
-		TargetMouthWidthSum,
-		MinLaneCount,
-		StartR,
-		EndR,
-		TipHalf,
-		TargetHalf,
-		CenterErr,
-		WidthErr);
-	if (GEngine)
+void UMetaLandRoadSplineComponent::StretchTipSectionToSplineLength(bool bAttachAtSplineStart)
+{
+	TArray<FMetaLandRoadLaneSection>& Sections = GetLaneSectionsMutable();
+	if (Sections.Num() == 0)
 	{
-		GEngine->AddOnScreenDebugMessage(
-			991141,
-			6.0f,
-			(CenterErr > 40.0 || WidthErr > 40.0) ? FColor::Orange : FColor::Cyan,
-			FString::Printf(
-				TEXT("[MetaLandRoad] Blend %d→%d  centerErr=%.0fcm widthErr=%.0fcm (src=%.0f tgt=%.0f)"),
-				SourceLaneCount,
-				TargetLaneCount,
-				CenterErr,
-				WidthErr,
-				SourceMouthSum,
-				TargetMouthWidthSum));
+		return;
 	}
-	if (CenterErr > 40.0 || WidthErr > 40.0)
+
+	const double Len = GetSplineLength();
+	if (bAttachAtSplineStart)
 	{
-		UE_LOG(
-			LogTemp,
-			Error,
-			TEXT("[MetaLandRoad] BlendEndWidth mismatch: tip=%s targetCenter=%s tipHalf=%.1f tgtHalf=%.1f"),
-			*TipWorld.ToCompactString(),
-			*EndCenter.ToCompactString(),
-			TipHalf,
-			TargetHalf);
+		Sections[0].SOffset = 0.0;
+		Sections[0].SOffsetEnd_Cached = (Sections.Num() == 1) ? Len : Sections[1].SOffset;
 	}
+	else
+	{
+		if (Sections.Num() == 1)
+		{
+			Sections[0].SOffset = 0.0;
+		}
+		Sections.Last().SOffsetEnd_Cached = Len;
+	}
+}
+
+void UMetaLandRoadSplineComponent::IsolateTipSectionAtMouthS(double MouthS)
+{
+	TArray<FMetaLandRoadLaneSection>& Sections = GetLaneSectionsMutable();
+	if (Sections.Num() == 0)
+	{
+		return;
+	}
+
+	const double Len = GetSplineLength();
+	const double CutS = FMath::Clamp(MouthS, 10.0, FMath::Max(Len - 10.0, 10.0));
+	FMetaLandRoadLaneSection& Last = Sections.Last();
+	if (FMath::Abs(Last.SOffset - CutS) <= 25.0)
+	{
+		Last.SOffsetEnd_Cached = Len;
+		return;
+	}
+
+	Last.SOffsetEnd_Cached = CutS;
+	FMetaLandRoadLaneSection TipSection = Last;
+	TipSection.SOffset = CutS;
+	TipSection.SOffsetEnd_Cached = Len;
+	Sections.Add(MoveTemp(TipSection));
+}
+
+bool UMetaLandRoadSplineComponent::BlendTipSectionWidthToTargetMouth(
+	const FMetaLandRoadDrawAnchor& TargetAnchor,
+	bool bAttachAtSplineStart)
+{
+	UMetaLandRoadSplineComponent* TargetSpline = TargetAnchor.SourceSpline.Get();
+	if (!IsValid(TargetSpline) || !TargetAnchor.IsValid())
+	{
+		return false;
+	}
+
+	TArray<int32> TargetLaneIndices;
+	TArray<float> TargetLaneWidths;
+	if (!MetaLandRoadProfile::GetDrawAnchorBundleLaneWidths(
+		TargetSpline, TargetAnchor, TargetLaneIndices, TargetLaneWidths))
+	{
+		return false;
+	}
+
+	float TargetLeftSum = 0.0f;
+	float TargetRightSum = 0.0f;
+	for (int32 Index = 0; Index < TargetLaneIndices.Num(); ++Index)
+	{
+		const float W = FMath::Max(
+			TargetLaneWidths.IsValidIndex(Index) ? TargetLaneWidths[Index] : 1.0f,
+			1.0f);
+		if (TargetLaneIndices[Index] > 0)
+		{
+			TargetRightSum += W;
+		}
+		else if (TargetLaneIndices[Index] < 0)
+		{
+			TargetLeftSum += W;
+		}
+	}
+	const float TargetSum = FMath::Max(TargetLeftSum + TargetRightSum, 1.0f);
+
+	TArray<FMetaLandRoadLaneSection>& Sections = GetLaneSectionsMutable();
+	if (Sections.Num() == 0)
+	{
+		return false;
+	}
+
+	StretchTipSectionToSplineLength(bAttachAtSplineStart);
+	FMetaLandRoadLaneSection& Section = bAttachAtSplineStart ? Sections[0] : Sections.Last();
+	const float SectionLen = static_cast<float>(
+		FMath::Max(Section.SOffsetEnd_Cached - Section.SOffset, 1.0));
+	const float TipTime = bAttachAtSplineStart ? 0.0f : SectionLen;
+	const float BodyTime = bAttachAtSplineStart ? SectionLen : 0.0f;
+
+	const float SourceLeft = FMath::Max(SumLaneWidthsAtTime(Section.Left, TipTime), 1.0f);
+	const float SourceRight = FMath::Max(SumLaneWidthsAtTime(Section.Right, TipTime), 1.0f);
+	const float SourceSum = SourceLeft + SourceRight;
+	if (FMath::Abs(SourceSum - TargetSum) < 8.0f)
+	{
+		return true;
+	}
+
+	const float LeftScale = (TargetLeftSum > 1.0f && Section.Left.Num() > 0)
+		? (TargetLeftSum / SourceLeft)
+		: (TargetSum / SourceSum);
+	const float RightScale = (TargetRightSum > 1.0f && Section.Right.Num() > 0)
+		? (TargetRightSum / SourceRight)
+		: (TargetSum / SourceSum);
+
+	Modify();
+	for (FMetaLandRoadLane& Lane : Section.Left)
+	{
+		WriteLaneBodyToTipWidth(
+			Lane,
+			SectionLen,
+			Lane.Width.Eval(BodyTime),
+			Lane.Width.Eval(TipTime) * LeftScale,
+			bAttachAtSplineStart);
+	}
+	for (FMetaLandRoadLane& Lane : Section.Right)
+	{
+		WriteLaneBodyToTipWidth(
+			Lane,
+			SectionLen,
+			Lane.Width.Eval(BodyTime),
+			Lane.Width.Eval(TipTime) * RightScale,
+			bAttachAtSplineStart);
+	}
+
 	return true;
 }
 
 bool UMetaLandRoadSplineComponent::ConnectRoadToDrawAnchor(
 	const FMetaLandRoadDrawAnchor& SourceAnchor,
-	bool bAttachAtSplineStart)
+	bool bAttachAtSplineStart,
+	bool bRebuildLayouts)
 {
 	UMetaLandRoadSplineComponent* SourceSpline = SourceAnchor.SourceSpline.Get();
 	if (!IsValid(SourceSpline) || !SourceAnchor.IsValid() || SourceSpline == this)
@@ -2197,9 +3155,11 @@ bool UMetaLandRoadSplineComponent::ConnectRoadToDrawAnchor(
 		return false;
 	}
 
-	// Ensure lane Connection objects exist on the source.
-	SourceSpline->GetRoadLayoutMutable().UpdateLayout(SourceSpline);
-	GetRoadLayoutMutable().UpdateLayout(this);
+	if (bRebuildLayouts)
+	{
+		SourceSpline->GetRoadLayoutMutable().UpdateLayout(SourceSpline);
+		GetRoadLayoutMutable().UpdateLayout(this);
+	}
 
 	TArray<int32> SourceLaneIndices;
 	SourceLaneIndices.Add(SourceAnchor.LaneIndex);
@@ -2278,19 +3238,95 @@ bool UMetaLandRoadSplineComponent::ConnectRoadToDrawAnchor(
 		if (TryConnectLane(RoadConnection, SourceLaneConnection))
 		{
 			bAnyConnected = true;
-			UE_LOG(
-				LogTemp,
-				Log,
-				TEXT("[LaneAnchor] ConnectRoadToDrawAnchor Road=%s AttachStart=%d → SourceLane=%d Mouth=%s Connected=%d"),
-				*GetName(),
-				bAttachAtSplineStart ? 1 : 0,
-				SourceLaneIndex,
-				SourceAnchor.MouthSide == EMetaLandRoadMouthSide::End ? TEXT("End") : TEXT("Start"),
-				1);
 		}
 	}
 
 	return bAnyConnected;
+}
+
+#if 0
+static void AppendFilletSampleParams(
+	const UMetaLandRoadSplineComponent* Spline,
+	const TArray<FCornerFillet>& Fillets,
+	double S0,
+	double S1,
+	TArray<float>& InOutParams)
+{
+	if (!Spline || Fillets.Num() == 0)
+	{
+		return;
+	}
+
+	for (const FCornerFillet& Fillet : Fillets)
+	{
+		const double Win0 = FMath::Max(S0, Fillet.SEnter);
+		const double Win1 = FMath::Min(S1, Fillet.SLeave);
+		if (Win1 <= Win0 + 1.0)
+		{
+			continue;
+		}
+
+		const double SampleCm = FMath::Max(Fillet.Radius * 0.10, Fillet.MinInnerRadius * 0.20);
+		const int32 Extra = FMath::Clamp(FMath::CeilToInt((Win1 - Win0) / SampleCm), 8, 48);
+		for (int32 StepIndex = 0; StepIndex <= Extra; ++StepIndex)
+		{
+			const double S = FMath::Lerp(Win0, Win1, static_cast<double>(StepIndex) / static_cast<double>(Extra));
+			InOutParams.Add(Spline->GetInputKeyValueAtDistanceAlongSpline(S));
+		}
+	}
+}
+#endif
+
+static void AppendCornerKeySampleParams(
+	const UMetaLandRoadSplineComponent* Spline,
+	double S0,
+	double S1,
+	TArray<float>& InOutParams)
+{
+	if (!Spline)
+	{
+		return;
+	}
+	const int32 NumPts = Spline->GetNumberOfSplinePoints();
+	const double StepCm = FMath::Max(MetaLandRoad::DefaultMeshSampleCm * 0.35, 20.0);
+	for (int32 KeyIdx = 1; KeyIdx <= NumPts - 2; ++KeyIdx)
+	{
+		const double KeyS = Spline->GetDistanceAlongSplineAtSplinePoint(KeyIdx);
+		if (KeyS < S0 - 1.0 || KeyS > S1 + 1.0)
+		{
+			continue;
+		}
+		const FVector Prev = Spline->GetLocationAtSplinePoint(KeyIdx - 1, ESplineCoordinateSpace::Local);
+		const FVector Cur = Spline->GetLocationAtSplinePoint(KeyIdx, ESplineCoordinateSpace::Local);
+		const FVector Next = Spline->GetLocationAtSplinePoint(KeyIdx + 1, ESplineCoordinateSpace::Local);
+		const FVector InDir = (Cur - Prev).GetSafeNormal2D();
+		const FVector OutDir = (Next - Cur).GetSafeNormal2D();
+		if (InDir.IsNearlyZero() || OutDir.IsNearlyZero())
+		{
+			continue;
+		}
+		const double Angle = FMath::Acos(
+			FMath::Clamp(FVector::DotProduct(InDir, OutDir), -1.0, 1.0));
+		if (Angle < MetaLandRoad::CornerFilletSkipAngleRad)
+		{
+			continue;
+		}
+		const int32 Extra = Angle > FMath::DegreesToRadians(50.0) ? 8
+			: (Angle > FMath::DegreesToRadians(30.0) ? 5 : 2);
+		InOutParams.Add(Spline->GetInputKeyValueAtDistanceAlongSpline(KeyS));
+		for (int32 Step = 1; Step <= Extra; ++Step)
+		{
+			const double Delta = StepCm * static_cast<double>(Step);
+			if (KeyS - Delta >= S0)
+			{
+				InOutParams.Add(Spline->GetInputKeyValueAtDistanceAlongSpline(KeyS - Delta));
+			}
+			if (KeyS + Delta <= S1)
+			{
+				InOutParams.Add(Spline->GetInputKeyValueAtDistanceAlongSpline(KeyS + Delta));
+			}
+		}
+	}
 }
 
 void UMetaLandRoadSplineComponent::BuildLinearApproximation(
@@ -2312,41 +3348,219 @@ void UMetaLandRoadSplineComponent::BuildLinearApproximation(
 	}
 
 	const double SpanLenCm = FMath::Max(S1 - S0, KINDA_SMALL_NUMBER);
-	constexpr double TargetSampleCm = 90.0;
-	const int32 LengthBasedSteps = FMath::Max(2, FMath::CeilToInt(SpanLenCm / TargetSampleCm));
-	const int32 KeyBasedSteps = FMath::Max(
-		1,
-		static_cast<int32>((S1_Param - S0_Param) * InReparamStepsPerSegment + 0.5));
-	int32 NumStep = FMath::Max(KeyBasedSteps, LengthBasedSteps);
-	if (SpanLenCm >= static_cast<double>(MinNumSteps) * TargetSampleCm * 0.35)
-	{
-		NumStep = FMath::Max(NumStep, FMath::Min(MinNumSteps, LengthBasedSteps + 2));
-	}
-	NumStep = FMath::Max(NumStep, 2);
-	NumStep += EstimateCornerExtraSteps(S0_Param, S1_Param);
-	NumStep = FMath::Clamp(NumStep, 2, 96);
+	const double HalfW = LayoutHalfWidthAtS(this, (S0 + S1) * 0.5);
+	const double TargetSampleCm = MetaLandRoad::MeshRibbonStepCm(HalfW, /*RadiusCm=*/0.0);
+	int32 NumStep = FMath::Max(2, FMath::CeilToInt(SpanLenCm / TargetSampleCm));
+	NumStep = FMath::Clamp(NumStep, 2, MetaLandRoad::LeaveArriveSampleSegCap);
+	(void)InReparamStepsPerSegment;
+	(void)MinNumSteps;
 
-	const double Step = (S1_Param - S0_Param) / static_cast<double>(NumStep);
+	const bool bAlignStart = IsCutSStation(this, S0);
+	const bool bAlignEnd = IsCutSStation(this, S1);
+	const FVector StartRight = FlattenHorizontalRight(
+		GetRightVectorAtDistanceAlongSpline(S0, CoordinateSpace));
+	const FVector EndRight = FlattenHorizontalRight(
+		GetRightVectorAtDistanceAlongSpline(S1, CoordinateSpace));
+	const FVector StartTravel = GetTangentAtDistanceAlongSpline(S0, CoordinateSpace).GetSafeNormal2D();
+	const FVector EndTravel = GetTangentAtDistanceAlongSpline(S1, CoordinateSpace).GetSafeNormal2D();
+	const double AlignCm = FMath::Min(
+		LayoutHalfWidthAtS(this, (S0 + S1) * 0.5) * 0.05,
+		MetaLandRoad::MouthRightAlignCm);
+
+	TArray<float> Params;
+	Params.Reserve(NumStep + 64);
 	for (int32 i = 0; i <= NumStep; ++i)
 	{
-		const float Param = static_cast<float>(S0_Param + static_cast<double>(i) * Step);
+		const double SampleS = FMath::Lerp(S0, S1, static_cast<double>(i) / static_cast<double>(NumStep));
+		Params.Add(static_cast<float>(GetInputKeyValueAtDistanceAlongSpline(SampleS)));
+	}
+	AppendCornerKeySampleParams(this, S0, S1, Params);
+	for (int32 SectionIndex = 0; SectionIndex < GetLaneSectionsNum(); ++SectionIndex)
+	{
+		const double SectionS = GetLaneSection(SectionIndex).SOffset;
+		if (SectionS > S0 + 1.0 && SectionS < S1 - 1.0)
+		{
+			Params.Add(static_cast<float>(GetInputKeyValueAtDistanceAlongSpline(SectionS)));
+		}
+	}
+	Params.Sort();
+
+	TArray<float> UniqueParams;
+	UniqueParams.Reserve(Params.Num());
+	const float ParamEps = 0.002f;
+	for (float Param : Params)
+	{
+		Param = FMath::Clamp(Param, static_cast<float>(S0_Param), static_cast<float>(S1_Param));
+		if (UniqueParams.Num() == 0 || FMath::Abs(Param - UniqueParams.Last()) > ParamEps)
+		{
+			UniqueParams.Add(Param);
+		}
+	}
+
+	for (int32 Pass = 0; Pass < 3 && UniqueParams.Num() < MetaLandRoad::LeaveArriveSampleSegCap; ++Pass)
+	{
+		bool bGrew = false;
+		TArray<float> Refined;
+		Refined.Reserve(UniqueParams.Num() * 2);
+		Refined.Add(UniqueParams[0]);
+		for (int32 i = 1; i < UniqueParams.Num(); ++i)
+		{
+			const float P0 = Refined.Last();
+			const float P1 = UniqueParams[i];
+			const double SegS0 = GetDistanceAlongSplineAtSplineInputKey(P0);
+			const double SegS1 = GetDistanceAlongSplineAtSplineInputKey(P1);
+			const double SpanCm = SegS1 - SegS0;
+			const FVector T0 = GetTangentAtSplineInputKey(P0, CoordinateSpace).GetSafeNormal2D();
+			const FVector T1 = GetTangentAtSplineInputKey(P1, CoordinateSpace).GetSafeNormal2D();
+			const double Turn = FMath::Acos(FMath::Clamp(FVector::DotProduct(T0, T1), -1.0, 1.0));
+			const double RadiusCm = (Turn > 1.0e-4 && SpanCm > 1.0)
+				? (SpanCm / Turn)
+				: 0.0;
+			double NeedCm = MetaLandRoad::MeshRibbonStepCm(HalfW, RadiusCm);
+			if (RadiusCm > 1.0)
+			{
+				const double OuterStep = (RadiusCm + HalfW) * FMath::DegreesToRadians(5.0);
+				NeedCm = FMath::Min(NeedCm, FMath::Max(OuterStep, HalfW * 0.08));
+			}
+			if (SpanCm > NeedCm * 1.15)
+			{
+				const int32 Cuts = FMath::Clamp(
+					FMath::CeilToInt(SpanCm / NeedCm) - 1,
+					1,
+					24);
+				for (int32 Cut = 1; Cut <= Cuts; ++Cut)
+				{
+					const double MidS = FMath::Lerp(
+						SegS0,
+						SegS1,
+						static_cast<double>(Cut) / static_cast<double>(Cuts + 1));
+					Refined.Add(static_cast<float>(GetInputKeyValueAtDistanceAlongSpline(MidS)));
+				}
+				bGrew = true;
+			}
+			Refined.Add(P1);
+		}
+		UniqueParams = MoveTemp(Refined);
+		if (!bGrew)
+		{
+			break;
+		}
+	}
+
+	struct FMeshSample
+	{
+		FVector Center = FVector::ZeroVector;
+		FVector Right = FVector::ZeroVector;
+		FVector Travel = FVector::ZeroVector;
+		double S = 0.0;
+		float Param = 0.0f;
+	};
+	TArray<FMeshSample> Samples;
+	Samples.Reserve(UniqueParams.Num());
+	for (const float Param : UniqueParams)
+	{
 		const double SampleS = GetDistanceAlongSplineAtSplineInputKey(Param);
-		const FVector Center = GetLocationAtSplineInputKey(Param, CoordinateSpace);
-		const FVector Right = FlattenHorizontalRight(
+		FVector Center = GetLocationAtSplineInputKey(Param, CoordinateSpace);
+		FVector Travel = GetTangentAtSplineInputKey(Param, CoordinateSpace).GetSafeNormal2D();
+		FVector Right = FlattenHorizontalRight(
 			GetRightVectorAtSplineInputKey(Param, CoordinateSpace));
-		const double RightOffset = RightOffsetFunc(SampleS);
-		FVector Point = ApplyLinkedJunctionHeightToPosition(
-			Center + Right * RightOffset,
-			SampleS,
-			CoordinateSpace);
-		OutPoints.Emplace(Point, Param);
+		if (Samples.Num() > 0 && FVector::DotProduct(Samples.Last().Right, Right) < 0.0)
+		{
+			Right = -Right;
+		}
+		if (bAlignStart && (SampleS - S0) < AlignCm
+			&& FVector::DotProduct(Travel, StartTravel) > 0.85)
+		{
+			const double U = FMath::Clamp(1.0 - (SampleS - S0) / AlignCm, 0.0, 1.0);
+			const double W = U * U * (3.0 - 2.0 * U);
+			FVector TipRight = StartRight;
+			if (FVector::DotProduct(TipRight, Right) < 0.0)
+			{
+				TipRight = -TipRight;
+			}
+			Right = FlattenHorizontalRight(FMath::Lerp(Right, TipRight, W));
+		}
+		if (bAlignEnd && (S1 - SampleS) < AlignCm
+			&& FVector::DotProduct(Travel, EndTravel) > 0.85)
+		{
+			const double U = FMath::Clamp(1.0 - (S1 - SampleS) / AlignCm, 0.0, 1.0);
+			const double W = U * U * (3.0 - 2.0 * U);
+			FVector TipRight = EndRight;
+			if (FVector::DotProduct(TipRight, Right) < 0.0)
+			{
+				TipRight = -TipRight;
+			}
+			Right = FlattenHorizontalRight(FMath::Lerp(Right, TipRight, W));
+		}
+		FMeshSample Sample;
+		Sample.Center = Center;
+		Sample.Right = Right;
+		Sample.Travel = Travel;
+		Sample.S = SampleS;
+		Sample.Param = Param;
+		Samples.Add(Sample);
+	}
+
+	for (int32 i = 0; i < Samples.Num(); ++i)
+	{
+		const FVector Prev = (i > 0) ? Samples[i - 1].Center : Samples[i].Center;
+		const FVector Next = (i + 1 < Samples.Num()) ? Samples[i + 1].Center : Samples[i].Center;
+		FVector Travel = (Next - Prev).GetSafeNormal2D();
+		if (Travel.IsNearlyZero())
+		{
+			Travel = Samples[i].Travel;
+		}
+		FVector Right = HorizontalRightFromTravel(Travel);
+		if (i > 0 && FVector::DotProduct(Samples[i - 1].Right, Right) < 0.0)
+		{
+			Right = -Right;
+		}
+		if (bAlignStart && (Samples[i].S - S0) < AlignCm
+			&& FVector::DotProduct(Travel, StartTravel) > 0.85)
+		{
+			const double U = FMath::Clamp(1.0 - (Samples[i].S - S0) / AlignCm, 0.0, 1.0);
+			const double W = U * U * (3.0 - 2.0 * U);
+			FVector TipRight = StartRight;
+			if (FVector::DotProduct(TipRight, Right) < 0.0)
+			{
+				TipRight = -TipRight;
+			}
+			Right = FlattenHorizontalRight(FMath::Lerp(Right, TipRight, W));
+		}
+		if (bAlignEnd && (S1 - Samples[i].S) < AlignCm
+			&& FVector::DotProduct(Travel, EndTravel) > 0.85)
+		{
+			const double U = FMath::Clamp(1.0 - (S1 - Samples[i].S) / AlignCm, 0.0, 1.0);
+			const double W = U * U * (3.0 - 2.0 * U);
+			FVector TipRight = EndRight;
+			if (FVector::DotProduct(TipRight, Right) < 0.0)
+			{
+				TipRight = -TipRight;
+			}
+			Right = FlattenHorizontalRight(FMath::Lerp(Right, TipRight, W));
+		}
+		Samples[i].Travel = Travel;
+		Samples[i].Right = Right;
+	}
+
+	for (int32 i = 0; i < Samples.Num(); ++i)
+	{
+		const FVector Right = Samples[i].Right;
+		const double Off = RightOffsetFunc(Samples[i].S);
+		const FVector OffsetPoint = Samples[i].Center + Right * Off;
+		OutPoints.Emplace(
+			ApplyLinkedJunctionHeightToPosition(OffsetPoint, Samples[i].S, CoordinateSpace),
+			Samples[i].Param);
+		OutPoints.Last().PathCenter = ApplyLinkedJunctionHeightToPosition(
+			Samples[i].Center, Samples[i].S, CoordinateSpace);
 	}
 }
 
 FVector UMetaLandRoadSplineComponent::EvalLanePosition(int SectionIndex, int LaneIndex, double S, double Alpha, ESplineCoordinateSpace::Type CoordinateSpace) const
 {
 	const float SParam = GetInputKeyValueAtDistanceAlongSpline(S);
-	const FVector Loc = GetLocationAtSplineInputKey(SParam, CoordinateSpace);
+	FVector Loc = GetLocationAtSplineInputKey(SParam, CoordinateSpace);
+	FVector RVector = FlattenHorizontalRight(GetRightVectorAtDistanceAlongSpline(S, CoordinateSpace));
 
 	double ROffset = EvalROffset(S);
 	if (LaneIndex != LANE_INDEX_NONE)
@@ -2356,184 +3570,79 @@ FVector UMetaLandRoadSplineComponent::EvalLanePosition(int SectionIndex, int Lan
 
 	const FMetaLandRoadLaneSection& Section = RoadLayout.Sections[SectionIndex];
 	(void)Section;
-	const FVector RVector = FlattenHorizontalRight(GetRightVectorAtDistanceAlongSpline(S, CoordinateSpace));
 	return ApplyLinkedJunctionHeightToPosition(Loc + RVector * ROffset, S, CoordinateSpace);
 }
 
-static void AppendLinkedJunctionHeightStations(
-	const AMoKuEditSplineActor* Road,
-	const AMoKuEditIntersectionActor* Junction,
-	const UMetaLandRoadSplineComponent* Spline,
-	TArray<double>& OutStations)
-{
-	if (!Road || !Junction)
-	{
-		return;
-	}
-	if (Road->StartOfJunction.Get() == Junction && Road->StartJunctionMeshTrimS >= 0.0)
-	{
-		OutStations.Add(Road->StartJunctionMeshTrimS);
-	}
-	if (Road->EndOfJunction.Get() == Junction && Road->EndJunctionMeshTrimS >= 0.0)
-	{
-		OutStations.Add(Road->EndJunctionMeshTrimS);
-	}
-	for (const FMetaLandRoadJunctionTrimZone& Zone : Road->JunctionTrimZones)
-	{
-		if (Zone.Junction.Get() != Junction)
-		{
-			continue;
-		}
-		if (Zone.ApproachCutS >= 0.0)
-		{
-			OutStations.Add(Zone.ApproachCutS);
-		}
-		if (Zone.DepartCutS >= 0.0)
-		{
-			OutStations.Add(Zone.DepartCutS);
-		}
-	}
-	if (Junction->JunctionData && Spline)
-	{
-		for (const FMetaLandRoadJunctionArmRef& Arm : Junction->JunctionData->JunctionNode.Arms)
-		{
-			if (Arm.Spline.Get() != Spline)
-			{
-				continue;
-			}
-			if (Arm.CutDistanceS >= 0.0)
-			{
-				OutStations.Add(Arm.CutDistanceS);
-			}
-			if (Arm.DepartCutS >= 0.0)
-			{
-				OutStations.Add(Arm.DepartCutS);
-			}
-		}
-	}
-
-	if (Spline)
-	{
-		TArray<TPair<double, double>> Spans;
-		Road->GetJunctionMeshGenerationSpans(Spans);
-		const FVector Hub = Junction->GetActorLocation();
-		double BestTipS = -1.0;
-		double BestDistSq = TNumericLimits<double>::Max();
-		for (const TPair<double, double>& Span : Spans)
-		{
-			const double Tips[2] = { Span.Key, Span.Value };
-			for (const double TipS : Tips)
-			{
-				const FVector Tip = Spline->GetLocationAtDistanceAlongSpline(
-					TipS,
-					ESplineCoordinateSpace::World);
-				const double DistSq = FVector::DistSquared2D(Tip, Hub);
-				if (DistSq < BestDistSq)
-				{
-					BestDistSq = DistSq;
-					BestTipS = TipS;
-				}
-			}
-		}
-		if (BestTipS >= 0.0)
-		{
-			OutStations.Add(BestTipS);
-		}
-	}
-}
-
-static float PerlinSmootherstep01(float T)
+static float JunctionHeightSmootherstep01(float T)
 {
 	T = FMath::Clamp(T, 0.0f, 1.0f);
 	return T * T * T * (T * (T * 6.0f - 15.0f) + 10.0f);
 }
 
-bool UMetaLandRoadSplineComponent::FindJunctionHeightBlendEndS(double MouthS, double& OutEndS) const
+static double ResolveJunctionHeightBlendCm(
+	const AMoKuEditIntersectionActor* Junction,
+	const UMetaLandRoadSplineComponent* Spline)
 {
-	const double Length = GetSplineLength();
-	if (Length <= 50.0)
+	if (!Junction)
 	{
-		return false;
+		return 0.0;
 	}
 
-	double AwaySign = 0.0;
-	if (const AMoKuEditSplineActor* Road = Cast<AMoKuEditSplineActor>(GetOwner()))
+	if (Junction->JunctionData)
 	{
-		TArray<TPair<double, double>> Spans;
-		Road->GetJunctionMeshGenerationSpans(Spans);
-		double BestMouthDist = TNumericLimits<double>::Max();
-		for (const TPair<double, double>& Span : Spans)
+		const FMetaLandRoadJunctionNode& Node = Junction->JunctionData->JunctionNode;
+		for (const FMetaLandRoadJunctionArmRef& Arm : Node.Arms)
 		{
-			const double DistKey = FMath::Abs(Span.Key - MouthS);
-			const double DistValue = FMath::Abs(Span.Value - MouthS);
-			if (DistValue <= DistKey && DistValue < BestMouthDist)
+			if (Arm.Spline.Get() == Spline && Arm.ForwardIndent > KINDA_SMALL_NUMBER)
 			{
-				BestMouthDist = DistValue;
-				AwaySign = -1.0;
-			}
-			else if (DistKey < BestMouthDist)
-			{
-				BestMouthDist = DistKey;
-				AwaySign = 1.0;
+				return Arm.ForwardIndent;
 			}
 		}
+		if (Node.ForwardIndent > KINDA_SMALL_NUMBER)
+		{
+			return Node.ForwardIndent;
+		}
 	}
-	if (FMath::IsNearlyZero(AwaySign))
+	return 600.0;
+}
+
+struct FJunctionHeightBlendMouth
+{
+	double MouthS = 0.0;
+	double BlendCm = 0.0;
+	double HubWorldZ = 0.0;
+};
+
+static void AddJunctionHeightBlendMouth(
+	TArray<FJunctionHeightBlendMouth>& OutMouths,
+	const AMoKuEditIntersectionActor* Junction,
+	const UMetaLandRoadSplineComponent* Spline,
+	double MouthS,
+	double SplineLength)
+{
+	if (!Junction || !Spline || MouthS < 0.0)
 	{
-		AwaySign = (MouthS > Length * 0.5) ? -1.0 : 1.0;
+		return;
 	}
 
-	auto Consider = [MouthS, AwaySign](double Candidate, double& InOutBest, double& InOutBestDelta) -> void
+	const double BlendCm = FMath::Clamp(
+		ResolveJunctionHeightBlendCm(Junction, Spline),
+		50.0,
+		FMath::Max(SplineLength, 50.0));
+	for (const FJunctionHeightBlendMouth& Existing : OutMouths)
 	{
-		const double Delta = (Candidate - MouthS) * AwaySign;
-		if (Delta < 100.0)
+		if (FMath::IsNearlyEqual(Existing.MouthS, MouthS, 5.0)
+			&& FMath::IsNearlyEqual(Existing.HubWorldZ, Junction->GetActorLocation().Z, 1.0))
 		{
 			return;
 		}
-		if (Delta < InOutBestDelta)
-		{
-			InOutBestDelta = Delta;
-			InOutBest = Candidate;
-		}
-	};
-
-	double BestS = -1.0;
-	double BestDelta = TNumericLimits<double>::Max();
-	for (int32 SectionIndex = 0; SectionIndex < GetLaneSectionsNum(); ++SectionIndex)
-	{
-		const FMetaLandRoadLaneSection& Section = GetLaneSection(SectionIndex);
-		const FMetaLandRoadLaneAttribute* Track = Section.FindAttribute(FMetaLandRoadAttributeRegistry::TypeLandscape);
-		if (!Track)
-		{
-			continue;
-		}
-		for (const FMetaLandRoadLaneAttributeKey& Key : Track->Keys)
-		{
-			Consider(Section.SOffset + Key.SOffset, BestS, BestDelta);
-		}
-	}
-	if (BestS >= 0.0)
-	{
-		OutEndS = BestS;
-		return true;
 	}
 
-	const int32 PointCount = GetNumberOfSplinePoints();
-	for (int32 PointIndex = 0; PointIndex < PointCount; ++PointIndex)
-	{
-		Consider(
-			static_cast<double>(GetDistanceAlongSplineAtSplinePoint(PointIndex)),
-			BestS,
-			BestDelta);
-	}
-	if (BestS >= 0.0)
-	{
-		OutEndS = BestS;
-		return true;
-	}
-
-	OutEndS = FMath::Clamp(MouthS + AwaySign * 2500.0, 0.0, Length);
-	return FMath::Abs(OutEndS - MouthS) >= 100.0;
+	FJunctionHeightBlendMouth Mouth;
+	Mouth.MouthS = MouthS;
+	Mouth.BlendCm = BlendCm;
+	Mouth.HubWorldZ = Junction->GetActorLocation().Z;
+	OutMouths.Add(Mouth);
 }
 
 FVector UMetaLandRoadSplineComponent::ApplyLinkedJunctionHeightToPosition(
@@ -2547,84 +3656,51 @@ FVector UMetaLandRoadSplineComponent::ApplyLinkedJunctionHeightToPosition(
 		return Position;
 	}
 
-	TArray<AMoKuEditIntersectionActor*, TInlineAllocator<4>> Junctions;
-	if (AMoKuEditIntersectionActor* StartJunction = Road->StartOfJunction.Get())
-	{
-		Junctions.Add(StartJunction);
-	}
-	if (AMoKuEditIntersectionActor* EndJunction = Road->EndOfJunction.Get())
-	{
-		Junctions.AddUnique(EndJunction);
-	}
+	const double SplineLength = GetSplineLength();
+	TArray<FJunctionHeightBlendMouth> Mouths;
+	AddJunctionHeightBlendMouth(
+		Mouths, Road->StartOfJunction.Get(), this, Road->StartJunctionMeshTrimS, SplineLength);
+	AddJunctionHeightBlendMouth(
+		Mouths, Road->EndOfJunction.Get(), this, Road->EndJunctionMeshTrimS, SplineLength);
 	for (const FMetaLandRoadJunctionTrimZone& Zone : Road->JunctionTrimZones)
 	{
-		if (AMoKuEditIntersectionActor* ZoneJunction = Zone.Junction.Get())
-		{
-			Junctions.AddUnique(ZoneJunction);
-		}
+		AddJunctionHeightBlendMouth(Mouths, Zone.Junction.Get(), this, Zone.ApproachCutS, SplineLength);
+		AddJunctionHeightBlendMouth(Mouths, Zone.Junction.Get(), this, Zone.DepartCutS, SplineLength);
 	}
-	if (Junctions.Num() == 0)
+	if (Mouths.Num() == 0)
 	{
 		return Position;
 	}
 
-	FVector WorldPos = Position;
-	if (CoordinateSpace == ESplineCoordinateSpace::Local)
-	{
-		WorldPos = GetComponentTransform().TransformPosition(Position);
-	}
-
-	const double CenterlineZ = GetLocationAtDistanceAlongSpline(S, ESplineCoordinateSpace::World).Z;
-
 	float BestAlpha = 0.0f;
-	float TargetZ = static_cast<float>(CenterlineZ);
-	for (const AMoKuEditIntersectionActor* Junction : Junctions)
+	double BestHubZ = Position.Z;
+	for (const FJunctionHeightBlendMouth& Mouth : Mouths)
 	{
-		if (!Junction)
+		const double Dist = FMath::Abs(S - Mouth.MouthS);
+		if (Dist >= Mouth.BlendCm)
 		{
 			continue;
 		}
-		TArray<double> Stations;
-		AppendLinkedJunctionHeightStations(Road, Junction, this, Stations);
-		if (Stations.Num() == 0)
-		{
-			continue;
-		}
-		double DistToMouth = TNumericLimits<double>::Max();
-		double NearestMouthS = Stations[0];
-		for (const double Station : Stations)
-		{
-			const double Dist = FMath::Abs(S - Station);
-			if (Dist < DistToMouth)
-			{
-				DistToMouth = Dist;
-				NearestMouthS = Station;
-			}
-		}
-		double BlendEndS = NearestMouthS;
-		double BlendCm = 2500.0;
-		if (FindJunctionHeightBlendEndS(NearestMouthS, BlendEndS))
-		{
-			BlendCm = FMath::Max(400.0, FMath::Abs(BlendEndS - NearestMouthS));
-		}
-		const float Alpha = 1.0f - PerlinSmootherstep01(static_cast<float>(DistToMouth / BlendCm));
+		const float Alpha = JunctionHeightSmootherstep01(
+			static_cast<float>(1.0 - Dist / Mouth.BlendCm));
 		if (Alpha > BestAlpha)
 		{
 			BestAlpha = Alpha;
-			TargetZ = static_cast<float>(Junction->GetActorLocation().Z);
+			BestHubZ = Mouth.HubWorldZ;
 		}
 	}
-	if (BestAlpha > KINDA_SMALL_NUMBER)
+	if (BestAlpha <= KINDA_SMALL_NUMBER)
 	{
-		WorldPos.Z = FMath::Lerp(CenterlineZ, static_cast<double>(TargetZ), static_cast<double>(BestAlpha));
+		return Position;
 	}
 
-	if (CoordinateSpace == ESplineCoordinateSpace::Local)
-	{
-		const FVector WorldOnPlane(WorldPos.X, WorldPos.Y, WorldPos.Z);
-		return GetComponentTransform().InverseTransformPosition(WorldOnPlane);
-	}
-	return WorldPos;
+	FVector WorldPos = (CoordinateSpace == ESplineCoordinateSpace::World)
+		? Position
+		: GetComponentTransform().TransformPosition(Position);
+	WorldPos.Z = FMath::Lerp(WorldPos.Z, BestHubZ, static_cast<double>(BestAlpha));
+	return (CoordinateSpace == ESplineCoordinateSpace::World)
+		? WorldPos
+		: GetComponentTransform().InverseTransformPosition(WorldPos);
 }
 
 float UMetaLandRoadSplineComponent::ClosestKeyToSegment(float Key1, float Key2, const FVector& A1, const FVector& A2) const

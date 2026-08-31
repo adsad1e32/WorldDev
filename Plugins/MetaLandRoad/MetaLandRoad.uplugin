@@ -17,10 +17,14 @@
 	"Modules": [
 		{
 			"Name": "MetaLandRoad",
-			"Type": "Editor",
+			"Type": "Runtime",
 			"LoadingPhase": "PostConfigInit"
+		},
+		{
+			"Name": "MetaLandRoadEditor",
+			"Type": "Editor",
+			"LoadingPhase": "Default"
 		}
-
 	],
 	"Plugins": [
 		{
@@ -31,6 +35,5 @@
 			"Name": "Water",
 			"Enabled": true
 		}
-
 	]
 }

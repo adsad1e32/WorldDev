@@ -72,6 +72,19 @@ public:
 
 	virtual void UpdateSpline(int32 EditingPointIndex);
 
+	/** Reparam only. Does not rewrite committed tangents. */
+	void UpdateSplineKeepTangents(bool bUpdateSectionBounds = true);
+
+	/**
+	 * Body corners stay as authored. Loft sweeps this spline (Center + Right × Off).
+	 * Do not insert T1/T2 or rewrite handles to invent a second centerline.
+	 */
+	bool ApplyAngleAwareCornerTangent(
+		int32 PointIndex,
+		bool bUpdateSplineAfter = false,
+		int32* OutNetPointsAdded = nullptr,
+		bool bAllowInsert = false);
+
 	UFUNCTION(BlueprintCallable, Category = Road)
 	virtual void UpdateRoadLayout();
 
@@ -120,10 +133,8 @@ public:
 
 	FMetaLandRoadLaneRange GetLaneRange(int SectionIndex, int LaneIndex) const;
 	FVector EvalLanePosition(int SectionIndex, int LaneIndex, double S, double Alpha, ESplineCoordinateSpace::Type CoordinateSpace) const;
-	/** Lift a sample toward linked junction actor Z (mouth=1, fade to next marker). */
+	/** Road bed Z only: blend to hub plane over ForwardIndent (cut formula). Overlay still uses raw spline. */
 	FVector ApplyLinkedJunctionHeightToPosition(const FVector& Position, double S, ESplineCoordinateSpace::Type CoordinateSpace) const;
-	/** Next landscape key or spline point along the remaining road from MouthS. */
-	bool FindJunctionHeightBlendEndS(double MouthS, double& OutEndS) const;
 	float ClosestKeyToSegment(float Key1, float Key2, const FVector& A1, const FVector& A2) const;
 	float ClosestKeyToSegment2(float S1, float S2, const FVector& A1, const FVector& A2) const;
 
@@ -177,10 +188,10 @@ public:
 				const float AngleDeg = FMath::RadiansToDegrees(FMath::Acos(Dot));
 				if (AngleDeg > 12.0f)
 				{
-					Extra = AngleDeg > 45.0f ? 5 : (AngleDeg > 25.0f ? 4 : 3);
+					Extra = AngleDeg > 45.0f ? 8 : (AngleDeg > 25.0f ? 6 : 4);
 				}
 			}
-			return FMath::Clamp(Extra, 0, 6);
+			return FMath::Clamp(Extra, 0, 12);
 		}
 
 		const int32 KeyStart = FMath::Max(FMath::FloorToInt(static_cast<float>(S0Param)), 1);
@@ -200,33 +211,17 @@ public:
 			const float AngleDeg = FMath::RadiansToDegrees(FMath::Acos(Dot));
 			if (AngleDeg > 18.0f)
 			{
-				Extra = FMath::Max(Extra, AngleDeg > 50.0f ? 4 : (AngleDeg > 30.0f ? 3 : 2));
+				Extra = FMath::Max(Extra, AngleDeg > 50.0f ? 8 : (AngleDeg > 30.0f ? 5 : 3));
 			}
 		}
-		return FMath::Clamp(Extra, 0, 6);
+		return FMath::Clamp(Extra, 0, 12);
 	}
 
 	/** Convert Linear keys to Curve so bends subdivide instead of hard corners. */
 	void EnsureCurvePointTypesForSmoothCorners(const TArray<int32>& KeyIndices, bool bUpdateSplineAfter = true)
 	{
-		bool bChanged = false;
-		for (const int32 KeyIdx : KeyIndices)
-		{
-			if (KeyIdx < 0 || KeyIdx >= GetNumberOfSplinePoints())
-			{
-				continue;
-			}
-			if (GetSplinePointType(KeyIdx) == ESplinePointType::Linear
-				|| GetSplinePointType(KeyIdx) == ESplinePointType::Constant)
-			{
-				SetSplinePointType(KeyIdx, ESplinePointType::Curve, false);
-				bChanged = true;
-			}
-		}
-		if (bChanged && bUpdateSplineAfter)
-		{
-			UpdateSpline();
-		}
+		(void)KeyIndices;
+		(void)bUpdateSplineAfter;
 	}
 
 	void EnsureAllCurvePointTypesForSmoothCorners(bool bUpdateSplineAfter = true)
@@ -292,11 +287,15 @@ public:
 	UFUNCTION(BlueprintCallable, Category = Road)
 	void RefreshLaneVisualization();
 
-	/** Center-line polyline through every spline point (per-segment InputKey, not index-as-key). */
+	/** Center-line polyline on remaining-road spans only (hub-interior keys stay in data). */
 	void BuildCenterLineWorldPolyline(TArray<FVector>& OutPoints, int32 StepsPerSegment = 32) const;
 	float GetSplinePointInputKey(int32 PointIndex) const;
 	float GetMainCenterLineHeightOffset() const;
 	void DrawMainCenterLinePDI(FPrimitiveDrawInterface* PDI, const FLinearColor& Color, float Thickness) const;
+
+	/** Overlay / Alt+W: hub-interior keys are not display keys. */
+	bool IsSplinePointOnDisplaySpan(int32 PointIndex, double TolCm = 10.0) const;
+	bool IsSplineSegmentOnDisplaySpan(int32 SegmentIndex, double TolCm = 10.0) const;
 
 	bool EvalMouthTransform(const FMetaLandRoadDrawAnchor& Anchor, FTransform& OutTransform) const;
 
@@ -317,7 +316,10 @@ public:
 	 * MetaRoad FromConnection: Road Predecessor/Successor ↔ source Lane Successor/Predecessor.
 	 * Returns true if at least the primary lane link was written.
 	 */
-	bool ConnectRoadToDrawAnchor(const FMetaLandRoadDrawAnchor& SourceAnchor, bool bAttachAtSplineStart);
+	bool ConnectRoadToDrawAnchor(
+		const FMetaLandRoadDrawAnchor& SourceAnchor,
+		bool bAttachAtSplineStart,
+		bool bRebuildLayouts = true);
 
 	/**
 	 * [KEY-ALGO] Mouth-to-mouth blend. Min(N,M)==1 → Left[0]+Right[0] width mix, ROffset=0.
@@ -327,6 +329,17 @@ public:
 		const FMetaLandRoadDrawAnchor& TargetAnchor,
 		EMetaLandRoadEndWidthBlendSpan SpanMode = EMetaLandRoadEndWidthBlendSpan::LastTwoSegments,
 		double BlendLengthCm = 0.0);
+
+	/** Tail/head grow only. Does not move interior section S. */
+	void StretchTipSectionToSplineLength(bool bAttachAtSplineStart);
+
+	/** New last section starts at MouthS so width mix stays on the corner only. */
+	void IsolateTipSectionAtMouthS(double MouthS);
+
+	/** Mix only the tip section widths. Keeps other sections and ROffset. */
+	bool BlendTipSectionWidthToTargetMouth(
+		const FMetaLandRoadDrawAnchor& TargetAnchor,
+		bool bAttachAtSplineStart);
 
 protected:
 	void FixUpSegments();

@@ -19,6 +19,8 @@
 #include "MetaLandRoadProfile.h"
 #include "MetaLandRoadLaneAttribute.h"
 #include "MetaLandRoadPropSetting.h"
+#include "MetaLandRoadCurbEditor.h"
+#include "MetaLandRoadTypes.h"
 #include "ComponentVisualizers/MetaLandRoadSectionComponentVisualizer.h"
 #include "Widgets/Input/SButton.h"
 #include "Widgets/Input/SNumericEntryBox.h"
@@ -72,6 +74,8 @@ void FMetaLandRoadEditorModeToolkit::Init(const TSharedPtr<IToolkitHost>& InitTo
 		this, &FMetaLandRoadEditorModeToolkit::RefreshLandscapeKeyDetails);
 	FMetaLandRoadEditorModule::Get().PropSettingEditorRefresh.AddSP(
 		this, &FMetaLandRoadEditorModeToolkit::RefreshPropSettingDetails);
+	FMetaLandRoadEditorModule::Get().SidewalkEditorRefresh.AddSP(
+		this, &FMetaLandRoadEditorModeToolkit::RefreshSidewalkDetails);
 	ToolkitWidgetVBox->AddSlot().HAlign(HAlign_Fill).AutoHeight().Padding(0.0f, 0.0f, 0.0f, 8.0f)
 	[
 		BuildLandscapeAttributePanel()
@@ -173,6 +177,29 @@ UMetaLandRoadSplineComponent* FMetaLandRoadEditorModeToolkit::FindSelectedRoadSp
 		return nullptr;
 	}
 
+	if (FMetaLandRoadEditorModule::Get().ShouldDrawSidewalkOverlay())
+	{
+		if (UMetaLandRoadSplineComponent* Focus = FMetaLandRoadEditorModule::Get().GetSidewalkFocusSpline())
+		{
+			AActor* FocusOwner = Focus->GetOwner();
+			for (FSelectionIterator It(GEditor->GetSelectedActorIterator()); It; ++It)
+			{
+				if (*It == FocusOwner)
+				{
+					return Focus;
+				}
+				if (AMoKuEditIntersectionActor* Junction = Cast<AMoKuEditIntersectionActor>(*It))
+				{
+					if (Junction->JunctionData && Junction->JunctionData->LinkedRoadActors.Contains(
+						Cast<AMoKuEditSplineActor>(FocusOwner)))
+					{
+						return Focus;
+					}
+				}
+			}
+		}
+	}
+
 	for (FSelectionIterator It(GEditor->GetSelectedActorIterator()); It; ++It)
 	{
 		if (AMoKuEditSplineActor* Road = Cast<AMoKuEditSplineActor>(*It))
@@ -180,6 +207,19 @@ UMetaLandRoadSplineComponent* FMetaLandRoadEditorModeToolkit::FindSelectedRoadSp
 			if (UMetaLandRoadSplineComponent* Spline = Road->GetSplineComponent())
 			{
 				return Spline;
+			}
+		}
+		if (AMoKuEditIntersectionActor* Junction = Cast<AMoKuEditIntersectionActor>(*It))
+		{
+			if (Junction->JunctionData)
+			{
+				for (AMoKuEditSplineActor* Linked : Junction->JunctionData->LinkedRoadActors)
+				{
+					if (Linked && Linked->GetSplineComponent())
+					{
+						return Linked->GetSplineComponent();
+					}
+				}
 			}
 		}
 	}
@@ -368,7 +408,14 @@ void FMetaLandRoadEditorModeToolkit::NotifyPostChange(
 	FProperty* PropertyThatChanged)
 {
 	(void)PropertyThatChanged;
-	OnPropSettingDetailsFinished(PropertyChangedEvent);
+	if (FMetaLandRoadEditorModule::Get().IsPropSettingSelected())
+	{
+		OnPropSettingDetailsFinished(PropertyChangedEvent);
+	}
+	if (FMetaLandRoadEditorModule::Get().IsSidewalkSelected())
+	{
+		OnSidewalkDetailsFinished(PropertyChangedEvent);
+	}
 }
 
 void FMetaLandRoadEditorModeToolkit::OnPropSettingDetailsFinished(const FPropertyChangedEvent& PropertyChangedEvent)
@@ -388,6 +435,137 @@ void FMetaLandRoadEditorModeToolkit::OnPropSettingDetailsFinished(const FPropert
 		FMetaLandRoadEditorModule::Get().GetRoadComponentVisualizer())
 	{
 		RoadVis->SetSelectedPropSettingDetails(*EditData);
+	}
+}
+
+void FMetaLandRoadEditorModeToolkit::OnSidewalkAttributeClicked()
+{
+	FMetaLandRoadEditorModule& Module = FMetaLandRoadEditorModule::Get();
+	Module.EnterSidewalkOverlay();
+	OnSidewalkShowClicked();
+}
+
+void FMetaLandRoadEditorModeToolkit::OnSidewalkShowClicked()
+{
+	AActor* Selected = nullptr;
+	if (GEditor)
+	{
+		for (FSelectionIterator It(GEditor->GetSelectedActorIterator()); It; ++It)
+		{
+			if (AMoKuEditSplineActor* Road = Cast<AMoKuEditSplineActor>(*It))
+			{
+				Selected = Road;
+				break;
+			}
+			if (AMoKuEditIntersectionActor* Junction = Cast<AMoKuEditIntersectionActor>(*It))
+			{
+				Selected = Junction;
+				break;
+			}
+		}
+	}
+
+	FMetaLandRoadEditorModule& Module = FMetaLandRoadEditorModule::Get();
+	if (Selected)
+	{
+		Module.ShowSidewalkOverlayForActor(Selected);
+		return;
+	}
+
+	if (UMetaLandRoadSplineComponent* Spline = Module.GetActiveNativeEditSpline())
+	{
+		Module.ShowSidewalkOverlayForActor(Spline->GetOwner());
+	}
+}
+
+void FMetaLandRoadEditorModeToolkit::OnSidewalkHideClicked()
+{
+	FMetaLandRoadEditorModule::Get().DismissSidewalkOverlay();
+}
+
+void FMetaLandRoadEditorModeToolkit::OnSidewalkAddKeyClicked()
+{
+	if (UMetaLandRoadSplineComponent* Spline = FindSelectedRoadSpline())
+	{
+		const double S = Spline->GetSplineLength() * 0.5;
+		MetaLandRoadCurbEditor::AddCurbKeyAtS(Spline, S);
+		RefreshSidewalkDetails();
+	}
+}
+
+void FMetaLandRoadEditorModeToolkit::OnSidewalkDeleteKeyClicked()
+{
+	if (UMetaLandRoadSplineComponent* Spline = FindSelectedRoadSpline())
+	{
+		MetaLandRoadCurbEditor::RemoveSelectedCurbKey(Spline);
+		RefreshSidewalkDetails();
+	}
+}
+
+void FMetaLandRoadEditorModeToolkit::EnsureSidewalkDetailsView()
+{
+	if (SidewalkDetailsView.IsValid())
+	{
+		return;
+	}
+
+	FPropertyEditorModule& PropModule = FModuleManager::LoadModuleChecked<FPropertyEditorModule>("PropertyEditor");
+	FDetailsViewArgs DetailsArgs;
+	DetailsArgs.bAllowSearch = false;
+	DetailsArgs.bHideSelectionTip = true;
+	DetailsArgs.bShowScrollBar = false;
+	FStructureDetailsViewArgs StructArgs;
+	SidewalkEditStruct = MakeShared<FStructOnScope>(FMetaLandRoadSidewalkEditDetails::StaticStruct());
+	SidewalkDetailsView = PropModule.CreateStructureDetailView(
+		DetailsArgs,
+		StructArgs,
+		SidewalkEditStruct,
+		LOCTEXT("SidewalkStruct", "Sidewalk"));
+	SidewalkDetailsView->GetOnFinishedChangingPropertiesDelegate().AddSP(
+		this, &FMetaLandRoadEditorModeToolkit::OnSidewalkDetailsFinished);
+}
+
+void FMetaLandRoadEditorModeToolkit::RefreshSidewalkDetails()
+{
+	EnsureSidewalkDetailsView();
+	bRefreshingSidewalkDetails = true;
+	if (FMetaLandRoadSidewalkEditDetails* EditData = SidewalkEditStruct.IsValid()
+		? reinterpret_cast<FMetaLandRoadSidewalkEditDetails*>(SidewalkEditStruct->GetStructMemory())
+		: nullptr)
+	{
+		*EditData = FMetaLandRoadSidewalkEditDetails();
+		if (UMetaLandRoadSplineComponent* Spline = FindSelectedRoadSpline())
+		{
+			MetaLandRoadCurbEditor::GetSidewalkDetails(Spline, *EditData);
+		}
+	}
+	if (SidewalkDetailsView.IsValid())
+	{
+		SidewalkDetailsView->SetStructureData(SidewalkEditStruct);
+	}
+	bRefreshingSidewalkDetails = false;
+}
+
+void FMetaLandRoadEditorModeToolkit::OnSidewalkDetailsFinished(const FPropertyChangedEvent& PropertyChangedEvent)
+{
+	(void)PropertyChangedEvent;
+	if (bRefreshingSidewalkDetails || !SidewalkEditStruct.IsValid())
+	{
+		return;
+	}
+	const FMetaLandRoadSidewalkEditDetails* EditData =
+		reinterpret_cast<const FMetaLandRoadSidewalkEditDetails*>(SidewalkEditStruct->GetStructMemory());
+	if (!EditData)
+	{
+		return;
+	}
+	if (!GEditor)
+	{
+		return;
+	}
+	if (UMetaLandRoadSplineComponent* Spline = FindSelectedRoadSpline())
+	{
+		MetaLandRoadCurbEditor::SetSidewalkDetails(Spline, *EditData);
 	}
 }
 
@@ -594,6 +772,7 @@ TSharedRef<SWidget> FMetaLandRoadEditorModeToolkit::BuildLandscapeAttributePanel
 	EnsureLandscapeKeyDetailsView();
 	EnsureJunctionLandscapeDetailsView();
 	EnsurePropSettingDetailsView();
+	EnsureSidewalkDetailsView();
 
 	auto MatchesSearch = [this](const FText& DisplayName) -> bool
 	{
@@ -612,10 +791,11 @@ TSharedRef<SWidget> FMetaLandRoadEditorModeToolkit::BuildLandscapeAttributePanel
 		const FText CategoryText = FText::FromName(Desc.Category);
 		const bool bIsLandscape = TypeId == FMetaLandRoadAttributeRegistry::TypeLandscape;
 		const bool bIsPropSetting = TypeId == FMetaLandRoadAttributeRegistry::TypePropSetting;
-		const bool bRowEnabled = bIsLandscape || bIsPropSetting;
+		const bool bIsSidewalk = TypeId == FMetaLandRoadAttributeRegistry::TypeSidewalkHeight;
+		const bool bRowEnabled = bIsLandscape || bIsPropSetting || bIsSidewalk;
 		return SNew(SBorder)
 			.BorderImage(FAppStyle::GetBrush("WhiteBrush"))
-			.BorderBackgroundColor_Lambda([bIsLandscape, bIsPropSetting]()
+			.BorderBackgroundColor_Lambda([bIsLandscape, bIsPropSetting, bIsSidewalk]()
 			{
 				if (bIsLandscape && FMetaLandRoadEditorModule::Get().IsLandscapeAttributeSelected())
 				{
@@ -625,6 +805,10 @@ TSharedRef<SWidget> FMetaLandRoadEditorModeToolkit::BuildLandscapeAttributePanel
 				{
 					return FLinearColor(0.18f, 0.32f, 0.12f, 1.0f);
 				}
+				if (bIsSidewalk && FMetaLandRoadEditorModule::Get().IsSidewalkSelected())
+				{
+					return FLinearColor(0.28f, 0.18f, 0.08f, 1.0f);
+				}
 				return FLinearColor(0.0f, 0.0f, 0.0f, 0.0f);
 			})
 			.Padding(FMargin(4.0f, 3.0f))
@@ -633,7 +817,7 @@ TSharedRef<SWidget> FMetaLandRoadEditorModeToolkit::BuildLandscapeAttributePanel
 				.ButtonStyle(FAppStyle::Get(), "NoBorder")
 				.ContentPadding(FMargin(0.0f))
 				.IsEnabled(bRowEnabled)
-				.OnClicked_Lambda([this, bIsLandscape, bIsPropSetting]()
+				.OnClicked_Lambda([this, bIsLandscape, bIsPropSetting, bIsSidewalk]()
 				{
 					if (bIsLandscape)
 					{
@@ -642,6 +826,10 @@ TSharedRef<SWidget> FMetaLandRoadEditorModeToolkit::BuildLandscapeAttributePanel
 					else if (bIsPropSetting)
 					{
 						OnPropSettingAttributeClicked();
+					}
+					else if (bIsSidewalk)
+					{
+						OnSidewalkAttributeClicked();
 					}
 					return FReply::Handled();
 				})
@@ -665,11 +853,12 @@ TSharedRef<SWidget> FMetaLandRoadEditorModeToolkit::BuildLandscapeAttributePanel
 					[
 						SNew(STextBlock)
 						.Text(DisplayName)
-						.ColorAndOpacity_Lambda([bPinned, bIsLandscape, bIsPropSetting]()
+						.ColorAndOpacity_Lambda([bPinned, bIsLandscape, bIsPropSetting, bIsSidewalk]()
 						{
 							if (bPinned
 								|| (bIsLandscape && FMetaLandRoadEditorModule::Get().IsLandscapeAttributeSelected())
-								|| (bIsPropSetting && FMetaLandRoadEditorModule::Get().IsPropSettingSelected()))
+								|| (bIsPropSetting && FMetaLandRoadEditorModule::Get().IsPropSettingSelected())
+								|| (bIsSidewalk && FMetaLandRoadEditorModule::Get().IsSidewalkSelected()))
 							{
 								return FSlateColor(FLinearColor(1.0f, 0.92f, 0.2f));
 							}
@@ -727,7 +916,8 @@ TSharedRef<SWidget> FMetaLandRoadEditorModeToolkit::BuildLandscapeAttributePanel
 	{
 		const FText DisplayName = Desc.DisplayName;
 		const bool bPinned = Desc.TypeId == FMetaLandRoadAttributeRegistry::TypeLandscape
-			|| Desc.TypeId == FMetaLandRoadAttributeRegistry::TypePropSetting;
+			|| Desc.TypeId == FMetaLandRoadAttributeRegistry::TypePropSetting
+			|| Desc.TypeId == FMetaLandRoadAttributeRegistry::TypeSidewalkHeight;
 		Panel->AddSlot()
 			.AutoHeight()
 			[
@@ -842,6 +1032,59 @@ TSharedRef<SWidget> FMetaLandRoadEditorModeToolkit::BuildLandscapeAttributePanel
 
 	Panel->AddSlot()
 		.AutoHeight()
+		.Padding(8.0f, 4.0f, 0.0f, 4.0f)
+		[
+			SNew(SHorizontalBox)
+			.Visibility_Lambda([]()
+			{
+				return FMetaLandRoadEditorModule::Get().IsSidewalkSelected()
+					? EVisibility::Visible
+					: EVisibility::Collapsed;
+			})
+			+ SHorizontalBox::Slot().AutoWidth().Padding(0.0f, 0.0f, 6.0f, 0.0f)
+			[
+				SNew(SButton)
+				.Text(LOCTEXT("SidewalkShowOverlay", "Show"))
+				.OnClicked_Lambda([this]()
+				{
+					OnSidewalkShowClicked();
+					return FReply::Handled();
+				})
+			]
+			+ SHorizontalBox::Slot().AutoWidth().Padding(0.0f, 0.0f, 6.0f, 0.0f)
+			[
+				SNew(SButton)
+				.Text(LOCTEXT("SidewalkHideOverlay", "Hide"))
+				.OnClicked_Lambda([this]()
+				{
+					OnSidewalkHideClicked();
+					return FReply::Handled();
+				})
+			]
+			+ SHorizontalBox::Slot().AutoWidth().Padding(0.0f, 0.0f, 6.0f, 0.0f)
+			[
+				SNew(SButton)
+				.Text(LOCTEXT("SidewalkAddKey", "Add Key"))
+				.OnClicked_Lambda([this]()
+				{
+					OnSidewalkAddKeyClicked();
+					return FReply::Handled();
+				})
+			]
+			+ SHorizontalBox::Slot().AutoWidth()
+			[
+				SNew(SButton)
+				.Text(LOCTEXT("SidewalkDeleteKey", "Delete Key"))
+				.OnClicked_Lambda([this]()
+				{
+					OnSidewalkDeleteKeyClicked();
+					return FReply::Handled();
+				})
+			]
+		];
+
+	Panel->AddSlot()
+		.AutoHeight()
 		.Padding(0.0f, 6.0f, 0.0f, 2.0f)
 		[
 			SNew(STextBlock)
@@ -946,6 +1189,50 @@ TSharedRef<SWidget> FMetaLandRoadEditorModeToolkit::BuildLandscapeAttributePanel
 			[
 				PropSettingDetailsView.IsValid()
 					? PropSettingDetailsView->GetWidget().ToSharedRef()
+					: SNullWidget::NullWidget
+			]
+		];
+
+	Panel->AddSlot()
+		.AutoHeight()
+		.Padding(0.0f, 6.0f, 0.0f, 2.0f)
+		[
+			SNew(STextBlock)
+			.Visibility_Lambda([]()
+			{
+				return FMetaLandRoadEditorModule::Get().ShouldShowSidewalkDetailsPanel()
+					? EVisibility::Visible
+					: EVisibility::Collapsed;
+			})
+			.Text_Lambda([]()
+			{
+				const int32 Sign = FMetaLandRoadEditorModule::Get().GetSidewalkEdgeSign();
+				if (Sign > 0)
+				{
+					return LOCTEXT("RightEdgeTitle", "Right Edge");
+				}
+				if (Sign < 0)
+				{
+					return LOCTEXT("LeftEdgeTitle", "Left Edge");
+				}
+				return LOCTEXT("PickEdgeTitle", "Hover an edge line, click to edit it");
+			})
+		];
+
+	Panel->AddSlot()
+		.AutoHeight()
+		[
+			SNew(SBox)
+			.Visibility_Lambda([]()
+			{
+				return FMetaLandRoadEditorModule::Get().ShouldShowSidewalkDetailsPanel()
+					&& FMetaLandRoadEditorModule::Get().GetSidewalkEdgeSign() != 0
+					? EVisibility::Visible
+					: EVisibility::Collapsed;
+			})
+			[
+				SidewalkDetailsView.IsValid()
+					? SidewalkDetailsView->GetWidget().ToSharedRef()
 					: SNullWidget::NullWidget
 			]
 		];

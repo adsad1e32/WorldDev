@@ -59,7 +59,7 @@ public:
 
 	/** Manual connection snap distance (cm). Ignored when Auto is on. */
 	UPROPERTY(EditAnywhere, Category = "Lane Draw", meta = (ClampMin = "50", UIMin = "50", UIMax = "2000", EditCondition = "!bAutoLaneDrawFromRoadWidth"))
-	float ConnectionSnapDistanceCm = 600.0f;
+	float ConnectionSnapDistanceCm = 200.0f;
 
 	/**
 	 * When EndConnection snaps to another tip: how far back to mix width toward that lane mouth.
@@ -207,11 +207,11 @@ public:
 	bool bShiftModifierOn = false;
 	bool bAltModifierOn = false;
 	bool bAdjustControlPoint = false;
+	/** C session A: keep original+Ctrl keys, reconstruct spline, mesh stays. */
 	void OnFinishedSplineEdit();
 	/**
 	 * Cook junction + interrupt draw session.
 	 * Trigger: Ctrl+press while drawing when current road XY-crosses another (not A).
-	 * A finish = end draw + mesh refresh only (see OnFinishedSplineEdit).
 	 */
 	void CookJunctionForActiveRoad(bool bFinishEditSession = true, bool bForceHubJunctionCook = false);
 	/**
@@ -236,10 +236,10 @@ public:
 	bool HasLiveContinueDrawTarget() const;
 	/** Drop leftover C arm/session so empty Ctrl can spawn a new road. */
 	void AbandonStaleContinueDraw();
-	/** Lane-extend, C continue-draw, and free-draw: adsorb the whole target road mouth. */
+	/** C / 嘴延伸 / 普通 Ctrl 画线：靠近别的路嘴时出吸附。路身第一落点仍走 insert-junction。 */
 	bool AllowsEndSnapConnectionHover() const
 	{
-		return IsLaneAnchorDrawSession() || bContinueDrawSession || GetEditState();
+		return IsDrawSessionActive() || bContinueDrawSession || IsLaneAnchorDrawSession();
 	}
 
 	/** Rebuild green dual-rail draw guidance (cursor follow + rubber-band/snap). */
@@ -272,8 +272,6 @@ public:
 	}
 	/** Hide all mouth overlay only while Ctrl is placing points. */
 	bool ShouldSuppressLanePickOverlay() const;
-	/** Hide EditTarget yellow while Ctrl is placing points (EndSnap cyan + hover still draw). */
-	bool ShouldSuppressLanePickEditHover() const;
 	/** Hide EditTarget yellow mouth bars only while actually placing an extend (keep idle mouth + green rails). */
 	bool ShouldSuppressEditTargetMouthBar() const;
 	bool TryGetEndSnapMixHoverOverlay(FMetaLandRoadDrawAnchor& OutAnchor) const;
@@ -297,6 +295,7 @@ protected:
 	TObjectPtr<UInteractiveToolSettings> OutputProperties = nullptr;
 
 	UWorld* TargetWorld = nullptr;
+	UPROPERTY()
 	AMoKuEditBaseActor* ActiveActor = nullptr;
 	static const int CtrlModifierID = 1;
 	static const int ShiftModifierID = 2;
@@ -315,6 +314,15 @@ private:
 	void HandleClickPressDrawOrExtend(
 		const FInputDeviceRay& PressPos,
 		UMetaLandRoadEditorMode* RoadMode);
+	/** This press's world position only. Does not read ResultHitPos. */
+	void CommitCtrlFreeDrawAtWorld(const FVector& WorldPos, const FRotator& HitRot);
+	/** First hit is a road/junction: snap or cook. */
+	bool TryHandleCtrlClickOnRoadOrJunction(
+		const FVector& WorldPos,
+		const FRotator& HitRot,
+		const FInputDeviceRay& PressPos,
+		AActor* PressHitActor,
+		AMoKuEditSplineActor* ActiveSplineActor);
 	/** C highlight + Ctrl: start/continue free draw. No mix, no cook, no mesh. */
 	bool HandleClickPressContinueDraw(
 		const FInputDeviceRay& PressPos);
@@ -322,6 +330,7 @@ private:
 	UInteractiveGizmoManager* GizmoManager;
 	TWeakObjectPtr<UMetaLandRoadEditorMode> CachedRoadEditorMode;
 	AWorldSceneManagement* SceneManagement;
+	UPROPERTY()
 	EMetaLandRoadToolSession ToolSession = EMetaLandRoadToolSession::Idle;
 	bool bIsDrawHud = false;
 	TMap<TObjectPtr<AMoKuEditBaseActor>, TArray<FSocketGizmoTransformInfo>>UpdateGizmoInfos;
@@ -329,6 +338,7 @@ private:
 	EMoKuEditState StateOfEditor = EMoKuEditState::Defult;
 	bool bContinueDrawMouthArmed = false;
 	/** True from C mouth commit until A / Reset. Ctrl adds points only (no cook). */
+	UPROPERTY()
 	bool bContinueDrawSession = false;
 	TWeakObjectPtr<AMoKuEditSplineActor> ContinueDrawRoad;
 	int32 ContinueDrawOriginalNumPoints = 0;
@@ -336,7 +346,11 @@ private:
 	FVector ContinueDrawMouthLeft = FVector::ZeroVector;
 	FVector ContinueDrawMouthRight = FVector::ZeroVector;
 	FVector ContinueDrawMouthCenter = FVector::ZeroVector;
+	UPROPERTY()
 	double ContinueDrawMouthS = -1.0;
+	/** Insert-after S for C Ctrl add. Walks with new tips. MouthS stays at the junction. */
+	UPROPERTY()
+	double ContinueDrawInsertS = -1.0;
 	/** Which remaining-road span tip C armed. Not spline key 0 / last. */
 	int32 ContinueDrawMouthSpanIndex = INDEX_NONE;
 	bool bContinueDrawMouthIsSpanEnd = true;
@@ -380,6 +394,9 @@ private:
 	FVector ResultHitPos;
 	AActor* HitActor;
 	bool bInsertJunction = false;
+	/** First Ctrl click on a road: cook T at this snap, not source S=0. */
+	TWeakObjectPtr<AMoKuEditSplineActor> InsertJunctionSourceRoad;
+	FVector InsertJunctionWorld = FVector::ZeroVector;
 
 	/** Live draw guidance: parallel L/R rails (PDI neon green). One polyline pair per lane. */
 	TArray<TArray<FVector>> GuidanceLeftPolylines;

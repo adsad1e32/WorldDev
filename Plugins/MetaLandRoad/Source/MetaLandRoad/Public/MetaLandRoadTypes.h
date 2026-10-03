@@ -6,6 +6,8 @@
 #include "MetaLandRoadLaneAttribute.h"
 #include "MetaLandRoadTypes.generated.h"
 
+class UMetaLandRoadCurbProfile;
+
 enum { METALANDROAD_LANE_INDEX_NONE = 0 };
 enum { LANE_INDEX_NONE = METALANDROAD_LANE_INDEX_NONE };
 
@@ -97,9 +99,19 @@ namespace MetaLandRoad
 		return FMath::Max(HalfWidthCm, 1.0) * TanHalf;
 	}
 
+	/** Inner/outer miter scale: HalfW / sin(θ/2). 1 = no expand. */
+	inline double CornerMiterHalfWidthScale(double TurnAngleRad)
+	{
+		return 1.0 / FMath::Max(
+			FMath::Sin(FMath::Clamp(TurnAngleRad * 0.5, 0.08, 1.15)),
+			0.20);
+	}
+
 	/**
 	 * Width + angle → along-leg. Target = NeedAlongCm; floor = NeedAlongMinCm.
-	 * Use nearly the whole shorter leg (not 45%). MouthBudget < 0 = ignore.
+	 * Cap to ~38% of the shorter leg so the rest of the same actor stays lofted.
+	 * Whole-leg FitMax ate the straight after a U / L (same-actor mesh hole).
+	 * MouthBudget < 0 = ignore.
 	 */
 	inline double CornerFilletNeedAlongFitCm(
 		double HalfWidthCm,
@@ -109,7 +121,8 @@ namespace MetaLandRoad
 	{
 		const double NeedStd = CornerFilletNeedAlongCm(HalfWidthCm, TurnAngleRad);
 		const double NeedMin = CornerFilletNeedAlongMinCm(HalfWidthCm, TurnAngleRad);
-		double FitMax = FMath::Max(NeighborMinCm - 8.0, 1.0);
+		const double LegKeep = FMath::Max(NeighborMinCm * 0.38, 1.0);
+		double FitMax = FMath::Max(FMath::Min(LegKeep, NeighborMinCm - 8.0), 1.0);
 		if (MouthBudgetCm > 1.0)
 		{
 			FitMax = FMath::Min(FitMax, MouthBudgetCm);
@@ -509,6 +522,26 @@ struct METALANDROAD_API FMetaLandRoadLaneDriving : public FMetaLandRoadLaneInsta
 	bool bInvertUV0 = false;
 };
 
+USTRUCT(BlueprintType)
+struct METALANDROAD_API FMetaLandRoadSidewalkCurbKey
+{
+	GENERATED_BODY()
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Sidewalk)
+	double SOffset = 0.0;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Sidewalk)
+	TSoftObjectPtr<UMetaLandRoadCurbProfile> CurbProfileAsset;
+
+	/** Road / sidewalk strip width from this key (cm). Not Curb Profile curve Width. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Sidewalk, meta = (ClampMin = "20.0", ClampMax = "800.0"))
+	float WidthCm = 150.0f;
+
+	/** Whole-number cm from this key until the next. Positive = into the grass. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Sidewalk, meta = (DisplayName = "Outward Offset"))
+	int32 OutwardOffsetCm = 0;
+};
+
 USTRUCT(BlueprintType, Blueprintable)
 struct METALANDROAD_API FMetaLandRoadLaneSidewalk : public FMetaLandRoadLaneInstance
 {
@@ -517,8 +550,8 @@ struct METALANDROAD_API FMetaLandRoadLaneSidewalk : public FMetaLandRoadLaneInst
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = RoadLane)
 	bool bIsSoftBorder = false;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = RoadLane)
-	bool bInsideCurb = true;
+	UPROPERTY()
+	bool bInsideCurb = false;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = RoadLane)
 	bool bOutsideCurb = true;
@@ -540,6 +573,39 @@ struct METALANDROAD_API FMetaLandRoadLaneSidewalk : public FMetaLandRoadLaneInst
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = RoadLane)
 	FName CurbProfile = TEXT("Default");
+
+	/** Project asset created in Content Browser. Wins over CurbProfile name. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = RoadLane)
+	TSoftObjectPtr<UMetaLandRoadCurbProfile> CurbProfileAsset;
+
+	/** Road / sidewalk strip width (cm). Not Curb Profile curve Width. Not applied to the asphalt. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = RoadLane, meta = (ClampMin = "20.0", ClampMax = "800.0"))
+	float WidthCm = 150.0f;
+
+	/** Whole-number cm. Positive = into the grass. Negative = onto the asphalt. Does not change road width. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = RoadLane, meta = (DisplayName = "Outward Offset"))
+	int32 OutwardOffsetCm = 0;
+
+	/** PropSetting-style spans: each key holds curb asset / width until the next key. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = RoadLane)
+	TArray<FMetaLandRoadSidewalkCurbKey> CurbKeys;
+};
+
+/** Mode-panel edit payload when Sidewalk is shown. */
+USTRUCT(BlueprintType)
+struct METALANDROAD_API FMetaLandRoadSidewalkEditDetails
+{
+	GENERATED_BODY()
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Sidewalk)
+	TSoftObjectPtr<UMetaLandRoadCurbProfile> CurbProfileAsset;
+
+	UPROPERTY(VisibleAnywhere, Category = Sidewalk)
+	double KeyS = 0.0;
+
+	/** Whole-number cm. Positive = into the grass. Negative = onto the asphalt. Does not change road width. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Sidewalk, meta = (DisplayName = "Outward Offset"))
+	int32 OutwardOffset = 0;
 };
 
 USTRUCT(BlueprintType)

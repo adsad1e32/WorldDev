@@ -12,6 +12,8 @@
 #include "HAL/IConsoleManager.h"
 #include "PropertyEditorModule.h"
 #include "MoKuSplineActorCustomization.h"
+#include "MetaLandRoadCurbProfile.h"
+#include "MetaLandRoadCurbEditor.h"
 #include "MoKuEditSplineActor.h"
 #include "MetaLandRoadPropInstances.h"
 #include "MoKuEditIntersectionActor.h"
@@ -36,6 +38,7 @@
 #include "Tools/MetaLandRoadInteractiveTool.h"
 #include "InteractiveToolManager.h"
 #include "Editor.h"
+#include "ScopedTransaction.h"
 #include "Editor/EditorPerProjectUserSettings.h"
 #include "EditorViewportClient.h"
 #include "Selection.h"
@@ -363,6 +366,7 @@ void FMetaLandRoadEditorModule::RegisterEditorFeatures()
 	FMetaLandRoadEditorModeCommands::Register();
 	FPropertyEditorModule& PropertyEditorModule = FModuleManager::LoadModuleChecked<FPropertyEditorModule>("PropertyEditor");
 	PropertyEditorModule.RegisterCustomClassLayout(AMoKuEditSplineActor::StaticClass()->GetFName(), FOnGetDetailCustomizationInstance::CreateStatic(&FMoKuSplineConnectAssetMeshDetail::MakeInstance));
+	PropertyEditorModule.NotifyCustomizationModuleChanged();
 	GEngine->OnLevelActorAdded().AddRaw(this, &FMetaLandRoadEditorModule::OnLevelActorAddedToWorld);
 	EnsureComponentVisualizersRegistered();
 
@@ -863,6 +867,7 @@ void FMetaLandRoadEditorModule::SetLandscapeAttributeSelected(bool bSelected)
 	if (bSelected)
 	{
 		DismissPropSettingOverlay();
+		DismissSidewalkOverlay();
 	}
 	if (GEditor)
 	{
@@ -885,6 +890,8 @@ void FMetaLandRoadEditorModule::SetPropSettingSelected(bool bSelected)
 	if (bSelected)
 	{
 		HideLandscapeAttributeDisplay();
+		bShowSidewalkOverlay = false;
+		bSidewalkSelected = false;
 	}
 	if (GEditor)
 	{
@@ -982,6 +989,177 @@ void FMetaLandRoadEditorModule::SetPropPlaceMode(EPropPlaceMode Mode)
 	{
 		GEditor->RedrawLevelEditingViewports(true);
 	}
+}
+
+void FMetaLandRoadEditorModule::SetSidewalkSelected(bool bSelected)
+{
+	bSidewalkSelected = bSelected;
+	if (!bSelected)
+	{
+		bShowSidewalkOverlay = false;
+	}
+	if (bSelected)
+	{
+		HideLandscapeAttributeDisplay();
+		bShowPropSettingOverlay = false;
+		bPropSettingSelected = false;
+	}
+	if (GEditor)
+	{
+		GEditor->RedrawLevelEditingViewports(true);
+	}
+}
+
+void FMetaLandRoadEditorModule::EnterSidewalkOverlay()
+{
+	if (!IsStandardMode())
+	{
+		ExitEditorVisModesForInteractiveTool();
+	}
+	SetSidewalkSelected(true);
+}
+
+void FMetaLandRoadEditorModule::DismissSidewalkOverlay()
+{
+	bShowSidewalkOverlay = false;
+	bSidewalkSelected = false;
+	SidewalkEdgeSign = 0;
+	SidewalkHoverEdgeSign = 0;
+	SidewalkHoverS = -1.0;
+	SidewalkHoverCornerIndex = INDEX_NONE;
+	SidewalkSelectedCornerIndex = INDEX_NONE;
+	SidewalkHoverSpline = nullptr;
+	SidewalkFocusSpline = nullptr;
+	SidewalkHoverJunction = nullptr;
+	SidewalkSelectedJunction = nullptr;
+	FMoKuEditSplinesComponentVisualizer::UpdateEditorViewportTick();
+	BroadcastSidewalkEditorRefresh();
+	if (GEditor)
+	{
+		GEditor->RedrawLevelEditingViewports(true);
+	}
+}
+
+void FMetaLandRoadEditorModule::ShowSidewalkOverlayForActor(AActor* Actor)
+{
+	AMoKuEditSplineActor* Road = Cast<AMoKuEditSplineActor>(Actor);
+	AMoKuEditIntersectionActor* Junction = Cast<AMoKuEditIntersectionActor>(Actor);
+	if (!Road && !Junction)
+	{
+		return;
+	}
+
+	EnterSidewalkOverlay();
+	SetLandscapeAttributeOverlayVisible(false);
+	if (Road)
+	{
+		if (UMetaLandRoadSplineComponent* Spline = Road->GetSplineComponent())
+		{
+			if (RoadComponentVisualizer.IsValid())
+			{
+				RoadComponentVisualizer->SetActiveForSpline(Spline);
+			}
+		}
+	}
+	bShowSidewalkOverlay = true;
+	FMoKuEditSplinesComponentVisualizer::UpdateEditorViewportTick();
+	if (GEditor)
+	{
+		GEditor->RedrawLevelEditingViewports(false);
+	}
+}
+
+bool FMetaLandRoadEditorModule::ShouldDrawSidewalkOverlay() const
+{
+	return bShowSidewalkOverlay
+		&& bSidewalkSelected
+		&& IsStandardMode()
+		&& !IsLiveSplineDrawSession();
+}
+
+bool FMetaLandRoadEditorModule::ShouldShowSidewalkDetailsPanel() const
+{
+	if (!bSidewalkSelected || !bShowSidewalkOverlay)
+	{
+		return false;
+	}
+	if (!GEditor)
+	{
+		return false;
+	}
+	for (FSelectionIterator It(GEditor->GetSelectedActorIterator()); It; ++It)
+	{
+		if (Cast<AMoKuEditSplineActor>(*It) || Cast<AMoKuEditIntersectionActor>(*It))
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
+void FMetaLandRoadEditorModule::BroadcastSidewalkEditorRefresh()
+{
+	SidewalkEditorRefresh.Broadcast();
+}
+
+void FMetaLandRoadEditorModule::SetSidewalkKeyIndex(int32 Index)
+{
+	SidewalkKeyIndex = FMath::Max(Index, 0);
+	BroadcastSidewalkEditorRefresh();
+}
+
+void FMetaLandRoadEditorModule::SetSidewalkEdgeSign(int32 Sign)
+{
+	SidewalkEdgeSign = (Sign > 0) ? 1 : ((Sign < 0) ? -1 : 0);
+	BroadcastSidewalkEditorRefresh();
+	if (GEditor)
+	{
+		GEditor->RedrawLevelEditingViewports(true);
+	}
+}
+
+void FMetaLandRoadEditorModule::SetSidewalkHover(int32 Sign, double S, UMetaLandRoadSplineComponent* Spline)
+{
+	const int32 Next = (Sign > 0) ? 1 : ((Sign < 0) ? -1 : 0);
+	const double NextS = Next == 0 ? -1.0 : S;
+	if (SidewalkHoverEdgeSign == Next
+		&& FMath::IsNearlyEqual(SidewalkHoverS, NextS, 1.0)
+		&& SidewalkHoverCornerIndex == INDEX_NONE
+		&& SidewalkHoverSpline.Get() == (Next == 0 ? nullptr : Spline))
+	{
+		return;
+	}
+	SidewalkHoverEdgeSign = Next;
+	SidewalkHoverS = NextS;
+	SidewalkHoverCornerIndex = INDEX_NONE;
+	SidewalkHoverJunction = nullptr;
+	SidewalkHoverSpline = Next == 0 ? nullptr : Spline;
+}
+
+void FMetaLandRoadEditorModule::SetSidewalkHoverCorner(AMoKuEditIntersectionActor* Junction, int32 CornerIndex)
+{
+	if (SidewalkHoverCornerIndex == CornerIndex
+		&& SidewalkHoverJunction.Get() == Junction
+		&& SidewalkHoverEdgeSign == 0)
+	{
+		return;
+	}
+	SidewalkHoverCornerIndex = CornerIndex;
+	SidewalkHoverJunction = Junction;
+	SidewalkHoverEdgeSign = 0;
+	SidewalkHoverS = -1.0;
+	SidewalkHoverSpline = nullptr;
+}
+
+void FMetaLandRoadEditorModule::SetSidewalkFocusSpline(UMetaLandRoadSplineComponent* Spline)
+{
+	SidewalkFocusSpline = Spline;
+}
+
+void FMetaLandRoadEditorModule::SetSidewalkSelectedCorner(AMoKuEditIntersectionActor* Junction, int32 CornerIndex)
+{
+	SidewalkSelectedCornerIndex = CornerIndex;
+	SidewalkSelectedJunction = CornerIndex == INDEX_NONE ? nullptr : Junction;
 }
 
 void FMetaLandRoadEditorModule::BroadcastPropSettingEditorRefresh()

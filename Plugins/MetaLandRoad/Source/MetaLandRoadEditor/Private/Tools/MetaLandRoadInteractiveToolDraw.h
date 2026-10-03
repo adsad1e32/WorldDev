@@ -99,9 +99,13 @@ bool AddContinueDrawSplinePoint(
 	const FVector& WorldPos,
 	bool bInsertAtStart,
 	double MouthS = -1.0,
-	const FVector& MouthCenter = FVector::ZeroVector);
+	const FVector& MouthCenter = FVector::ZeroVector,
+	bool bKeepWorldZ = false);
 
-/** Keep the frozen body tangent; size the new-span handle from road half-width and turn angle. */
+/** A: keep C-session authoring keys (original + Ctrl adds), rewrite spline, no preview-sample keys. */
+void ReconstructContinueDrawAuthoringSpline(AMoKuEditSplineActor* Road);
+
+/** Freeze the confirmed-side tangent; size only the new-span handle from width and angle. */
 void ApplyWidthAwareNewSpanTangents(
 	UMoKuEditSplinesComponent* Spline,
 	int32 JointIndex,
@@ -117,7 +121,8 @@ bool PinContinueDrawTipToTargetMouth(
 	const FVector& TargetOutward,
 	const TArray<FVector>* PreviewCenterline = nullptr,
 	double PreviewMouthS = -1.0,
-	const FVector& PreviewMouthCenter = FVector::ZeroVector);
+	const FVector& PreviewMouthCenter = FVector::ZeroVector,
+	bool bKeepAuthoringKeys = false);
 
 void StabilizeLaneExtendMouthPoint(
 	UMoKuEditSplinesComponent* SplineComponent,
@@ -279,14 +284,16 @@ struct FCornerCurveDebug
 /** Mouth cannot face the other mouth, or the CSC hook would invert / detour. */
 bool IsLeaveArrivePlanUnusable(const FLeaveArrivePlan& Plan, double HalfWidthCm);
 
-/** Dubins CSC: shortest same-side, then any CSC. Red only if rails invert. */
+/** Dubins CSC: shortest same-side, then any CSC. Red only if rails invert.
+ *  HalfWidthCm > 0: outward mouth stubs along Leave/Arrive, then CSC from insets. */
 bool TryMakeLeaveArrivePlan(
 	const FVector& P0,
 	const FVector& P1,
 	const FVector& LeaveDir,
 	const FVector& ArriveDir,
 	double MinRadiusCm,
-	FLeaveArrivePlan& OutPlan);
+	FLeaveArrivePlan& OutPlan,
+	double HalfWidthCm = 0.0);
 
 void SampleLeaveArrivePlan(
 	const FLeaveArrivePlan& Plan,
@@ -338,7 +345,35 @@ bool ResolveCtrlDrawRayHit(
 	UWorld* World,
 	const FRay& WorldRay,
 	FHitResult& OutHit,
-	AActor*& OutHitActor);
+	AActor*& OutHitActor,
+	bool bPreferRoadOrJunction = true);
+
+/** Closest authored centerline to the ray (screen-pointing at a road). */
+bool TryPickClosestRoadToRay(
+	UWorld* World,
+	const FRay& WorldRay,
+	AMoKuEditSplineActor*& OutRoad,
+	FVector& OutCenterline,
+	double& OutS,
+	float& OutRayDist);
+
+/** Road bed along the ray (no physics). DynamicMesh roads have no collision. */
+bool TryPickRoadBedAlongRay(
+	UWorld* World,
+	const FRay& WorldRay,
+	AMoKuEditSplineActor*& OutRoad,
+	FVector& OutCenterline,
+	double& OutS,
+	float& OutRayT);
+
+/** Click XY sits on a road bed (centerline within half-width). No physics. */
+bool TryPickRoadCenterlineNearPoint(
+	UWorld* World,
+	const FVector& WorldPos,
+	AMoKuEditSplineActor* IgnoreRoad,
+	AMoKuEditSplineActor*& OutRoad,
+	FVector& OutCenterline,
+	double& OutS);
 
 FVector ProjectOntoParallelLaneExtend(
 	const FVector& Origin,

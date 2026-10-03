@@ -1,5 +1,6 @@
 #include "MetaLandRoadSplineComponent.h"
 #include "MetaLandRoadTypes.h"
+#include "MetaLandRoadCurbProfile.h"
 #include "MetaLandRoadProfile.h"
 #include "MetaLandRoadModule.h"
 #include "MoKuEditSplineActor.h"
@@ -8,6 +9,7 @@
 #include "Components/LineBatchComponent.h"
 #include "SceneManagement.h"
 #include "DynamicMesh/DynamicMesh3.h"
+#include "DynamicMesh/DynamicMeshAttributeSet.h"
 #include "Engine/World.h"
 #include "Engine/Engine.h"
 #if WITH_EDITOR
@@ -331,6 +333,44 @@ static bool IsProtectedMouthStation(const UMetaLandRoadSplineComponent* Spline, 
 		}
 	}
 	return false;
+}
+
+/** Longest NeedAlong that stays off spline ends and CutS. */
+static double MaxNeedAlongBeforeMouth(const UMetaLandRoadSplineComponent* Spline, double KeyS)
+{
+	if (!Spline)
+	{
+		return 0.0;
+	}
+
+	const double Length = Spline->GetSplineLength();
+	double Budget = FMath::Min(KeyS - 40.0, Length - 40.0 - KeyS);
+	auto LimitByCutS = [KeyS, &Budget](double CutS)
+	{
+		if (CutS >= 0.0)
+		{
+			Budget = FMath::Min(Budget, FMath::Abs(KeyS - CutS) - 40.0);
+		}
+	};
+
+	if (const AMoKuEditSplineActor* Road = Cast<AMoKuEditSplineActor>(Spline->GetOwner()))
+	{
+		LimitByCutS(Road->StartJunctionMeshTrimS);
+		LimitByCutS(Road->EndJunctionMeshTrimS);
+		for (const FMetaLandRoadJunctionTrimZone& Zone : Road->JunctionTrimZones)
+		{
+			LimitByCutS(Zone.ApproachCutS);
+			LimitByCutS(Zone.DepartCutS);
+		}
+		TArray<TPair<double, double>> Spans;
+		Road->GetJunctionMeshGenerationSpans(Spans);
+		for (const TPair<double, double>& Span : Spans)
+		{
+			LimitByCutS(Span.Key);
+			LimitByCutS(Span.Value);
+		}
+	}
+	return FMath::Max(Budget, 0.0);
 }
 
 #if 0
@@ -1657,6 +1697,109 @@ bool UMetaLandRoadSplineComponent::ApplyAngleAwareCornerTangent(
 	return true;
 }
 
+void UMetaLandRoadSplineComponent::RefreshAutoTangentsAroundKeys(const TArray<int32>& KeyIndices)
+{
+	const int32 NumPts = GetNumberOfSplinePoints();
+	if (NumPts < 2)
+	{
+		return;
+	}
+
+	TSet<int32> Touch;
+	Touch.Reserve(KeyIndices.Num() * 3 + 2);
+	for (const int32 Key : KeyIndices)
+	{
+		if (Key < 0 || Key >= NumPts)
+		{
+			continue;
+		}
+		Touch.Add(Key);
+		if (Key > 0)
+		{
+			Touch.Add(Key - 1);
+		}
+		if (Key + 1 < NumPts)
+		{
+			Touch.Add(Key + 1);
+		}
+	}
+	if (Touch.Num() == 0)
+	{
+		return;
+	}
+
+	auto ChordHandleCm = [](double SegLenCm) -> double
+	{
+		return FMath::Clamp(SegLenCm * 0.28, 16.0, FMath::Min(SegLenCm * 0.42, 120.0));
+	};
+
+	for (const int32 Index : Touch)
+	{
+		const FVector Cur = GetLocationAtSplinePoint(Index, ESplineCoordinateSpace::World);
+		FVector ArriveDir = FVector::ZeroVector;
+		FVector LeaveDir = FVector::ZeroVector;
+		double ArriveLen = 80.0;
+		double LeaveLen = 80.0;
+		if (Index > 0)
+		{
+			const FVector Prev = GetLocationAtSplinePoint(Index - 1, ESplineCoordinateSpace::World);
+			ArriveDir = (Cur - Prev).GetSafeNormal2D();
+			ArriveLen = FMath::Max(FVector::Dist2D(Prev, Cur), 16.0);
+		}
+		if (Index + 1 < NumPts)
+		{
+			const FVector Next = GetLocationAtSplinePoint(Index + 1, ESplineCoordinateSpace::World);
+			LeaveDir = (Next - Cur).GetSafeNormal2D();
+			LeaveLen = FMath::Max(FVector::Dist2D(Cur, Next), 16.0);
+		}
+		if (ArriveDir.IsNearlyZero())
+		{
+			ArriveDir = LeaveDir;
+			ArriveLen = LeaveLen;
+		}
+		if (LeaveDir.IsNearlyZero())
+		{
+			LeaveDir = ArriveDir;
+			LeaveLen = ArriveLen;
+		}
+		if (ArriveDir.IsNearlyZero() || LeaveDir.IsNearlyZero())
+		{
+			continue;
+		}
+
+		const double KeyS = GetDistanceAlongSplineAtSplinePoint(Index);
+		if (IsProtectedMouthStation(this, KeyS))
+		{
+			const FVector Dir = ArriveDir;
+			const double Handle = ChordHandleCm(FMath::Min(ArriveLen, LeaveLen));
+			SetSplinePointType(Index, ESplinePointType::CurveCustomTangent, false);
+			SetTangentsAtSplinePoint(
+				Index,
+				Dir * Handle,
+				Dir * Handle,
+				ESplineCoordinateSpace::World,
+				false);
+			continue;
+		}
+
+		const double Angle = FMath::Acos(
+			FMath::Clamp(FVector::DotProduct(ArriveDir, LeaveDir), -1.0, 1.0));
+		if (Angle < MetaLandRoad::CornerFilletSkipAngleRad)
+		{
+			SetSplinePointType(Index, ESplinePointType::Linear, false);
+			continue;
+		}
+
+		SetSplinePointType(Index, ESplinePointType::CurveCustomTangent, false);
+		SetTangentsAtSplinePoint(
+			Index,
+			ArriveDir * ChordHandleCm(ArriveLen),
+			LeaveDir * ChordHandleCm(LeaveLen),
+			ESplineCoordinateSpace::World,
+			false);
+	}
+}
+
 float UMetaLandRoadSplineComponent::GetSplinePointInputKey(int32 PointIndex) const
 {
 	if (!SplineCurves.Position.Points.IsValidIndex(PointIndex))
@@ -2222,6 +2365,14 @@ bool UMetaLandRoadSplineComponent::GenerateCombinedLaneDynamicMesh(
 	{
 		OutMesh.EnableVertexUVs(FVector2f::Zero());
 		OutMesh.EnableAttributes();
+	}
+	if (!OutMesh.HasAttributes())
+	{
+		OutMesh.EnableAttributes();
+	}
+	if (OutMesh.Attributes() && !OutMesh.Attributes()->HasMaterialID())
+	{
+		OutMesh.Attributes()->EnableMaterialID();
 	}
 
 	const double SplineLength = GetSplineLength();
@@ -3277,28 +3428,78 @@ static void AppendFilletSampleParams(
 }
 #endif
 
-static void AppendCornerKeySampleParams(
+struct FBodyCornerBezier
+{
+	double Win0 = 0.0;
+	double Win1 = 0.0;
+	double NeedAlong = 0.0;
+	double Angle = 0.0;
+	double Radius = 0.0;
+	FVector Corner = FVector::ZeroVector;
+	FVector FilletCenter = FVector::ZeroVector;
+	FVector InDir = FVector::ForwardVector;
+	FVector OutDir = FVector::ForwardVector;
+	FVector RightIn = FVector::YAxisVector;
+	FVector RightOut = FVector::YAxisVector;
+};
+
+static FVector EvalCubicBezier2D(
+	const FVector& P0,
+	const FVector& P1,
+	const FVector& P2,
+	const FVector& P3,
+	double T)
+{
+	const double U = 1.0 - T;
+	FVector Out = (U * U * U) * P0
+		+ (3.0 * U * U * T) * P1
+		+ (3.0 * U * T * T) * P2
+		+ (T * T * T) * P3;
+	Out.Z = FMath::Lerp(P0.Z, P3.Z, T);
+	return Out;
+}
+
+static bool IntersectLines2D(
+	const FVector& A,
+	const FVector& ADir,
+	const FVector& B,
+	const FVector& BDir,
+	FVector& OutHit)
+{
+	const double Det = ADir.X * BDir.Y - ADir.Y * BDir.X;
+	if (FMath::Abs(Det) < 1.0e-8)
+	{
+		return false;
+	}
+	const double T = ((B.X - A.X) * BDir.Y - (B.Y - A.Y) * BDir.X) / Det;
+	OutHit = A + ADir * T;
+	OutHit.Z = A.Z;
+	return true;
+}
+
+static void CollectBodyCornerBeziers(
 	const UMetaLandRoadSplineComponent* Spline,
 	double S0,
 	double S1,
-	TArray<float>& InOutParams)
+	ESplineCoordinateSpace::Type CoordinateSpace,
+	TArray<FBodyCornerBezier>& OutCorners)
 {
+	OutCorners.Reset();
 	if (!Spline)
 	{
 		return;
 	}
 	const int32 NumPts = Spline->GetNumberOfSplinePoints();
-	const double StepCm = FMath::Max(MetaLandRoad::DefaultMeshSampleCm * 0.35, 20.0);
 	for (int32 KeyIdx = 1; KeyIdx <= NumPts - 2; ++KeyIdx)
 	{
 		const double KeyS = Spline->GetDistanceAlongSplineAtSplinePoint(KeyIdx);
-		if (KeyS < S0 - 1.0 || KeyS > S1 + 1.0)
+		if (KeyS < S0 - 1.0 || KeyS > S1 + 1.0 || IsProtectedMouthStation(Spline, KeyS))
 		{
 			continue;
 		}
-		const FVector Prev = Spline->GetLocationAtSplinePoint(KeyIdx - 1, ESplineCoordinateSpace::Local);
-		const FVector Cur = Spline->GetLocationAtSplinePoint(KeyIdx, ESplineCoordinateSpace::Local);
-		const FVector Next = Spline->GetLocationAtSplinePoint(KeyIdx + 1, ESplineCoordinateSpace::Local);
+		const FVector Prev = Spline->GetLocationAtSplinePoint(KeyIdx - 1, CoordinateSpace);
+		const FVector Cur = Spline->GetLocationAtSplinePoint(KeyIdx, CoordinateSpace);
+		const FVector Next = Spline->GetLocationAtSplinePoint(KeyIdx + 1, CoordinateSpace);
 		const FVector InDir = (Cur - Prev).GetSafeNormal2D();
 		const FVector OutDir = (Next - Cur).GetSafeNormal2D();
 		if (InDir.IsNearlyZero() || OutDir.IsNearlyZero())
@@ -3311,12 +3512,248 @@ static void AppendCornerKeySampleParams(
 		{
 			continue;
 		}
-		const int32 Extra = Angle > FMath::DegreesToRadians(50.0) ? 8
-			: (Angle > FMath::DegreesToRadians(30.0) ? 5 : 2);
+		const double HalfW = LayoutHalfWidthAtS(Spline, KeyS);
+		const double SegIn = FMath::Max(FVector::Dist2D(Prev, Cur), 1.0);
+		const double SegOut = FMath::Max(FVector::Dist2D(Cur, Next), 1.0);
+		const double MouthBudget = MaxNeedAlongBeforeMouth(Spline, KeyS);
+		const double NeedAlong = MetaLandRoad::CornerFilletNeedAlongFitCm(
+			HalfW, Angle, FMath::Min(SegIn, SegOut), MouthBudget);
+		if (NeedAlong < 8.0)
+		{
+			continue;
+		}
+		FVector RightIn = HorizontalRightFromTravel(InDir);
+		FVector RightOut = HorizontalRightFromTravel(OutDir);
+		if (FVector::DotProduct(RightIn, RightOut) < 0.0)
+		{
+			RightOut = -RightOut;
+		}
+		const double Cross = InDir.X * OutDir.Y - InDir.Y * OutDir.X;
+		const FVector InsideIn = (Cross > 0.0) ? -RightIn : RightIn;
+		const FVector InsideOut = (Cross > 0.0) ? -RightOut : RightOut;
+		const FVector T1 = Cur - InDir * NeedAlong;
+		const FVector T2 = Cur + OutDir * NeedAlong;
+		FVector FilletCenter;
+		if (!IntersectLines2D(T1, InsideIn, T2, InsideOut, FilletCenter))
+		{
+			continue;
+		}
+		const double Radius = FMath::Max(
+			FVector::Dist2D(FilletCenter, T1),
+			HalfW * 1.15);
+		FBodyCornerBezier Corner;
+		Corner.Win0 = KeyS - NeedAlong;
+		Corner.Win1 = KeyS + NeedAlong;
+		Corner.NeedAlong = NeedAlong;
+		Corner.Angle = Angle;
+		Corner.Radius = Radius;
+		Corner.Corner = Cur;
+		Corner.FilletCenter = FilletCenter;
+		Corner.InDir = InDir;
+		Corner.OutDir = OutDir;
+		Corner.RightIn = RightIn;
+		Corner.RightOut = RightOut;
+		OutCorners.Add(Corner);
+	}
+
+	// Adjacent covers must not share S. Overlap → first-match jumps and stacked slabs.
+	for (int32 i = 0; i < OutCorners.Num(); ++i)
+	{
+		FBodyCornerBezier& Corner = OutCorners[i];
+		const double KeyS = 0.5 * (Corner.Win0 + Corner.Win1);
+		double MaxNeed = Corner.NeedAlong;
+		if (i > 0)
+		{
+			const double PrevKey = 0.5 * (OutCorners[i - 1].Win0 + OutCorners[i - 1].Win1);
+			MaxNeed = FMath::Min(MaxNeed, (KeyS - PrevKey) * 0.5 - 4.0);
+		}
+		if (i + 1 < OutCorners.Num())
+		{
+			const double NextKey = 0.5 * (OutCorners[i + 1].Win0 + OutCorners[i + 1].Win1);
+			MaxNeed = FMath::Min(MaxNeed, (NextKey - KeyS) * 0.5 - 4.0);
+		}
+		if (MaxNeed < 8.0)
+		{
+			Corner.NeedAlong = 0.0;
+			continue;
+		}
+		if (MaxNeed + 0.5 >= Corner.NeedAlong)
+		{
+			continue;
+		}
+		Corner.NeedAlong = MaxNeed;
+		Corner.Win0 = KeyS - MaxNeed;
+		Corner.Win1 = KeyS + MaxNeed;
+		const double Cross = Corner.InDir.X * Corner.OutDir.Y - Corner.InDir.Y * Corner.OutDir.X;
+		const FVector InsideIn = (Cross > 0.0) ? -Corner.RightIn : Corner.RightIn;
+		const FVector InsideOut = (Cross > 0.0) ? -Corner.RightOut : Corner.RightOut;
+		const FVector T1 = Corner.Corner - Corner.InDir * MaxNeed;
+		const FVector T2 = Corner.Corner + Corner.OutDir * MaxNeed;
+		FVector FilletCenter;
+		if (IntersectLines2D(T1, InsideIn, T2, InsideOut, FilletCenter))
+		{
+			Corner.FilletCenter = FilletCenter;
+			Corner.Radius = FMath::Max(FVector::Dist2D(FilletCenter, T1), Corner.Radius * 0.5);
+		}
+	}
+	OutCorners.RemoveAll([](const FBodyCornerBezier& Corner)
+	{
+		return Corner.NeedAlong < 8.0;
+	});
+}
+
+static bool TryEvalBodyCornerBezier(
+	const TArray<FBodyCornerBezier>& Corners,
+	double S,
+	double Off,
+	FVector& OutPoint)
+{
+	const FBodyCornerBezier* Best = nullptr;
+	double BestDist = TNumericLimits<double>::Max();
+	for (const FBodyCornerBezier& Corner : Corners)
+	{
+		if (S < Corner.Win0 || S > Corner.Win1)
+		{
+			continue;
+		}
+		const double KeyS = 0.5 * (Corner.Win0 + Corner.Win1);
+		const double Dist = FMath::Abs(S - KeyS);
+		if (Dist < BestDist)
+		{
+			BestDist = Dist;
+			Best = &Corner;
+		}
+	}
+	if (!Best)
+	{
+		return false;
+	}
+	const FBodyCornerBezier& Corner = *Best;
+	const double U = FMath::Clamp(
+		(S - Corner.Win0) / FMath::Max(Corner.Win1 - Corner.Win0, 1.0),
+		0.0,
+		1.0);
+	const FVector P0 = Corner.Corner - Corner.InDir * Corner.NeedAlong + Corner.RightIn * Off;
+	const FVector P3 = Corner.Corner + Corner.OutDir * Corner.NeedAlong + Corner.RightOut * Off;
+	const double RailR = FMath::Max(
+		FVector::Dist2D(Corner.FilletCenter, P0),
+		FMath::Max(FMath::Abs(Off), Corner.Radius) * 0.25);
+	const double Quarter = FMath::Tan(FMath::Clamp(Corner.Angle * 0.25, 0.0, 0.65));
+	const double Handle = FMath::Clamp(
+		(4.0 / 3.0) * RailR * Quarter,
+		16.0,
+		Corner.NeedAlong * 0.85);
+	OutPoint = EvalCubicBezier2D(
+		P0,
+		P0 + Corner.InDir * Handle,
+		P3 - Corner.OutDir * Handle,
+		P3,
+		U);
+	return true;
+}
+
+void UMetaLandRoadSplineComponent::ApplyBodyCornerCoverToEdges(
+	double S,
+	FVector& InOutLeft,
+	FVector& InOutRight,
+	FVector& InOutCenter,
+	ESplineCoordinateSpace::Type CoordinateSpace) const
+{
+	if (IsCutSStation(this, S))
+	{
+		return;
+	}
+	TArray<FBodyCornerBezier> Corners;
+	CollectBodyCornerBeziers(this, 0.0, GetSplineLength(), CoordinateSpace, Corners);
+	if (Corners.Num() == 0)
+	{
+		return;
+	}
+
+	const FVector Right2D = (InOutRight - InOutCenter).GetSafeNormal2D();
+	const double OffL = Right2D.IsNearlyZero()
+		? -FVector::Dist2D(InOutLeft, InOutCenter)
+		: FVector::DotProduct(InOutLeft - InOutCenter, Right2D);
+	const double OffR = Right2D.IsNearlyZero()
+		? FVector::Dist2D(InOutRight, InOutCenter)
+		: FVector::DotProduct(InOutRight - InOutCenter, Right2D);
+	const double ZL = InOutLeft.Z;
+	const double ZR = InOutRight.Z;
+	const double ZC = InOutCenter.Z;
+	FVector CoverCenter = InOutCenter;
+	FVector CoverLeft = InOutLeft;
+	FVector CoverRight = InOutRight;
+	const bool bGotC = TryEvalBodyCornerBezier(Corners, S, 0.0, CoverCenter);
+	const bool bGotL = TryEvalBodyCornerBezier(Corners, S, OffL, CoverLeft);
+	const bool bGotR = TryEvalBodyCornerBezier(Corners, S, OffR, CoverRight);
+	const double AuthW = FMath::Max(FMath::Abs(OffR - OffL), 1.0);
+	const double CoverW = FVector::Dist2D(CoverLeft, CoverRight);
+	if (bGotC && bGotL && bGotR && CoverW >= AuthW * 0.35)
+	{
+		CoverCenter.Z = ZC;
+		CoverLeft.Z = ZL;
+		CoverRight.Z = ZR;
+		InOutCenter = CoverCenter;
+		InOutLeft = CoverLeft;
+		InOutRight = CoverRight;
+	}
+}
+
+void UMetaLandRoadSplineComponent::AppendBodyCornerCoverStations(
+	double S0,
+	double S1,
+	TArray<double>& InOutStations) const
+{
+	TArray<FBodyCornerBezier> Corners;
+	CollectBodyCornerBeziers(this, S0, S1, ESplineCoordinateSpace::World, Corners);
+	for (const FBodyCornerBezier& Corner : Corners)
+	{
+		const double Win0 = FMath::Max(Corner.Win0, S0);
+		const double Win1 = FMath::Min(Corner.Win1, S1);
+		if (Win1 - Win0 < 8.0)
+		{
+			continue;
+		}
+		const int32 Extra = FMath::Clamp(
+			FMath::CeilToInt((Win1 - Win0) / 25.0),
+			4,
+			24);
+		for (int32 i = 0; i <= Extra; ++i)
+		{
+			InOutStations.Add(FMath::Lerp(Win0, Win1, static_cast<double>(i) / static_cast<double>(Extra)));
+		}
+	}
+}
+
+static void AppendCornerKeySampleParams(
+	const UMetaLandRoadSplineComponent* Spline,
+	double S0,
+	double S1,
+	const TArray<FBodyCornerBezier>& Corners,
+	TArray<float>& InOutParams)
+{
+	if (!Spline)
+	{
+		return;
+	}
+	for (const FBodyCornerBezier& Corner : Corners)
+	{
+		const double KeyS = 0.5 * (Corner.Win0 + Corner.Win1);
+		if (KeyS < S0 - 1.0 || KeyS > S1 + 1.0)
+		{
+			continue;
+		}
+		const double NeedAlong = Corner.NeedAlong;
+		const double HalfW = LayoutHalfWidthAtS(Spline, KeyS);
+		const double StepCm = MetaLandRoad::MeshRibbonStepCm(HalfW, Corner.Radius);
+		const int32 Extra = FMath::Clamp(
+			FMath::CeilToInt(NeedAlong / FMath::Max(StepCm, 1.0)),
+			6,
+			32);
 		InOutParams.Add(Spline->GetInputKeyValueAtDistanceAlongSpline(KeyS));
 		for (int32 Step = 1; Step <= Extra; ++Step)
 		{
-			const double Delta = StepCm * static_cast<double>(Step);
+			const double Delta = NeedAlong * (static_cast<double>(Step) / static_cast<double>(Extra));
 			if (KeyS - Delta >= S0)
 			{
 				InOutParams.Add(Spline->GetInputKeyValueAtDistanceAlongSpline(KeyS - Delta));
@@ -3374,7 +3811,9 @@ void UMetaLandRoadSplineComponent::BuildLinearApproximation(
 		const double SampleS = FMath::Lerp(S0, S1, static_cast<double>(i) / static_cast<double>(NumStep));
 		Params.Add(static_cast<float>(GetInputKeyValueAtDistanceAlongSpline(SampleS)));
 	}
-	AppendCornerKeySampleParams(this, S0, S1, Params);
+	TArray<FBodyCornerBezier> BodyCorners;
+	CollectBodyCornerBeziers(this, S0, S1, CoordinateSpace, BodyCorners);
+	AppendCornerKeySampleParams(this, S0, S1, BodyCorners, Params);
 	for (int32 SectionIndex = 0; SectionIndex < GetLaneSectionsNum(); ++SectionIndex)
 	{
 		const double SectionS = GetLaneSection(SectionIndex).SOffset;
@@ -3539,6 +3978,32 @@ void UMetaLandRoadSplineComponent::BuildLinearApproximation(
 			}
 			Right = FlattenHorizontalRight(FMath::Lerp(Right, TipRight, W));
 		}
+		if (bAlignStart && i == 0)
+		{
+			FVector TipRight = StartRight;
+			if (FVector::DotProduct(TipRight, Right) < 0.0)
+			{
+				TipRight = -TipRight;
+			}
+			Right = TipRight;
+			if (!StartTravel.IsNearlyZero())
+			{
+				Travel = StartTravel;
+			}
+		}
+		if (bAlignEnd && i == Samples.Num() - 1)
+		{
+			FVector TipRight = EndRight;
+			if (FVector::DotProduct(TipRight, Right) < 0.0)
+			{
+				TipRight = -TipRight;
+			}
+			Right = TipRight;
+			if (!EndTravel.IsNearlyZero())
+			{
+				Travel = EndTravel;
+			}
+		}
 		Samples[i].Travel = Travel;
 		Samples[i].Right = Right;
 	}
@@ -3547,12 +4012,37 @@ void UMetaLandRoadSplineComponent::BuildLinearApproximation(
 	{
 		const FVector Right = Samples[i].Right;
 		const double Off = RightOffsetFunc(Samples[i].S);
-		const FVector OffsetPoint = Samples[i].Center + Right * Off;
+		FVector OffsetPoint = Samples[i].Center + Right * Off;
+		FVector CoverCenter = Samples[i].Center;
+		const bool bAtSpanMouth =
+			i == 0
+			|| i == Samples.Num() - 1
+			|| (Samples[i].S - S0) < 40.0
+			|| (S1 - Samples[i].S) < 40.0;
+		if (!bAtSpanMouth)
+		{
+			FVector BezierOffset = OffsetPoint;
+			FVector BezierCenter = CoverCenter;
+			const bool bGotOff = TryEvalBodyCornerBezier(
+				BodyCorners, Samples[i].S, Off, BezierOffset);
+			const bool bGotCenter = TryEvalBodyCornerBezier(
+				BodyCorners, Samples[i].S, 0.0, BezierCenter);
+			const double AuthW = FMath::Abs(Off);
+			const double BezierW = FVector::Dist2D(BezierOffset, BezierCenter);
+			// Pinched cover (U/180°) skipped the rest of the same actor.
+			if (bGotOff && bGotCenter && (AuthW < 8.0 || BezierW >= AuthW * 0.35))
+			{
+				OffsetPoint = BezierOffset;
+				OffsetPoint.Z = Samples[i].Center.Z;
+				CoverCenter = BezierCenter;
+				CoverCenter.Z = Samples[i].Center.Z;
+			}
+		}
 		OutPoints.Emplace(
 			ApplyLinkedJunctionHeightToPosition(OffsetPoint, Samples[i].S, CoordinateSpace),
 			Samples[i].Param);
 		OutPoints.Last().PathCenter = ApplyLinkedJunctionHeightToPosition(
-			Samples[i].Center, Samples[i].S, CoordinateSpace);
+			CoverCenter, Samples[i].S, CoordinateSpace);
 	}
 }
 

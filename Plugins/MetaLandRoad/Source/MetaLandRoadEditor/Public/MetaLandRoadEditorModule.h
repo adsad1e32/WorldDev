@@ -67,6 +67,39 @@ public:
 	FSimpleMulticastDelegate PropSettingEditorRefresh;
 	void BroadcastPropSettingEditorRefresh();
 
+	bool IsSidewalkSelected() const { return bSidewalkSelected; }
+	void SetSidewalkSelected(bool bSelected);
+	void EnterSidewalkOverlay();
+	void DismissSidewalkOverlay();
+	void ShowSidewalkOverlayForActor(AActor* Actor);
+	bool ShouldDrawSidewalkOverlay() const;
+	bool ShouldShowSidewalkDetailsPanel() const;
+	FSimpleMulticastDelegate SidewalkEditorRefresh;
+	void BroadcastSidewalkEditorRefresh();
+	int32 GetSidewalkKeyIndex() const { return SidewalkKeyIndex; }
+	void SetSidewalkKeyIndex(int32 Index);
+	/** +1 right edge, -1 left edge, 0 none. */
+	int32 GetSidewalkEdgeSign() const { return SidewalkEdgeSign; }
+	void SetSidewalkEdgeSign(int32 Sign);
+	int32 GetSidewalkHoverEdgeSign() const { return SidewalkHoverEdgeSign; }
+	double GetSidewalkHoverS() const { return SidewalkHoverS; }
+	int32 GetSidewalkHoverCornerIndex() const { return SidewalkHoverCornerIndex; }
+	int32 GetSidewalkSelectedCornerIndex() const { return SidewalkSelectedCornerIndex; }
+	bool IsSidewalkHoverJunction(const class AMoKuEditIntersectionActor* Junction) const
+	{
+		return SidewalkHoverJunction.Get() == Junction;
+	}
+	bool IsSidewalkSelectedJunction(const class AMoKuEditIntersectionActor* Junction) const
+	{
+		return SidewalkSelectedJunction.Get() == Junction;
+	}
+	UMetaLandRoadSplineComponent* GetSidewalkFocusSpline() const { return SidewalkFocusSpline.Get(); }
+	UMetaLandRoadSplineComponent* GetSidewalkHoverSpline() const { return SidewalkHoverSpline.Get(); }
+	void SetSidewalkHover(int32 Sign, double S, UMetaLandRoadSplineComponent* Spline = nullptr);
+	void SetSidewalkHoverCorner(class AMoKuEditIntersectionActor* Junction, int32 CornerIndex);
+	void SetSidewalkFocusSpline(UMetaLandRoadSplineComponent* Spline);
+	void SetSidewalkSelectedCorner(class AMoKuEditIntersectionActor* Junction, int32 CornerIndex);
+
 	bool IsRoadSectionLineVisMode() const { return IsSectionMode(); }
 	bool IsNativeSplineEditMode() const { return IsNativeEditMode(); }
 	bool ShouldShowNativeEditOverlay() const { return IsNativeEditMode(); }
@@ -127,6 +160,18 @@ private:
 	bool bShowLandscapeAttributeOverlay = false;
 	bool bPropSettingSelected = false;
 	bool bShowPropSettingOverlay = false;
+	bool bSidewalkSelected = false;
+	bool bShowSidewalkOverlay = false;
+	int32 SidewalkKeyIndex = 0;
+	int32 SidewalkEdgeSign = 0;
+	int32 SidewalkHoverEdgeSign = 0;
+	double SidewalkHoverS = -1.0;
+	int32 SidewalkHoverCornerIndex = INDEX_NONE;
+	int32 SidewalkSelectedCornerIndex = INDEX_NONE;
+	TWeakObjectPtr<UMetaLandRoadSplineComponent> SidewalkHoverSpline;
+	TWeakObjectPtr<UMetaLandRoadSplineComponent> SidewalkFocusSpline;
+	TWeakObjectPtr<class AMoKuEditIntersectionActor> SidewalkHoverJunction;
+	TWeakObjectPtr<class AMoKuEditIntersectionActor> SidewalkSelectedJunction;
 	EPropPlaceMode PropPlaceMode = EPropPlaceMode::Select;
 	TWeakObjectPtr<class AMoKuEditIntersectionActor> LandscapeOverlayJunction;
 	TWeakObjectPtr<UMetaLandRoadSplineComponent> ActiveNativeEditSpline;

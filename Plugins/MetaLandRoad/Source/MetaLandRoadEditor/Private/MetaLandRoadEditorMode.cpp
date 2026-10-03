@@ -21,6 +21,7 @@
 #include "ComponentVisualizers/MetaLandRoadSectionComponentVisualizer.h"
 #include "ComponentVisualizer.h"
 #include "MetaLandRoadEditorModule.h"
+#include "MetaLandRoadCurbEditor.h"
 #include "MetaLandRoadLaneEditPick.h"
 #include "Utils/MetaLandRoadCompVisUtils.h"
 #include "Modules/ModuleManager.h"
@@ -671,6 +672,19 @@ void UMetaLandRoadEditorMode::ModeTick(float DeltaTime)
 bool UMetaLandRoadEditorMode::HandleClick(FEditorViewportClient* InViewportClient, HHitProxy* HitProxy, const FViewportClick& Click)
 {
 	if (FModuleManager::Get().IsModuleLoaded(TEXT("MetaLandRoad"))
+		&& FMetaLandRoadEditorModule::Get().ShouldDrawSidewalkOverlay())
+	{
+		if (const TSharedPtr<FMoKuEditSplinesComponentVisualizer> RoadVis =
+			FMetaLandRoadEditorModule::Get().GetRoadComponentVisualizer())
+		{
+			if (RoadVis->HandleSidewalkClick(InViewportClient, HitProxy, Click))
+			{
+				return true;
+			}
+		}
+	}
+
+	if (FModuleManager::Get().IsModuleLoaded(TEXT("MetaLandRoad"))
 		&& FMetaLandRoadEditorModule::Get().ShouldDrawPropSettingOverlay())
 	{
 		if (const TSharedPtr<FMoKuEditSplinesComponentVisualizer> RoadVis =
@@ -703,12 +717,18 @@ bool UMetaLandRoadEditorMode::HandleClick(FEditorViewportClient* InViewportClien
 
 		if (DrawTool
 			&& !Click.IsShiftDown()
-			&& !Click.IsAltDown()
-			&& !DrawTool->IsDrawSessionActive())
+			&& !Click.IsAltDown())
 		{
 			FInputDeviceRay DeviceRay;
 			DeviceRay.WorldRay = FRay(Click.GetOrigin(), Click.GetDirection());
-			if (DrawTool->TryHandleContinueDrawClick(DeviceRay))
+			if (!DrawTool->IsDrawSessionActive()
+				&& DrawTool->TryHandleContinueDrawClick(DeviceRay))
+			{
+				return true;
+			}
+			// Tool click may have already committed. Consume so default LMB
+			// does not deselect the road (next C+hover needs that selection).
+			if (DrawTool->IsContinueDrawSession() || DrawTool->IsContinueDrawMouthArmed())
 			{
 				return true;
 			}
@@ -1020,7 +1040,8 @@ void UMetaLandRoadEditorMode::Render(const FSceneView* View, FViewport* Viewport
 
 	if (FModuleManager::Get().IsModuleLoaded(TEXT("MetaLandRoad"))
 		&& (FMetaLandRoadEditorModule::Get().ShouldDrawLandscapeAttributeOverlay()
-			|| FMetaLandRoadEditorModule::Get().ShouldDrawPropSettingOverlay()))
+			|| FMetaLandRoadEditorModule::Get().ShouldDrawPropSettingOverlay()
+			|| FMetaLandRoadEditorModule::Get().ShouldDrawSidewalkOverlay()))
 	{
 		if (const TSharedPtr<FMoKuEditSplinesComponentVisualizer> RoadVis =
 			FMetaLandRoadEditorModule::Get().GetRoadComponentVisualizer())
@@ -1047,6 +1068,10 @@ void UMetaLandRoadEditorMode::Render(const FSceneView* View, FViewport* Viewport
 				{
 					RoadVis->DrawPropSettingOverlay(OverlaySpline, PDI, View);
 				}
+			}
+			if (FMetaLandRoadEditorModule::Get().ShouldDrawSidewalkOverlay())
+			{
+				RoadVis->DrawSidewalkOverlay(PDI, View);
 			}
 		}
 	}
@@ -2529,6 +2554,71 @@ namespace MetaLandRoadEditorModeJunctionPrivate
 				ESplineCoordinateSpace::World);
 			OutHits.Add(Hit);
 		}
+
+		// Ctrl click-on-road then draw: start tip sits on the other centerline (T),
+		// and may not count as a segment cross. Still a hub.
+		const int32 DrawnLast = DrawnSpline->GetNumberOfSplinePoints() - 1;
+		const FVector DrawnTips[2] = {
+			DrawnSpline->GetLocationAtSplinePoint(0, ESplineCoordinateSpace::World),
+			DrawnSpline->GetLocationAtSplinePoint(DrawnLast, ESplineCoordinateSpace::World)
+		};
+		for (const FVector& TipWorld : DrawnTips)
+		{
+			for (TActorIterator<AMoKuEditSplineActor> It(World); It; ++It)
+			{
+				AMoKuEditSplineActor* OtherActor = *It;
+				UMoKuEditSplinesComponent* OtherSpline = OtherActor ? OtherActor->GetSplineComponent() : nullptr;
+				if (!OtherSpline || OtherSpline == DrawnSpline || OtherSpline->GetNumberOfSplinePoints() < 2)
+				{
+					continue;
+				}
+				bool bAlready = false;
+				for (const FDetectedArmHit& Existing : OutHits)
+				{
+					if (Existing.Spline.Get() == OtherSpline)
+					{
+						bAlready = true;
+						break;
+					}
+				}
+				if (bAlready)
+				{
+					continue;
+				}
+				const float ClosestKey = OtherSpline->FindInputKeyClosestToWorldLocation(TipWorld);
+				const FVector OnOther = OtherSpline->GetLocationAtSplineInputKey(
+					ClosestKey, ESplineCoordinateSpace::World);
+				double ReachCm = 280.0;
+				if (UMetaLandRoadSplineComponent* OtherRoad = Cast<UMetaLandRoadSplineComponent>(OtherSpline))
+				{
+					const double OtherS = OtherSpline->GetDistanceAlongSplineAtLocation(
+						OnOther, ESplineCoordinateSpace::World);
+					ReachCm = FMath::Max(OtherRoad->GetRoadHalfWidthAtS(OtherS) + 40.0, 80.0);
+				}
+				if (FVector::Dist2D(TipWorld, OnOther) > ReachCm)
+				{
+					continue;
+				}
+				if (MaxHeightDeltaCm > 0.0f
+					&& FMath::Abs(TipWorld.Z - OnOther.Z) > MaxHeightDeltaCm)
+				{
+					continue;
+				}
+				if (UMetaLandRoadSplineComponent* OtherRoadSpline = Cast<UMetaLandRoadSplineComponent>(OtherSpline))
+				{
+					if (ShouldExcludeConnectIntersection(DrawnSpline, OtherRoadSpline, OnOther))
+					{
+						continue;
+					}
+				}
+				FDetectedArmHit Hit;
+				Hit.Spline = OtherSpline;
+				Hit.IntersectWorld = OnOther;
+				Hit.IntersectDistanceS = OtherSpline->GetDistanceAlongSplineAtLocation(
+					OnOther, ESplineCoordinateSpace::World);
+				OutHits.Add(Hit);
+			}
+		}
 	}
 
 	static FGuid FindOrCreateJunctionId(
@@ -2594,6 +2684,7 @@ namespace MetaLandRoadEditorModeJunctionPrivate
 	/**
 	 * Recook: re-adsorb the hub to live centerline XY crosses, then IntersectS
 	 * is the S of that point on each arm. CutS is computed after this.
+	 * Authored hub Z stays (raise junction — roads blend to actor Z, keys do not move in Z).
 	 */
 	static bool RefreshJunctionArmIntersectsFromCenterlines(
 		FMetaLandRoadJunctionNode& Junction,
@@ -2632,6 +2723,7 @@ namespace MetaLandRoadEditorModeJunctionPrivate
 			}
 		}
 
+		const double AuthoredHubZ = Junction.AnchorWorld.Z;
 		FVector Anchor = Junction.AnchorWorld;
 		if (Hits.Num() > 0)
 		{
@@ -2641,7 +2733,7 @@ namespace MetaLandRoadEditorModeJunctionPrivate
 				double BestDistSq = TNumericLimits<double>::Max();
 				for (const FVector& Hit : Hits)
 				{
-					const double DistSq = FVector::DistSquared(Hit, Junction.AnchorWorld);
+					const double DistSq = FVector::DistSquared2D(Hit, Junction.AnchorWorld);
 					if (DistSq < BestDistSq)
 					{
 						BestDistSq = DistSq;
@@ -2667,6 +2759,7 @@ namespace MetaLandRoadEditorModeJunctionPrivate
 				Junction.AnchorWorld,
 				ESplineCoordinateSpace::World);
 		}
+		Junction.AnchorWorld.Z = AuthoredHubZ;
 
 		UE_LOG(
 			LogTemp,
@@ -3201,7 +3294,9 @@ namespace MetaLandRoadEditorModeJunctionPrivate
 		TArray<FMetaLandRoadJunctionNode>& Junctions,
 		double ForwardIndent,
 		double ClusterRadius,
-		float MaxHeightDeltaCm = 0.0f)
+		float MaxHeightDeltaCm = 0.0f,
+		UMetaLandRoadSplineComponent* ForcedOtherSpline = nullptr,
+		FVector ForcedIntersectWorld = FVector::ZeroVector)
 	{
 		Junctions.Reset();
 		if (!World || !DrawnSpline || DrawnSpline->GetNumberOfSplinePoints() < 2)
@@ -3213,6 +3308,30 @@ namespace MetaLandRoadEditorModeJunctionPrivate
 
 		TArray<FDetectedArmHit> IntersectionHits;
 		DetectCenterlineIntersections(World, DrawnSpline, IntersectionHits, MaxHeightDeltaCm);
+		if (ForcedOtherSpline
+			&& ForcedOtherSpline != DrawnSpline
+			&& ForcedOtherSpline->GetNumberOfSplinePoints() >= 2
+			&& !ForcedIntersectWorld.IsNearlyZero())
+		{
+			bool bAlready = false;
+			for (const FDetectedArmHit& Existing : IntersectionHits)
+			{
+				if (Existing.Spline.Get() == ForcedOtherSpline)
+				{
+					bAlready = true;
+					break;
+				}
+			}
+			if (!bAlready)
+			{
+				FDetectedArmHit ForcedHit;
+				ForcedHit.Spline = ForcedOtherSpline;
+				ForcedHit.IntersectWorld = ForcedIntersectWorld;
+				ForcedHit.IntersectDistanceS = ForcedOtherSpline->GetDistanceAlongSplineAtLocation(
+					ForcedIntersectWorld, ESplineCoordinateSpace::World);
+				IntersectionHits.Add(ForcedHit);
+			}
+		}
 
 		for (const FDetectedArmHit& OtherHit : IntersectionHits)
 		{
@@ -3248,8 +3367,36 @@ namespace MetaLandRoadEditorModeJunctionPrivate
 				DrawnSpline->GetLocationAtSplinePoint(LastPt, ESplineCoordinateSpace::World)
 			};
 			const double TipS[2] = { 0.0, DrawnSpline->GetSplineLength() };
+			auto TipAlreadyOwnCutS = [DrawnSpline](double S) -> bool
+			{
+				const AMoKuEditSplineActor* Road = Cast<AMoKuEditSplineActor>(DrawnSpline->GetOwner());
+				if (!Road)
+				{
+					return false;
+				}
+				auto Near = [S](double CutS)
+				{
+					return CutS >= 0.0 && FMath::Abs(CutS - S) <= 80.0;
+				};
+				if (Near(Road->StartJunctionMeshTrimS) || Near(Road->EndJunctionMeshTrimS))
+				{
+					return true;
+				}
+				for (const FMetaLandRoadJunctionTrimZone& Zone : Road->JunctionTrimZones)
+				{
+					if (Near(Zone.ApproachCutS) || Near(Zone.DepartCutS))
+					{
+						return true;
+					}
+				}
+				return false;
+			};
 			for (int32 Tip = 0; Tip < 2; ++Tip)
 			{
+				if (TipAlreadyOwnCutS(TipS[Tip]))
+				{
+					continue;
+				}
 				AMoKuEditIntersectionActor* Hub = FindJunctionActorNear(
 					World, TipWorld[Tip], ClusterRadius);
 				if (!Hub)
@@ -3443,21 +3590,35 @@ namespace
 	int32 GJunctionRecookDepth = 0;
 	TSet<TWeakObjectPtr<AMoKuEditIntersectionActor>> GDeferredJunctionRecook;
 
+	bool GDrainingDeferredJunctionRecooks = false;
+
 	void DrainDeferredJunctionRecooks()
 	{
-		constexpr int32 MaxPasses = 32;
+		if (GDrainingDeferredJunctionRecooks || GJunctionRecookDepth > 0)
+		{
+			return;
+		}
+		TGuardValue<bool> DrainGuard(GDrainingDeferredJunctionRecooks, true);
+		TSet<TWeakObjectPtr<AMoKuEditIntersectionActor>> AlreadyCooked;
+		constexpr int32 MaxPasses = 8;
 		for (int32 Pass = 0; Pass < MaxPasses && GDeferredJunctionRecook.Num() > 0; ++Pass)
 		{
 			TArray<TWeakObjectPtr<AMoKuEditIntersectionActor>> Pending = GDeferredJunctionRecook.Array();
 			GDeferredJunctionRecook.Reset();
 			for (const TWeakObjectPtr<AMoKuEditIntersectionActor>& WeakJunction : Pending)
 			{
+				if (AlreadyCooked.Contains(WeakJunction))
+				{
+					continue;
+				}
 				if (AMoKuEditIntersectionActor* Deferred = WeakJunction.Get())
 				{
+					AlreadyCooked.Add(WeakJunction);
 					UMetaLandRoadEditorMode::RecookJunctionActorStatic(Deferred, true);
 				}
 			}
 		}
+		GDeferredJunctionRecook.Reset();
 	}
 }
 
@@ -3507,6 +3668,7 @@ void UMetaLandRoadEditorMode::RecookJunctionActorStatic(
 		UE_LOG(LogTemp, Warning, TEXT("[Recook] re-entrant skip junction=%s"), *JunctionActor->GetName());
 		return;
 	}
+	{
 	TGuardValue<int32> RecookDepthGuard(GJunctionRecookDepth, GJunctionRecookDepth + 1);
 	TGuardValue<bool> RecookGuard(JunctionActor->bIsRecookInProgress, true);
 	TGuardValue<bool> SuppressRoadRecook(
@@ -3674,6 +3836,7 @@ void UMetaLandRoadEditorMode::RecookJunctionActorStatic(
 		static_cast<int32>(Junction.Topology),
 		TriCount,
 		Junction.Arms.Num());
+	}
 	DrainDeferredJunctionRecooks();
 }
 
@@ -3691,7 +3854,10 @@ void UMetaLandRoadEditorMode::ResetInteractiveJunctionSession()
 void UMetaLandRoadEditorMode::ProcessInteractiveFinishedRoadDraw(
 	AMoKuEditSplineActor* DrawnRoad,
 	bool bFullWorldRebuild,
-	float MaxHeightDeltaCm)
+	float MaxHeightDeltaCm,
+	bool bSelectCookedJunction,
+	AMoKuEditSplineActor* ForcedOtherRoad,
+	FVector ForcedIntersectWorld)
 {
 	if (!DrawnRoad || !GEditor)
 	{
@@ -3716,6 +3882,16 @@ void UMetaLandRoadEditorMode::ProcessInteractiveFinishedRoadDraw(
 		return;
 	}
 
+	UMetaLandRoadSplineComponent* ForcedOtherSpline = ForcedOtherRoad
+		? Cast<UMetaLandRoadSplineComponent>(ForcedOtherRoad->GetSplineComponent())
+		: nullptr;
+	// Click-on-road T: keep a new hub at the snap. 1500cm cluster would
+	// swallow it into a nearby existing T and trim the new road to a stub.
+	const bool bForcedNewHub = ForcedOtherSpline && !ForcedIntersectWorld.IsNearlyZero();
+	const double CookClusterRadius = bForcedNewHub
+		? FMath::Min(InteractiveJunctionClusterRadius, 200.0)
+		: InteractiveJunctionClusterRadius;
+
 	if (bFullWorldRebuild)
 	{
 		MetaLandRoadEditorModeJunctionPrivate::RebuildAllJunctionsFromWorld(
@@ -3732,8 +3908,10 @@ void UMetaLandRoadEditorMode::ProcessInteractiveFinishedRoadDraw(
 			DrawnRoadSpline,
 			InteractiveJunctions,
 			InteractiveJunctionForwardIndent,
-			InteractiveJunctionClusterRadius,
-			MaxHeightDeltaCm);
+			CookClusterRadius,
+			MaxHeightDeltaCm,
+			ForcedOtherSpline,
+			ForcedIntersectWorld);
 	}
 
 	if (InteractiveJunctions.IsEmpty())
@@ -3762,7 +3940,7 @@ void UMetaLandRoadEditorMode::ProcessInteractiveFinishedRoadDraw(
 			MetaLandRoadEditorModeJunctionPrivate::PersistJunctionNodeToActor(
 				World,
 				Junction,
-				InteractiveJunctionClusterRadius))
+				bFullWorldRebuild ? InteractiveJunctionClusterRadius : CookClusterRadius))
 		{
 			LastJunctionActor = JunctionActor;
 			++CookedJunctionCount;
@@ -3794,7 +3972,7 @@ void UMetaLandRoadEditorMode::ProcessInteractiveFinishedRoadDraw(
 		}
 	}
 
-	if (LastJunctionActor)
+	if (bSelectCookedJunction && LastJunctionActor)
 	{
 		GEditor->SelectActor(LastJunctionActor, true, true, true);
 	}

@@ -903,6 +903,14 @@ void AMoKuEditIntersectionActor::ClearJunctionCoverMesh()
 {
 	CornerInfo.Reset();
 	EdgePath.Reset();
+	for (UDynamicMeshComponent* Comp : SidewalkMeshComponents)
+	{
+		if (Comp)
+		{
+			Comp->DestroyComponent();
+		}
+	}
+	SidewalkMeshComponents.Reset();
 	if (!DynamicMeshComponent)
 	{
 		return;
@@ -3387,6 +3395,7 @@ bool AMoKuEditIntersectionActor::BuildJunctionBoundaryRing()
 
 	return EdgePath.Num() >= 3 && SignedArea > 0.0;
 }
+
 
 void AMoKuEditIntersectionActor::SortEdgePath()
 {

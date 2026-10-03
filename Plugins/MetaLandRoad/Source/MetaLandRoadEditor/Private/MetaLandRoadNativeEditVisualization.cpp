@@ -82,15 +82,20 @@ static bool ShouldDrawNativeEditKey(
 
 	const double Angle = FMath::Acos(
 		FMath::Clamp(FVector::DotProduct(InDir, OutDir), -1.0, 1.0));
+	if (Angle < FMath::DegreesToRadians(35.0))
+	{
+		return false;
+	}
+
 	const double KeyS = RoadSpline->GetDistanceAlongSplineAtSplinePoint(KeyIdx);
 	const double MinDrawCm = FMath::Clamp(
-		RoadSpline->GetRoadHalfWidthAtS(KeyS) * 0.45, 70.0, 160.0);
+		RoadSpline->GetRoadHalfWidthAtS(KeyS) * 0.8, 160.0, 400.0);
 	if (LastDrawnKey != INDEX_NONE)
 	{
 		const FVector LastPos = RoadSpline->GetLocationAtSplinePoint(
 			LastDrawnKey, ESplineCoordinateSpace::World);
 		if (FVector::Dist2D(LastPos, Cur) < MinDrawCm
-			&& Angle < FMath::DegreesToRadians(8.0))
+			&& Angle < FMath::DegreesToRadians(35.0))
 		{
 			return false;
 		}
@@ -427,7 +432,9 @@ void MetaLandRoadNativeEditVisualization::DrawNativeEditSplineOverlay(
 	int32 LastHitKey = INDEX_NONE;
 	for (int32 KeyIdx = 0; KeyIdx < NumPoints; ++KeyIdx)
 	{
-		if (!ShouldDrawNativeEditKey(RoadSpline, KeyIdx, LastHitKey))
+		if (!SelectedKeys.Contains(KeyIdx)
+			&& HoveredKey != KeyIdx
+			&& !ShouldDrawNativeEditKey(RoadSpline, KeyIdx, LastHitKey))
 		{
 			continue;
 		}
@@ -461,7 +468,9 @@ void MetaLandRoadNativeEditVisualization::DrawNativeEditRingOverlay(
 	int32 LastDrawnKey = INDEX_NONE;
 	for (int32 KeyIdx = 0; KeyIdx < NumPoints; ++KeyIdx)
 	{
-		if (!ShouldDrawNativeEditKey(RoadSpline, KeyIdx, LastDrawnKey))
+		if (!SelectedKeys.Contains(KeyIdx)
+			&& HoveredKey != KeyIdx
+			&& !ShouldDrawNativeEditKey(RoadSpline, KeyIdx, LastDrawnKey))
 		{
 			continue;
 		}

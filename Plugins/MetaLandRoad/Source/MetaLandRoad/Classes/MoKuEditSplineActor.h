@@ -282,6 +282,12 @@ public:
 	// 假如当前道路为DynamicMesh 则需要刷新
 	virtual void RefreshDynamicRoadMesh();
 
+	/** One DynamicMeshComponent per sidewalk lane. Not merged into the road mesh. */
+	void RebuildSidewalkMeshes();
+
+	UPROPERTY()
+	TArray<TObjectPtr<UDynamicMeshComponent>> SidewalkMeshComponents;
+
 	/** Copy the selected (or Begin) landscape key falloff onto leftover RoadHeightmapSettings. */
 	void SyncHeightmapFalloffFromLandscapeKey(int32 SectionIndex, int32 KeyIndex);
 

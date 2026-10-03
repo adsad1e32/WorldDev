@@ -201,7 +201,7 @@ FMetaLandRoadAttributeTypeDesc FMetaLandRoadSidewalkHeightAttributeValue::GetTyp
 {
 	FMetaLandRoadAttributeTypeDesc Desc;
 	Desc.TypeId = FMetaLandRoadAttributeRegistry::TypeSidewalkHeight;
-	Desc.DisplayName = NSLOCTEXT("MetaLandRoadAttribute", "SidewalkHeight", "Sidewalk Height");
+	Desc.DisplayName = NSLOCTEXT("MetaLandRoadAttribute", "Sidewalk", "Sidewalk");
 	Desc.Category = TEXT("Geometry");
 	Desc.IconName = TEXT("ClassIcon.StaticMeshActor");
 	Desc.ValueStruct = StaticStruct();

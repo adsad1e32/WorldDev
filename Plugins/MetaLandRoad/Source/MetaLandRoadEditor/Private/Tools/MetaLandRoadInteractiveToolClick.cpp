@@ -8,15 +8,244 @@
 #include "MoKuEditBaseActor.h"
 #include "CollisionQueryParams.h"
 #include "Editor.h"
+#include "EngineUtils.h"
 #include "EditorViewportClient.h"
 #include "Engine/Engine.h"
 #include "Engine/World.h"
 #include "Framework/Application/SlateApplication.h"
+#include "LandscapeProxy.h"
 #include "LevelEditorViewport.h"
 #include "SceneView.h"
 #include "ScopedTransaction.h"
 
 #define LOCTEXT_NAMESPACE "UMetaLandRoadInteractiveTool"
+
+namespace
+{
+bool IsCtrlClickRoadOrJunction(const AActor* Actor)
+{
+	return Actor
+		&& (Actor->IsA<AMoKuEditSplineActor>() || Actor->IsA<AMoKuEditIntersectionActor>());
+}
+
+bool IsCtrlClickLandscape(const AActor* Actor)
+{
+	return Actor && Actor->IsA<ALandscapeProxy>();
+}
+
+/** Ray hits a road bed or passes within half-width of a centerline. Highest Ctrl priority. */
+bool TryPickRoadAlongCtrlRay(
+	UWorld* World,
+	const FRay& ClickRay,
+	AMoKuEditSplineActor*& OutRoad,
+	FVector& OutCenter)
+{
+	OutRoad = nullptr;
+	OutCenter = FVector::ZeroVector;
+	if (!World)
+	{
+		return false;
+	}
+
+	AMoKuEditSplineActor* BedRoad = nullptr;
+	FVector BedCenter = FVector::ZeroVector;
+	double BedS = 0.0;
+	float BedT = 0.0f;
+	if (TryPickRoadBedAlongRay(World, ClickRay, BedRoad, BedCenter, BedS, BedT) && BedRoad)
+	{
+		OutRoad = BedRoad;
+		OutCenter = BedCenter;
+		return true;
+	}
+
+	AMoKuEditSplineActor* RayRoad = nullptr;
+	FVector RayCenter = FVector::ZeroVector;
+	double RayS = 0.0;
+	float RayDist = 0.0f;
+	if (TryPickClosestRoadToRay(World, ClickRay, RayRoad, RayCenter, RayS, RayDist) && RayRoad)
+	{
+		OutRoad = RayRoad;
+		OutCenter = RayCenter;
+		return true;
+	}
+	return false;
+}
+
+/** Road along the ray wins. No road → first landscape/road physics hit. */
+bool ResolveCtrlClickWorldPos(
+	UWorld* World,
+	const FRay& ClickRay,
+	FVector& OutWorldPos,
+	AActor*& OutHitActor)
+{
+	OutHitActor = nullptr;
+	if (!World || ClickRay.Direction.IsNearlyZero())
+	{
+		return false;
+	}
+
+	AMoKuEditSplineActor* RayRoad = nullptr;
+	FVector RayCenter = FVector::ZeroVector;
+	if (TryPickRoadAlongCtrlRay(World, ClickRay, RayRoad, RayCenter) && RayRoad)
+	{
+		OutHitActor = RayRoad;
+		OutWorldPos = RayCenter;
+		return true;
+	}
+
+	FCollisionQueryParams Params(SCENE_QUERY_STAT(MetaLandRoadCtrlClick), true);
+	Params.bTraceComplex = true;
+
+	auto PickSurface = [&OutWorldPos, &OutHitActor](const TArray<FHitResult>& Hits) -> bool
+	{
+		for (const FHitResult& Hit : Hits)
+		{
+			AActor* Actor = Hit.GetActor();
+			if (IsCtrlClickRoadOrJunction(Actor) || IsCtrlClickLandscape(Actor))
+			{
+				OutWorldPos = Hit.ImpactPoint;
+				OutHitActor = Actor;
+				return true;
+			}
+		}
+		return false;
+	};
+
+	TArray<FHitResult> Hits;
+	bool bPhysicsHit = World->LineTraceMultiByChannel(
+			Hits,
+			ClickRay.Origin,
+			ClickRay.PointAt(HALF_WORLD_MAX),
+			ECC_Visibility,
+			Params)
+		&& PickSurface(Hits);
+	if (!bPhysicsHit)
+	{
+		Hits.Reset();
+		const FCollisionObjectQueryParams Objects(FCollisionObjectQueryParams::AllObjects);
+		bPhysicsHit = World->LineTraceMultiByObjectType(
+				Hits,
+				ClickRay.Origin,
+				ClickRay.PointAt(HALF_WORLD_MAX),
+				Objects,
+				Params)
+			&& PickSurface(Hits);
+	}
+	return bPhysicsHit;
+}
+
+bool TryPickNearestLinkedRoadCenter(
+	AMoKuEditIntersectionActor* Hub,
+	const FVector& WorldPos,
+	AMoKuEditSplineActor*& OutRoad,
+	FVector& OutCenter)
+{
+	OutRoad = nullptr;
+	OutCenter = FVector::ZeroVector;
+	if (!Hub || !Hub->JunctionData)
+	{
+		return false;
+	}
+	double BestDist = TNumericLimits<double>::Max();
+	for (AMoKuEditSplineActor* Linked : Hub->JunctionData->LinkedRoadActors)
+	{
+		USplineComponent* Spline = Linked ? Linked->GetSplineComponent() : nullptr;
+		if (!Spline || Spline->GetNumberOfSplinePoints() < 2)
+		{
+			continue;
+		}
+		const float Key = Spline->FindInputKeyClosestToWorldLocation(WorldPos);
+		const FVector OnRoad = Spline->GetLocationAtSplineInputKey(Key, ESplineCoordinateSpace::World);
+		const double Dist = FVector::Dist2D(WorldPos, OnRoad);
+		if (Dist < BestDist)
+		{
+			BestDist = Dist;
+			OutRoad = Linked;
+			OutCenter = OnRoad;
+		}
+	}
+	return OutRoad != nullptr;
+}
+
+/** Idle Ctrl: click on a road / hub / road footprint → that centerline. Empty ground stays. */
+bool TrySnapIdleCtrlClickOntoRoad(
+	UWorld* World,
+	const FRay& ClickRay,
+	FVector& InOutWorldPos,
+	AActor*& InOutHitActor)
+{
+	if (!World)
+	{
+		return false;
+	}
+
+	auto SnapRoad = [&InOutWorldPos, &InOutHitActor](AMoKuEditSplineActor* Road) -> bool
+	{
+		USplineComponent* Spline = Road ? Road->GetSplineComponent() : nullptr;
+		if (!Spline || Spline->GetNumberOfSplinePoints() < 2)
+		{
+			return false;
+		}
+		const float Key = Spline->FindInputKeyClosestToWorldLocation(InOutWorldPos);
+		InOutWorldPos = Spline->GetLocationAtSplineInputKey(Key, ESplineCoordinateSpace::World);
+		InOutHitActor = Road;
+		return true;
+	};
+
+	AMoKuEditSplineActor* RayRoad = nullptr;
+	FVector RayCenter = FVector::ZeroVector;
+	if (TryPickRoadAlongCtrlRay(World, ClickRay, RayRoad, RayCenter) && RayRoad)
+	{
+		InOutWorldPos = RayCenter;
+		return SnapRoad(RayRoad);
+	}
+
+	if (AMoKuEditSplineActor* HitRoad = Cast<AMoKuEditSplineActor>(InOutHitActor))
+	{
+		return SnapRoad(HitRoad);
+	}
+
+	if (AMoKuEditIntersectionActor* Hub = Cast<AMoKuEditIntersectionActor>(InOutHitActor))
+	{
+		AMoKuEditSplineActor* BestRoad = nullptr;
+		FVector BestCenter = FVector::ZeroVector;
+		if (TryPickNearestLinkedRoadCenter(Hub, InOutWorldPos, BestRoad, BestCenter) && BestRoad)
+		{
+			InOutWorldPos = BestCenter;
+			InOutHitActor = BestRoad;
+			return true;
+		}
+	}
+	return false;
+}
+
+bool CtrlClickIsOnPendingMouth(
+	UMetaLandRoadEditorMode* RoadMode,
+	const FVector& ClickWorld)
+{
+	if (!RoadMode)
+	{
+		return false;
+	}
+	const FMetaLandRoadEditTarget& Target = RoadMode->GetEditTarget();
+	if (!Target.bHasPendingAnchor || !Target.Spline.IsValid())
+	{
+		return false;
+	}
+	FVector MouthL = FVector::ZeroVector;
+	FVector MouthR = FVector::ZeroVector;
+	FVector MouthC = FVector::ZeroVector;
+	FVector MouthT = FVector::ZeroVector;
+	if (!MetaLandRoadLaneEditPick::ComputeAnchorMouthRailFrame(
+			Target.Spline.Get(), Target.PendingAnchor, MouthL, MouthR, MouthC, MouthT))
+	{
+		return false;
+	}
+	const double MouthW = FMath::Max(FVector::Dist2D(MouthL, MouthR), 1.0);
+	return FVector::Dist2D(ClickWorld, MouthC)
+		<= MetaLandRoad::MouthAdsorbAcceptCm(MouthW);
+}
+}
 
 void UMetaLandRoadInteractiveTool::OnClickPress(const FInputDeviceRay& PressPos)
 {
@@ -44,13 +273,20 @@ void UMetaLandRoadInteractiveTool::OnClickPress(const FInputDeviceRay& PressPos)
 		&& !bContinueDrawSession;
 	if (bLaneExtendPending)
 	{
-		if (!bContinueDrawSession)
+		FVector MouthProbe = FVector::ZeroVector;
+		AActor* MouthProbeActor = nullptr;
+		const bool bHaveProbe = ResolveCtrlClickWorldPos(
+			TargetWorld, PressPos.WorldRay, MouthProbe, MouthProbeActor);
+		if (bHaveProbe && CtrlClickIsOnPendingMouth(RoadMode, MouthProbe))
 		{
-			ClearContinueDrawMouthArm();
-		}
-		if (HandleClickPressLaneAnchorStart(PressPos, RoadMode))
-		{
-			return;
+			if (!bContinueDrawSession)
+			{
+				ClearContinueDrawMouthArm();
+			}
+			if (HandleClickPressLaneAnchorStart(PressPos, RoadMode))
+			{
+				return;
+			}
 		}
 	}
 	if (!bLaneExtendPending && HasLiveContinueDrawTarget())
@@ -63,10 +299,6 @@ void UMetaLandRoadInteractiveTool::OnClickPress(const FInputDeviceRay& PressPos)
 	else if (!bLaneExtendPending && !bContinueDrawMouthArmed)
 	{
 		AbandonStaleContinueDraw();
-	}
-	if (HandleClickPressLaneAnchorStart(PressPos, RoadMode))
-	{
-		return;
 	}
 
 	HandleClickPressDrawOrExtend(PressPos, RoadMode);
@@ -387,35 +619,50 @@ bool UMetaLandRoadInteractiveTool::HandleClickPressContinueDraw(const FInputDevi
 	StateOfEditor = ContinueDrawState;
 	UpdateEditState(true);
 	bContinueDrawSession = true;
-	if (UMoKuEditSplinesComponent* Spline = Road->GetSplineComponent())
-	{
-		Spline->bDeferRoadMeshRefresh = true;
-	}
 
 	FHitResult Result;
 	AActor* ResolvedHitActor = nullptr;
 	const bool bHitWorld = ResolveCtrlDrawRayHit(TargetWorld, PressPos.WorldRay, Result, ResolvedHitActor);
-	if (bHitWorld)
+	const bool bHitOtherRoadOrJunction =
+		bHitWorld
+		&& ResolvedHitActor
+		&& ResolvedHitActor != Road
+		&& (ResolvedHitActor->IsA<AMoKuEditSplineActor>()
+			|| ResolvedHitActor->IsA<AMoKuEditIntersectionActor>());
+
+	UMetaLandRoadEditorMode* ContinueRoadMode = ResolveMetaLandRoadEditorMode(this);
+	const float FallbackZ = bHasGuidancePlaneZ
+		? GuidancePlaneZ
+		: (GuidanceLastCursor.IsNearlyZero() ? 0.0f : static_cast<float>(GuidanceLastCursor.Z));
+	const FVector GuidanceCursor = ResolveGuidanceCursorForRay(
+		PressPos.WorldRay,
+		ContinueRoadMode,
+		Cast<AMoKuEditSplineActor>(Road),
+		StateOfEditor,
+		GuidancePlaneZ,
+		bHasGuidancePlaneZ,
+		FallbackZ,
+		bHitWorld ? Result.ImpactPoint : ResultHitPos,
+		bHitWorld,
+		TargetWorld);
+
+	if (bHitOtherRoadOrJunction)
 	{
 		ResultHitPos = Result.ImpactPoint;
-		ProjectPointOntoLandscapeSurface(
-			TargetWorld, ResultHitPos, Cast<AMoKuEditSplineActor>(ActiveActor));
+		ProjectPointOntoLandscapeSurface(TargetWorld, ResultHitPos, Road);
 	}
 	else
 	{
-		FVector PlaneCursor = ResultHitPos;
-		if (ResolveGuidanceCursorOnPlane(PressPos.WorldRay, GuidancePlaneZ, PlaneCursor))
-		{
-			ResultHitPos = PlaneCursor;
-		}
-	}
-	if (bHasGuidancePlaneZ)
-	{
-		ResultHitPos.Z = GuidancePlaneZ;
+		// Same XY as the green rails. First-hit is often this road's mesh, not the preview tip.
+		ResultHitPos = GuidanceCursor;
+		ResolvedHitActor = nullptr;
 	}
 
 	HitActor = ResolvedHitActor;
-	UpdateLaneDrawSnapFromWorldHit(bHitWorld, ResolvedHitActor, ResultHitPos);
+	if (bHitOtherRoadOrJunction)
+	{
+		UpdateLaneDrawSnapFromWorldHit(true, ResolvedHitActor, ResultHitPos);
+	}
 
 	// Same as Ctrl free-draw: snap to the other road centerline, then add + cook.
 	AMoKuEditSplineActor* HitRoad = Cast<AMoKuEditSplineActor>(HitActor);
@@ -424,29 +671,30 @@ bool UMetaLandRoadInteractiveTool::HandleClickPressContinueDraw(const FInputDevi
 	const bool bHitExistingJunction = HitJunction != nullptr;
 	const bool bInsertAtStart = (ContinueDrawState == EMoKuEditState::Forward);
 	FVector PlacePos = ResultHitPos;
-	FVector FromPos = ContinueDrawMouthCenter;
-	if (FromPos.IsNearlyZero())
+	FVector FromPos = FVector::ZeroVector;
+	if (UMoKuEditSplinesComponent* LiveSpline = Road->GetSplineComponent())
 	{
-		if (UMoKuEditSplinesComponent* LiveSpline = Road->GetSplineComponent())
+		const double LiveTipS = (ContinueDrawInsertS >= 0.0)
+			? ContinueDrawInsertS
+			: ContinueDrawMouthS;
+		if (LiveTipS >= 0.0)
 		{
-			if (ContinueDrawMouthS >= 0.0)
-			{
-				FromPos = LiveSpline->GetLocationAtDistanceAlongSpline(
-					ContinueDrawMouthS, ESplineCoordinateSpace::World);
-			}
-			else
-			{
-				const int32 Tip = bInsertAtStart ? 0 : (LiveSpline->GetNumberOfSplinePoints() - 1);
-				FromPos = LiveSpline->GetLocationAtSplinePoint(Tip, ESplineCoordinateSpace::World);
-			}
+			FromPos = LiveSpline->GetLocationAtDistanceAlongSpline(
+				LiveTipS, ESplineCoordinateSpace::World);
+		}
+		else
+		{
+			const int32 Tip = bInsertAtStart ? 0 : (LiveSpline->GetNumberOfSplinePoints() - 1);
+			FromPos = LiveSpline->GetLocationAtSplinePoint(Tip, ESplineCoordinateSpace::World);
 		}
 	}
-	FVector Crossing = FVector::ZeroVector;
-	if (TryApplyJudgedDrawCrossing(PlacePos))
+	if (FromPos.IsNearlyZero())
 	{
-		ProjectPointOntoLandscapeSurface(TargetWorld, PlacePos, Road);
+		FromPos = ContinueDrawMouthCenter;
 	}
-	else if (TrySnapDrawToRoadCrossing(
+	FVector Crossing = FVector::ZeroVector;
+	bool bSnappedCrossing = false;
+	if (TrySnapDrawToRoadCrossing(
 			Road,
 			FromPos,
 			ResultHitPos,
@@ -456,6 +704,7 @@ bool UMetaLandRoadInteractiveTool::HandleClickPressContinueDraw(const FInputDevi
 	{
 		PlacePos = Crossing;
 		ProjectPointOntoLandscapeSurface(TargetWorld, PlacePos, Road);
+		bSnappedCrossing = true;
 	}
 	else if (bHitOtherRoad && HitRoad->GetSplineComponent())
 	{
@@ -466,54 +715,290 @@ bool UMetaLandRoadInteractiveTool::HandleClickPressContinueDraw(const FInputDevi
 				IntersectData.TValue, ESplineCoordinateSpace::World);
 		}
 	}
-	AddContinueDrawSplinePoint(
-		Road,
-		PlacePos,
-		bInsertAtStart,
-		ContinueDrawMouthS,
-		ContinueDrawMouthCenter);
-	if (UMoKuEditSplinesComponent* Spline = Road->GetSplineComponent())
 	{
-		Spline->bDeferRoadMeshRefresh = true;
-		const double OldMouthS = ContinueDrawMouthS;
-		if (bInsertAtStart)
+		FScopedTransaction ContinueAddTx(LOCTEXT("ContinueDrawAddPoint", "Continue Draw Add Point"));
+		Modify();
+		if (Road)
 		{
-			ContinueDrawMouthS = Spline->GetDistanceAlongSplineAtSplinePoint(0);
+			Road->Modify();
 		}
-		else if (OldMouthS >= 0.0)
+		if (UMoKuEditSplinesComponent* LiveSpline = Road ? Road->GetSplineComponent() : nullptr)
 		{
-			for (int32 i = 0; i < Spline->GetNumberOfSplinePoints(); ++i)
+			LiveSpline->Modify();
+		}
+		const double InsertAfterS = (ContinueDrawInsertS >= 0.0)
+			? ContinueDrawInsertS
+			: ContinueDrawMouthS;
+		AddContinueDrawSplinePoint(
+			Road,
+			PlacePos,
+			bInsertAtStart,
+			InsertAfterS,
+			ContinueDrawMouthCenter,
+			bHitOtherRoad || bHitExistingJunction || bSnappedCrossing || bHasEndSnapGhost);
+		if (UMoKuEditSplinesComponent* Spline = Road->GetSplineComponent())
+		{
+			if (bInsertAtStart)
 			{
-				const double S = Spline->GetDistanceAlongSplineAtSplinePoint(i);
-				if (S > OldMouthS + 0.01)
-				{
-					ContinueDrawMouthS = S;
-					break;
-				}
+				ContinueDrawInsertS = Spline->GetDistanceAlongSplineAtSplinePoint(0);
+			}
+			else
+			{
+				ContinueDrawInsertS = Spline->GetDistanceAlongSplineAtSplinePoint(
+					Spline->GetNumberOfSplinePoints() - 1);
 			}
 		}
-		else
-		{
-			ContinueDrawMouthS = Spline->GetDistanceAlongSplineAtSplinePoint(
-				Spline->GetNumberOfSplinePoints() - 1);
-		}
-		ContinueDrawMouthCenter = Spline->GetLocationAtDistanceAlongSpline(
-			FMath::Max(ContinueDrawMouthS, 0.0), ESplineCoordinateSpace::World);
 	}
 
-	if (bHitOtherRoad || bHitExistingJunction)
+	if (bHitOtherRoad || bHitExistingJunction || bSnappedCrossing)
 	{
 		if (UMoKuEditSplinesComponent* Spline = Road->GetSplineComponent())
 		{
 			Spline->bDeferRoadMeshRefresh = false;
 		}
-		CookJunctionForActiveRoad(/*bFinishEditSession=*/true);
+		CookJunctionForActiveRoad(/*bFinishEditSession=*/true, /*bForceHubJunctionCook=*/true);
 		ClearSelectionForDrawSession();
 		return true;
 	}
 
-	// A owns mesh cook. Recooking each C-click hitch + half-drawn 折角面.
+	RefreshRoadMeshSuppressJunction(Road);
 	UpdateDrawGuidanceRails();
+	return true;
+}
+
+void UMetaLandRoadInteractiveTool::CommitCtrlFreeDrawAtWorld(
+	const FVector& WorldPos,
+	const FRotator& HitRot)
+{
+	if (IsLaneAnchorDrawSession())
+	{
+		if (AddLaneDrawSegmentFromCursor(WorldPos, HitRot, false, false, nullptr))
+		{
+			UpdateDrawGuidanceRails();
+		}
+	}
+	else
+	{
+		AddSplinePoint(WorldPos, HitRot, false);
+	}
+
+	AMoKuEditSplineActor* SplineActor = Cast<AMoKuEditSplineActor>(ActiveActor);
+	if (!SplineActor)
+	{
+		return;
+	}
+	if (UMoKuEditSplinesComponent* Comp = SplineActor->GetSplineComponent();
+		Comp && Comp->GetNumberOfSplinePoints() >= 2)
+	{
+		SplineActor->UpdateInterpolateType(Comp->GetNumberOfSplinePoints() - 2);
+	}
+	if (bInsertJunction)
+	{
+		CookJunctionForActiveRoad(/*bFinishEditSession=*/false, /*bForceHubJunctionCook=*/true);
+		UpdateDrawGuidanceRails();
+		return;
+	}
+	if (!IsLaneAnchorDrawSession() && TryCookJunctionOnCtrlPressIfCrossed())
+	{
+		return;
+	}
+	RefreshRoadMeshSuppressJunction(SplineActor);
+}
+
+bool UMetaLandRoadInteractiveTool::TryHandleCtrlClickOnRoadOrJunction(
+	const FVector& WorldPos,
+	const FRotator& HitRot,
+	const FInputDeviceRay& PressPos,
+	AActor* PressHitActor,
+	AMoKuEditSplineActor* ActiveSplineActor)
+{
+	if (!PressHitActor || !PressHitActor->IsA<AMoKuEditBaseActor>())
+	{
+		return false;
+	}
+
+	AMoKuEditSplineActor* SourceActor = Cast<AMoKuEditSplineActor>(PressHitActor);
+	AMoKuEditIntersectionActor* HitJunction = Cast<AMoKuEditIntersectionActor>(PressHitActor);
+	FVector PressWorldPos = WorldPos;
+	if (!SourceActor && HitJunction)
+	{
+		FVector ArmCenter = FVector::ZeroVector;
+		if (TryPickNearestLinkedRoadCenter(HitJunction, PressWorldPos, SourceActor, ArmCenter)
+			&& SourceActor)
+		{
+			PressWorldPos = ArmCenter;
+		}
+	}
+
+	if (!bInsertJunction && !IsDrawSessionActive())
+	{
+		if (!SourceActor)
+		{
+			CommitCtrlFreeDrawAtWorld(PressWorldPos, HitRot);
+			return true;
+		}
+		GetSplitIntersectionData(SourceActor, PressWorldPos);
+		bInsertJunction = true;
+		FVector SnapPos = PressWorldPos;
+		if (USplineComponent* SourceSpline = SourceActor->GetSplineComponent())
+		{
+			const float ClosestKey = SourceSpline->FindInputKeyClosestToWorldLocation(PressWorldPos);
+			IntersectData.TValue = SourceSpline->GetDistanceAlongSplineAtSplineInputKey(ClosestKey);
+			bSplineSnapActive = true;
+			SnapPos = SourceSpline->GetLocationAtDistanceAlongSpline(
+				IntersectData.TValue, ESplineCoordinateSpace::World);
+		}
+		PreIntersectData = IntersectData;
+		PreIntersectData.PreHitActor = SourceActor;
+		InsertJunctionSourceRoad = SourceActor;
+		InsertJunctionWorld = SnapPos;
+		if (UMetaLandRoadEditorMode* LiveMode = ResolveMetaLandRoadEditorMode(this))
+		{
+			if (!CtrlClickIsOnPendingMouth(LiveMode, SnapPos))
+			{
+				LiveMode->ClearEditTarget();
+			}
+		}
+		// Spawn a new branch. Do not add keys onto the source road.
+		ActiveActor = nullptr;
+		AddSplinePoint(SnapPos, HitRot, false);
+		bInsertJunction = true;
+		UE_LOG(
+			LogTemp,
+			Log,
+			TEXT("[CtrlT] start source=%s HubS=%.1f"),
+			*SourceActor->GetName(),
+			IntersectData.TValue);
+		UpdateDrawGuidanceRails();
+		return true;
+	}
+
+	if (!bInsertJunction && GetEditState())
+	{
+		if (IsLaneAnchorDrawSession())
+		{
+			SyncLaneDrawCursorFromRay(PressPos.WorldRay);
+			PressWorldPos = ResultHitPos;
+		}
+		if (SourceActor)
+		{
+			GetSplitIntersectionData(SourceActor, PressWorldPos);
+		}
+		const FVector EndCursor = bSplineSnapActive ? FVector(DrawOutSplinePos) : PressWorldPos;
+
+		if (IsLaneAnchorDrawSession())
+		{
+			const bool bHitOtherRoad = SourceActor && SourceActor != ActiveSplineActor;
+			const bool bHitExistingJunction = HitJunction != nullptr;
+			const bool bHitMixTarget = bEndSnapBundleUserLocked
+				&& LaneDrawEndSnapAnchor.IsValid()
+				&& SourceActor
+				&& LaneDrawEndSnapAnchor.SourceSpline.Get()
+				&& LaneDrawEndSnapAnchor.SourceSpline.Get()->GetOwner() == SourceActor;
+
+			if (bHitMixTarget)
+			{
+				AddLaneDrawSegmentFromCursor(EndCursor, HitRot, false, false, nullptr);
+				UpdateDrawGuidanceRails();
+				return true;
+			}
+
+			if ((bHitOtherRoad || bHitExistingJunction) && !bEndSnapBundleUserLocked)
+			{
+				FVector PlacePos = PressWorldPos;
+				if (ActiveSplineActor && ActiveSplineActor->GetSplineComponent())
+				{
+					const int32 Last = ActiveSplineActor->GetSplineComponent()->GetNumberOfSplinePoints() - 1;
+					const FVector From = ActiveSplineActor->GetSplineComponent()->GetLocationAtSplinePoint(
+						FMath::Max(Last, 0), ESplineCoordinateSpace::World);
+					FVector Crossing = FVector::ZeroVector;
+					if (!TryApplyJudgedDrawCrossing(PlacePos)
+						&& TrySnapDrawToRoadCrossing(
+							ActiveSplineActor,
+							From,
+							PressWorldPos,
+							TargetWorld,
+							GetConnectionSnapDistanceCm(),
+							Crossing))
+					{
+						PlacePos = Crossing;
+					}
+					else if (!bHasDrawCrossing
+						&& bHitOtherRoad
+						&& SourceActor->GetSplineComponent()
+						&& bSplineSnapActive)
+					{
+						PlacePos = SourceActor->GetSplineComponent()->GetLocationAtDistanceAlongSpline(
+							IntersectData.TValue, ESplineCoordinateSpace::World);
+					}
+				}
+				AddLaneDrawSegmentFromCursor(PlacePos, HitRot, false, false, nullptr);
+				CookJunctionForActiveRoad(true, true);
+				ClearSelectionForDrawSession();
+				return true;
+			}
+
+			AddLaneDrawSegmentFromCursor(EndCursor, HitRot, false, false, nullptr);
+			UpdateDrawGuidanceRails();
+			return true;
+		}
+
+		const bool bHitOtherRoad = SourceActor && SourceActor != ActiveSplineActor;
+		const bool bHitExistingJunction = HitJunction != nullptr;
+		if (bHitOtherRoad || bHitExistingJunction)
+		{
+			FVector PlacePos = PressWorldPos;
+			if (ActiveSplineActor && ActiveSplineActor->GetSplineComponent())
+			{
+				const int32 Last = ActiveSplineActor->GetSplineComponent()->GetNumberOfSplinePoints() - 1;
+				const FVector From = ActiveSplineActor->GetSplineComponent()->GetLocationAtSplinePoint(
+					FMath::Max(Last, 0), ESplineCoordinateSpace::World);
+				FVector Crossing = FVector::ZeroVector;
+				if (!TryApplyJudgedDrawCrossing(PlacePos)
+					&& TrySnapDrawToRoadCrossing(
+						ActiveSplineActor,
+						From,
+						PressWorldPos,
+						TargetWorld,
+						GetConnectionSnapDistanceCm(),
+						Crossing))
+				{
+					PlacePos = Crossing;
+				}
+				else if (bHitOtherRoad && SourceActor && SourceActor->GetSplineComponent() && bSplineSnapActive)
+				{
+					PlacePos = SourceActor->GetSplineComponent()->GetLocationAtDistanceAlongSpline(
+						IntersectData.TValue, ESplineCoordinateSpace::World);
+				}
+			}
+			AddSplinePoint(PlacePos, HitRot, false);
+			CookJunctionForActiveRoad(true);
+			ClearSelectionForDrawSession();
+			return true;
+		}
+
+		CommitCtrlFreeDrawAtWorld(PressWorldPos, HitRot);
+		return true;
+	}
+
+	if (bInsertJunction && GetEditState())
+	{
+		ClearSelectionForDrawSession();
+		GEditor->SelectActor(ActiveActor, true, true, false, true);
+		AddSplinePoint(WorldPos, HitRot, false);
+		const bool bHitOtherRoad = SourceActor && SourceActor != ActiveSplineActor;
+		const bool bHitExistingJunction = HitJunction != nullptr;
+		if (bHitOtherRoad || bHitExistingJunction)
+		{
+			CookJunctionForActiveRoad(true);
+			bInsertJunction = false;
+		}
+		else
+		{
+			CookJunctionForActiveRoad(/*bFinishEditSession=*/false, /*bForceHubJunctionCook=*/true);
+			UpdateDrawGuidanceRails();
+		}
+	}
 	return true;
 }
 
@@ -526,248 +1011,182 @@ void UMetaLandRoadInteractiveTool::HandleClickPressDrawOrExtend(
 		return;
 	}
 
-	FScopedTransaction Transaction(LOCTEXT("BasicAddPoint", "Basic Add Point"));
-	FHitResult Result;
-	AActor* ResolvedHitActor = nullptr;
-	const bool bHitWorld = ResolveCtrlDrawRayHit(TargetWorld, PressPos.WorldRay, Result, ResolvedHitActor);
 	if (!bCtrlModifierOn)
 	{
 		return;
 	}
 
-	AMoKuEditSplineActor* ActiveSplineActor = Cast<AMoKuEditSplineActor>(ActiveActor);
-	if (IsLaneAnchorDrawSession()
-		|| (RoadMode && RoadMode->GetEditTarget().bHasPendingAnchor))
+	AActor* ResolvedHitActor = nullptr;
+	FVector PressWorldPos = FVector::ZeroVector;
+	const bool bStartingFreeDraw =
+		!IsDrawSessionActive()
+		&& !IsLaneAnchorDrawSession()
+		&& !bContinueDrawSession;
+
+	if (IsLaneAnchorDrawSession())
 	{
 		SyncLaneDrawCursorFromRay(PressPos.WorldRay);
+		PressWorldPos = ResultHitPos;
 	}
-	else if (bHitWorld)
+	else if (!ResolveCtrlClickWorldPos(
+		TargetWorld, PressPos.WorldRay, PressWorldPos, ResolvedHitActor))
 	{
-		ResultHitPos = Result.ImpactPoint;
-		ProjectPointOntoLandscapeSurface(
-			TargetWorld, ResultHitPos, Cast<AMoKuEditSplineActor>(ActiveActor));
-		const bool bStartingFreeDraw =
-			!IsDrawSessionActive()
-			&& !IsLaneAnchorDrawSession()
-			&& !bContinueDrawSession;
+		return;
+	}
+	else
+	{
+		if (TrySnapIdleCtrlClickOntoRoad(
+				TargetWorld, PressPos.WorldRay, PressWorldPos, ResolvedHitActor))
+		{
+			bSplineSnapActive = true;
+		}
+		else if (!IsCtrlClickRoadOrJunction(ResolvedHitActor))
+		{
+			ProjectPointOntoLandscapeSurface(
+				TargetWorld, PressWorldPos, Cast<AMoKuEditSplineActor>(ActiveActor));
+			bSplineSnapActive = false;
+		}
 		if (bStartingFreeDraw || !bHasGuidancePlaneZ)
 		{
-			SetGuidancePlaneFromMouthCenter(ResultHitPos);
+			SetGuidancePlaneFromMouthCenter(PressWorldPos);
+		}
+		if (bStartingFreeDraw && !IsCtrlClickRoadOrJunction(ResolvedHitActor))
+		{
+			FEndSnapTargetLanePick MouthPick;
+			if (FindEndSnapTargetLanePick(
+					TargetWorld,
+					nullptr,
+					PressWorldPos,
+					GetConnectionSnapDistanceCm(),
+					MouthPick)
+				&& MouthPick.Spline)
+			{
+				FVector MouthL, MouthR, MouthC;
+				if (MouthPick.Spline->GetRoadEdgePointsAtS(
+						MouthPick.MouthS, MouthL, MouthR, MouthC, ESplineCoordinateSpace::World))
+				{
+					PressWorldPos = MouthC;
+					ResolvedHitActor = MouthPick.Spline->GetOwner();
+				}
+			}
 		}
 	}
+
+	if (!bStartingFreeDraw
+		&& GetEditState()
+		&& !IsLaneAnchorDrawSession()
+		&& !bContinueDrawSession
+		&& bHasEndSnapGhost)
+	{
+		PressWorldPos = (EndSnapGhostLeft + EndSnapGhostRight) * 0.5;
+		if (LaneDrawEndSnapAnchor.SourceSpline.IsValid())
+		{
+			ResolvedHitActor = LaneDrawEndSnapAnchor.SourceSpline->GetOwner();
+		}
+	}
+
+	ResultHitPos = PressWorldPos;
 	HitActor = ResolvedHitActor;
-	const FVector3d HitPos = ResultHitPos;
-	FRotator HitRot = FRotator::ZeroRotator;
+	const FRotator HitRot = FRotator::ZeroRotator;
 
 	if (bContinueDrawSession && GetEditState())
 	{
 		return;
 	}
 
-	if (HitActor && HitActor->IsA<AMoKuEditBaseActor>())
+	AMoKuEditSplineActor* PickedRoad = Cast<AMoKuEditSplineActor>(ResolvedHitActor);
+	UE_LOG(
+		LogTemp,
+		Log,
+		TEXT("[CtrlT] click session=%d insert=%d lane=%d hit=%s"),
+		IsDrawSessionActive() ? 1 : 0,
+		bInsertJunction ? 1 : 0,
+		IsLaneAnchorDrawSession() ? 1 : 0,
+		ResolvedHitActor ? *ResolvedHitActor->GetName() : TEXT("null"));
+
+	if (PickedRoad
+		&& !bInsertJunction
+		&& !IsLaneAnchorDrawSession()
+		&& !bContinueDrawSession)
 	{
-		AMoKuEditSplineActor* SourceActor = Cast<AMoKuEditSplineActor>(HitActor);
-		AMoKuEditIntersectionActor* HitJunction = Cast<AMoKuEditIntersectionActor>(HitActor);
-		if (!bInsertJunction && !IsDrawSessionActive())
+		if (IsDrawSessionActive())
 		{
-			ActiveActor = SourceActor;
-			GetSplitIntersectionData(ActiveActor, ResultHitPos);
-			PreIntersectData = IntersectData;
-			PreIntersectData.PreHitActor = Cast<AMoKuEditBaseActor>(HitActor);
-			bInsertJunction = true;
-			if (bSplineSnapActive)
-			{
-				UMoKuEditSplinesComponent* SplineComp = SourceActor->GetSplineComponent();
-				FTransform InSertTransform = SplineComp->GetTransformAtDistanceAlongSpline(
-					IntersectData.TValue, ESplineCoordinateSpace::World);
-				AddSplinePoint(InSertTransform.GetLocation(), HitRot, false);
-			}
-			else
-			{
-				AddSplinePoint(ResultHitPos, HitRot, false);
-			}
-			return;
+			ResetDrawSessionState();
 		}
-
-		if (!bInsertJunction && GetEditState())
+		GetSplitIntersectionData(PickedRoad, PressWorldPos);
+		FVector SnapPos = PressWorldPos;
+		if (USplineComponent* SourceSpline = PickedRoad->GetSplineComponent())
 		{
-			SyncLaneDrawCursorFromRay(PressPos.WorldRay);
-			if (SourceActor)
-			{
-				GetSplitIntersectionData(SourceActor, ResultHitPos);
-			}
-			const FVector EndCursor = bSplineSnapActive ? FVector(DrawOutSplinePos) : ResultHitPos;
-
-			if (IsLaneAnchorDrawSession())
-			{
-				const bool bHitOtherRoad = SourceActor && SourceActor != ActiveSplineActor;
-				const bool bHitExistingJunction = HitJunction != nullptr;
-				const bool bHitMixTarget = bEndSnapBundleUserLocked
-					&& LaneDrawEndSnapAnchor.IsValid()
-					&& SourceActor
-					&& LaneDrawEndSnapAnchor.SourceSpline.Get()
-					&& LaneDrawEndSnapAnchor.SourceSpline.Get()->GetOwner() == SourceActor;
-
-				if (bHitMixTarget)
-				{
-					AddLaneDrawSegmentFromCursor(EndCursor, HitRot, false, false, nullptr);
-					UpdateDrawGuidanceRails();
-					if (GEngine)
-					{
-						GEngine->AddOnScreenDebugMessage(
-							991123,
-							2.0f,
-							FColor::Cyan,
-							TEXT("[MetaLandRoad] End mix locked — press A to connect (Ctrl does not confirm)"));
-					}
-					return;
-				}
-
-				if ((bHitOtherRoad || bHitExistingJunction) && !bEndSnapBundleUserLocked)
-				{
-					FVector PlacePos = ResultHitPos;
-					if (ActiveSplineActor && ActiveSplineActor->GetSplineComponent())
-					{
-						const int32 Last = ActiveSplineActor->GetSplineComponent()->GetNumberOfSplinePoints() - 1;
-						const FVector From = ActiveSplineActor->GetSplineComponent()->GetLocationAtSplinePoint(
-							FMath::Max(Last, 0), ESplineCoordinateSpace::World);
-						FVector Crossing = FVector::ZeroVector;
-						if (!TryApplyJudgedDrawCrossing(PlacePos)
-							&& TrySnapDrawToRoadCrossing(
-								ActiveSplineActor,
-								From,
-								ResultHitPos,
-								TargetWorld,
-								GetConnectionSnapDistanceCm(),
-								Crossing))
-						{
-							PlacePos = Crossing;
-						}
-						else if (!bHasDrawCrossing
-							&& bHitOtherRoad
-							&& SourceActor->GetSplineComponent()
-							&& bSplineSnapActive)
-						{
-							PlacePos = SourceActor->GetSplineComponent()->GetLocationAtDistanceAlongSpline(
-								IntersectData.TValue, ESplineCoordinateSpace::World);
-						}
-					}
-					AddLaneDrawSegmentFromCursor(PlacePos, HitRot, false, false, nullptr);
-
-					CookJunctionForActiveRoad(true, true);
-					ClearSelectionForDrawSession();
-					return;
-				}
-
-				if (AddLaneDrawSegmentFromCursor(EndCursor, HitRot, false, false, nullptr))
-				{
-					UpdateDrawGuidanceRails();
-				}
-				return;
-			}
-
-			const bool bHitOtherRoad = SourceActor && SourceActor != ActiveSplineActor;
-			const bool bHitExistingJunction = HitJunction != nullptr;
-			if (bHitOtherRoad || bHitExistingJunction)
-			{
-				FVector PlacePos = ResultHitPos;
-				if (ActiveSplineActor && ActiveSplineActor->GetSplineComponent())
-				{
-					const int32 Last = ActiveSplineActor->GetSplineComponent()->GetNumberOfSplinePoints() - 1;
-					const FVector From = ActiveSplineActor->GetSplineComponent()->GetLocationAtSplinePoint(
-						FMath::Max(Last, 0), ESplineCoordinateSpace::World);
-					FVector Crossing = FVector::ZeroVector;
-					if (!TryApplyJudgedDrawCrossing(PlacePos)
-						&& TrySnapDrawToRoadCrossing(
-							ActiveSplineActor,
-							From,
-							ResultHitPos,
-							TargetWorld,
-							GetConnectionSnapDistanceCm(),
-							Crossing))
-					{
-						PlacePos = Crossing;
-					}
-					else if (bHitOtherRoad && SourceActor && SourceActor->GetSplineComponent() && bSplineSnapActive)
-					{
-						PlacePos = SourceActor->GetSplineComponent()->GetLocationAtDistanceAlongSpline(
-							IntersectData.TValue, ESplineCoordinateSpace::World);
-					}
-				}
-				AddSplinePoint(PlacePos, HitRot, false);
-
-				CookJunctionForActiveRoad(true);
-				ClearSelectionForDrawSession();
-				return;
-			}
-
-			AddSplinePoint(ResultHitPos, HitRot, false);
-			UpdateDrawGuidanceRails();
-			return;
+			const float ClosestKey = SourceSpline->FindInputKeyClosestToWorldLocation(PressWorldPos);
+			IntersectData.TValue = SourceSpline->GetDistanceAlongSplineAtSplineInputKey(ClosestKey);
+			bSplineSnapActive = true;
+			SnapPos = SourceSpline->GetLocationAtDistanceAlongSpline(
+				IntersectData.TValue, ESplineCoordinateSpace::World);
 		}
+		InsertJunctionSourceRoad = PickedRoad;
+		InsertJunctionWorld = SnapPos;
+		bInsertJunction = true;
+		if (UMetaLandRoadEditorMode* LiveMode = ResolveMetaLandRoadEditorMode(this))
+		{
+			if (!CtrlClickIsOnPendingMouth(LiveMode, SnapPos))
+			{
+				LiveMode->ClearEditTarget();
+			}
+		}
+		ActiveActor = nullptr;
+		AddSplinePoint(SnapPos, HitRot, false);
+		bInsertJunction = true;
+		UE_LOG(
+			LogTemp,
+			Log,
+			TEXT("[CtrlT] start source=%s HubS=%.1f"),
+			*PickedRoad->GetName(),
+			IntersectData.TValue);
+		if (GEngine)
+		{
+			GEngine->AddOnScreenDebugMessage(
+				-1,
+				4.0f,
+				FColor::Cyan,
+				FString::Printf(
+					TEXT("[CtrlT] snap %s  S=%.0f"),
+					*PickedRoad->GetName(),
+					IntersectData.TValue));
+		}
+		UpdateDrawGuidanceRails();
+		return;
+	}
 
-		if (bInsertJunction && GetEditState())
+	if (TryHandleCtrlClickOnRoadOrJunction(
+		PressWorldPos,
+		HitRot,
+		PressPos,
+		ResolvedHitActor,
+		Cast<AMoKuEditSplineActor>(ActiveActor)))
+	{
+		return;
+	}
+
+	if (bInsertJunction && GetEditState() && !IsLaneAnchorDrawSession() && !bContinueDrawSession)
+	{
+		const bool bHitOtherRoad = ResolvedHitActor
+			&& ResolvedHitActor->IsA<AMoKuEditSplineActor>()
+			&& ResolvedHitActor != ActiveActor;
+		const bool bHitExistingJunction = ResolvedHitActor
+			&& ResolvedHitActor->IsA<AMoKuEditIntersectionActor>();
+		if (bHitOtherRoad || bHitExistingJunction)
 		{
 			ClearSelectionForDrawSession();
-			GEditor->SelectActor(ActiveActor, true, true, false, true);
-			AddSplinePoint(HitPos, HitRot, false);
-
-			const bool bHitOtherRoad = SourceActor && SourceActor != ActiveSplineActor;
-			const bool bHitExistingJunction = HitJunction != nullptr;
-			if (bHitOtherRoad || bHitExistingJunction)
-			{
-				CookJunctionForActiveRoad(true);
-			}
-			else
-			{
-				TryCookJunctionOnCtrlPressIfCrossed();
-			}
+			AddSplinePoint(PressWorldPos, HitRot, false);
+			CookJunctionForActiveRoad(true, true);
 			bInsertJunction = false;
+			return;
 		}
+		CommitCtrlFreeDrawAtWorld(PressWorldPos, HitRot);
 		return;
 	}
 
-	if (HitActor && !HitActor->IsA<AMoKuEditSplineActor>() && bInsertJunction)
-	{
-		ClearSelectionForDrawSession();
-		AddSplinePoint(HitPos, HitRot, false);
-		bInsertJunction = false;
-		TryCookJunctionOnCtrlPressIfCrossed();
-		return;
-	}
-
-	if ((!HitActor || !HitActor->IsA<AMoKuEditSplineActor>()) && !bInsertJunction)
-	{
-		SyncLaneDrawCursorFromRay(PressPos.WorldRay);
-		const FVector ClickPos = ResultHitPos;
-		if (IsLaneAnchorDrawSession())
-		{
-			if (AddLaneDrawSegmentFromCursor(ClickPos, HitRot, false, false, nullptr))
-			{
-				UpdateDrawGuidanceRails();
-			}
-		}
-		else
-		{
-			AddSplinePoint(ClickPos, HitRot, false);
-		}
-		if (AMoKuEditSplineActor* SplineActor = Cast<AMoKuEditSplineActor>(ActiveActor))
-		{
-			if (UMoKuEditSplinesComponent* Comp = SplineActor->GetSplineComponent();
-				Comp && Comp->GetNumberOfSplinePoints() >= 2)
-			{
-				const int32 PointIndex = Comp->GetNumberOfSplinePoints() - 2;
-				SplineActor->UpdateInterpolateType(PointIndex);
-			}
-			if (!IsLaneAnchorDrawSession() && TryCookJunctionOnCtrlPressIfCrossed())
-			{
-				return;
-			}
-			RefreshRoadMeshSuppressJunction(SplineActor);
-		}
-	}
+	CommitCtrlFreeDrawAtWorld(PressWorldPos, HitRot);
 }
-
-#undef LOCTEXT_NAMESPACE
 
 #undef LOCTEXT_NAMESPACE

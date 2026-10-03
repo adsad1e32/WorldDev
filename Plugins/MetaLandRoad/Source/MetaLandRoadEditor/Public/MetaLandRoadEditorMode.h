@@ -84,7 +84,10 @@ public:
 	void ProcessInteractiveFinishedRoadDraw(
 		AMoKuEditSplineActor* DrawnRoad,
 		bool bFullWorldRebuild = false,
-		float MaxHeightDeltaCm = 0.0f);
+		float MaxHeightDeltaCm = 0.0f,
+		bool bSelectCookedJunction = true,
+		AMoKuEditSplineActor* ForcedOtherRoad = nullptr,
+		FVector ForcedIntersectWorld = FVector::ZeroVector);
 
 	/** Recalculate arm cuts + trim zones; optionally refresh all linked road meshes. */
 	void RecookJunctionActor(class AMoKuEditIntersectionActor* JunctionActor, bool bRefreshLinkedRoadMeshes = true);

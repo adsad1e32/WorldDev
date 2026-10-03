@@ -85,6 +85,9 @@ public:
 		int32* OutNetPointsAdded = nullptr,
 		bool bAllowInsert = false);
 
+	/** Alt+W move: recompute auto tangents around moved keys. Mouth/CutS stay locked. */
+	void RefreshAutoTangentsAroundKeys(const TArray<int32>& KeyIndices);
+
 	UFUNCTION(BlueprintCallable, Category = Road)
 	virtual void UpdateRoadLayout();
 
@@ -261,6 +264,17 @@ public:
 		FVector& OutRight,
 		FVector& OutCenter,
 		ESplineCoordinateSpace::Type CoordinateSpace = ESplineCoordinateSpace::World) const;
+
+	/** Stamp / overlay: same cover Bezier as loft. EvalLanePosition stays raw. */
+	void ApplyBodyCornerCoverToEdges(
+		double S,
+		FVector& InOutLeft,
+		FVector& InOutRight,
+		FVector& InOutCenter,
+		ESplineCoordinateSpace::Type CoordinateSpace = ESplineCoordinateSpace::World) const;
+
+	/** Extra S in NeedAlong windows so weight follows the corner, not two boxes. */
+	void AppendBodyCornerCoverStations(double S0, double S1, TArray<double>& InOutStations) const;
 
 	/**
 	 * Full cross-section vertices at S, ordered left-outer → right-outer

@@ -504,6 +504,10 @@ double FMetaLandRoadLaneSection::EvalLaneROffset(int LaneIndex, double InSOffset
 	for (int32 i = 0; i < AbsLaneIndex; ++i)
 	{
 		PreBorderOffset = BorderOffset;
+		if ((*LanesInfo)[i].LaneInstance.GetPtr<FMetaLandRoadLaneSidewalk>())
+		{
+			continue;
+		}
 		const double LocalT = InSOffset - (*LanesInfo)[i].GetStartOffset();
 		const float SampleT = static_cast<float>(FMath::Max(LocalT, 0.0));
 		const double LaneW = FMath::Max(

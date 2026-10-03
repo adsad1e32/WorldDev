@@ -32,9 +32,14 @@ Do not skip the greeting on follow-up turns in the same MetaLandRoad task unless
 - Road weight falloff is Landscape Key **`RoadWeightFalloffWidth`** (0 = inherit Actor default). Junction / unset keys use Actor **`RoadWeightFalloffWidth`**. Profile PS draws **Road** only. No Dirty layer. No JF TMap.
 - Begin/End **data stays**; overlay **draws at CutS**. Hub-interior keys are not display keys.
 - Junction cook is **Fig1** + vertex-order audit; fail → abort mesh. **Follow [Junction Spec](../../../Docs/MetaLandRoad-Junction-Spec.md) exactly.**
+- Attribute UI (Landscape, PropSetting, Sidewalk, later rows) stays on `FMetaLandRoadEditorModule` + the existing component visualizer. Do not add a module. Enter = overlay flag only. Hover = visualizer tick. Click = visualizer, miss returns false. Draw uses `GetJunctionMeshGenerationSpans`.
 - CutS / remaining-road spans have **one owner**: `GetJunctionMeshGenerationSpans`. Do not copy a second trim test.
 - Do not fix N-way by changing T hole/fillet, or T by changing Cross/N hole. Same-spline adjacent = outer chord, never inward fillet.
 - Body-corner mesh: loft sweeps the authored spline (`Center + Right × Off`). Do not replace PathCenter with a second fillet curve. `EvalLanePosition` stays raw (Fig1 / half-width). Junction holes stay Fig1. Contract: [Docs/MetaLandRoad-Guidance-vs-Mesh-Review.md](../../../Docs/MetaLandRoad-Guidance-vs-Mesh-Review.md) §1 / §3.
+- **Ctrl 画线（普通落点，不是 C / 嘴）：**
+  - **落点：** 射线第一命中的世界坐标就是点击。路上才吸附 / junction（`InSertTransform`）。地形只改 Z 贴地，XY 不换、不走中心线吸附。
+  - **Undo：** 见 [Docs/MetaLandRoad-Ctrl-Draw-Undo.md](../../../Docs/MetaLandRoad-Ctrl-Draw-Undo.md)。加点前 `Modify`；一笔交易只在 `AddSplinePoint`；禁止 Release `EndTransaction`；Undo 后路没了就结束会话，还在就按当前路宽重画引导。
+  - **折线：** 见 [Docs/MetaLandRoad-Ctrl-Draw-Corner.md](../../../Docs/MetaLandRoad-Ctrl-Draw-Corner.md)。已确认点不改；只写新段；禁止插折角 keys；封面中线/内外边同一段贝塞尔。`EvalLanePosition` 仍生样条。C / 嘴另一套。
 
 ## Review before rewrite (mandatory)
 

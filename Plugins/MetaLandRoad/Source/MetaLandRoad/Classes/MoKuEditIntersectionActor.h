@@ -122,6 +122,10 @@ class METALANDROAD_API AMoKuEditIntersectionActor : public AMoKuEditBaseActor
 		/** Houdini silhouette cover: cut caps + N arcs + fill; audits vertex order. */
 		void RefreshJunctionCoverMesh();
 
+		/** One DynamicMeshComponent per outer corner curb. Not merged into the junction cover. */
+		UPROPERTY()
+		TArray<TObjectPtr<UDynamicMeshComponent>> SidewalkMeshComponents;
+
 		/** Recalculate arm cuts from linked road geometry and rebuild fill mesh. */
 		void RecookFromLinkedRoads();
 

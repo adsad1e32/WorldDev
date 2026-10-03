@@ -21,6 +21,7 @@
 #include "Engine/World.h"
 #include "EngineUtils.h"
 #include "Framework/Application/SlateApplication.h"
+#include "LandscapeProxy.h"
 #include "SceneManagement.h"
 #include "Tools/UEdMode.h"
 
@@ -1287,6 +1288,54 @@ bool ComputeAsymmetricTangentBezier(
 	return true;
 }
 
+/** Grow if centerline R < HalfW. Shrink only when a handle would loop past mid-chord. */
+static void ClampHermiteHandlesToLaneWidth(
+	const FVector& P0,
+	const FVector& P1,
+	const FVector& T0,
+	const FVector& T1,
+	FVector& InOutH0,
+	FVector& InOutH1,
+	double HalfWidthCm)
+{
+	const double Dist = FVector::Dist2D(P0, P1);
+	if (Dist <= 1.0)
+	{
+		return;
+	}
+	const FVector N0 = T0.GetSafeNormal2D();
+	const FVector N1 = T1.GetSafeNormal2D();
+	const double Theta = FMath::Acos(
+		FMath::Clamp(FVector::DotProduct(N0, N1), -1.0, 1.0));
+	if (Theta < FMath::DegreesToRadians(12.0))
+	{
+		return;
+	}
+	const double HalfW = FMath::Max(HalfWidthCm, 80.0);
+	const double TanQ = FMath::Tan(FMath::Clamp(Theta * 0.25, 0.0, 0.65));
+	const double NeedH = (4.0 / 3.0) * HalfW * TanQ;
+	const double MaxH = Dist * 0.5;
+	const double FloorH = FMath::Clamp(NeedH, 16.0, MaxH);
+	auto Fit = [FloorH, MaxH](FVector& Handle)
+	{
+		const double Len = Handle.Size2D();
+		if (Len <= 1.0)
+		{
+			return;
+		}
+		if (Len > MaxH)
+		{
+			Handle *= (MaxH / Len);
+		}
+		else if (Len < FloorH)
+		{
+			Handle *= (FloorH / Len);
+		}
+	};
+	Fit(InOutH0);
+	Fit(InOutH1);
+}
+
 FVector EvalCubicBezier(
 	const FVector& P0,
 	const FVector& C1,
@@ -1362,6 +1411,21 @@ void ApplyAsymmetricTangentBezierConnection(
 	if (!ComputeAsymmetricTangentBezier(Pos0, EndPos, LeaveDir, ArriveDir, 0.35, Path))
 	{
 		return;
+	}
+	{
+		FVector H0 = Path.Ctrl1 - Path.Pos0;
+		FVector H1 = Path.Pos1 - Path.Ctrl2;
+		double HalfW = 80.0;
+		if (const UMetaLandRoadSplineComponent* RoadSpline = Cast<UMetaLandRoadSplineComponent>(SplineComponent))
+		{
+			const double S = RoadSpline->GetDistanceAlongSplineAtSplinePoint(StartIndex);
+			HalfW = FMath::Max(RoadSpline->GetRoadHalfWidthAtS(S), 80.0);
+		}
+		ClampHermiteHandlesToLaneWidth(Path.Pos0, Path.Pos1, Path.Dir0, Path.Dir1, H0, H1, HalfW);
+		Path.Ctrl1 = Path.Pos0 + H0;
+		Path.Ctrl2 = Path.Pos1 - H1;
+		Path.Ctrl1.Z = Path.Pos0.Z;
+		Path.Ctrl2.Z = Path.Pos1.Z;
 	}
 
 	while (SplineComponent->GetNumberOfSplinePoints() > StartIndex + 1)
@@ -1594,6 +1658,13 @@ void ApplyLaneExtendHermiteSegmentHandles(
 	FVector Handle0World;
 	FVector Handle1World;
 	ComputeCentripetalCatmullRomHermiteTangents(P0, P1, T0, T1, Handle0World, Handle1World);
+	double HalfW = 80.0;
+	if (const UMetaLandRoadSplineComponent* RoadSpline = Cast<UMetaLandRoadSplineComponent>(SplineComponent))
+	{
+		const double S = RoadSpline->GetDistanceAlongSplineAtSplinePoint(StartIndex);
+		HalfW = FMath::Max(RoadSpline->GetRoadHalfWidthAtS(S), 80.0);
+	}
+	ClampHermiteHandlesToLaneWidth(P0, P1, T0, T1, Handle0World, Handle1World, HalfW);
 
 	SplineComponent->SetSplinePointType(StartIndex, ESplinePointType::CurveCustomTangent, false);
 	if (bPreserveStartArrive)
@@ -1767,6 +1838,37 @@ static bool IsNearJunctionInterfaceS(double PointS, const TArray<double>& Statio
 		}
 	}
 	return false;
+}
+
+static bool IsHubJunctionMouthS(const AMoKuEditSplineActor* Road, double MouthS, double Length)
+{
+	if (!Road || MouthS < 0.0 || Length <= KINDA_SMALL_NUMBER)
+	{
+		return false;
+	}
+
+	auto Near = [MouthS](double Station) -> bool
+	{
+		return Station >= 0.0 && FMath::Abs(Station - MouthS) <= 40.0;
+	};
+
+	for (const FMetaLandRoadJunctionTrimZone& Zone : Road->JunctionTrimZones)
+	{
+		const bool bHasGap = Zone.ApproachCutS >= 0.0
+			&& Zone.DepartCutS >= 0.0
+			&& (Zone.DepartCutS - Zone.ApproachCutS) > MetaLandRoad::MinKeepRoadSpanCm;
+		if (bHasGap && (Near(Zone.ApproachCutS) || Near(Zone.DepartCutS)))
+		{
+			return true;
+		}
+	}
+
+	const bool bAtSplineTip = MouthS <= 25.0 || MouthS >= Length - 25.0;
+	if (bAtSplineTip)
+	{
+		return false;
+	}
+	return Near(Road->StartJunctionMeshTrimS) || Near(Road->EndJunctionMeshTrimS);
 }
 
 static bool SegmentTouchesJunctionInterface(
@@ -1971,19 +2073,14 @@ static double ResolveJointHalfWidthCm(const USplineComponent* Spline, int32 Poin
 	{
 		const double S = RoadSpline->GetDistanceAlongSplineAtSplinePoint(
 			FMath::Clamp(PointIndex, 0, FMath::Max(RoadSpline->GetNumberOfSplinePoints() - 1, 0)));
+		FVector EdgeL, EdgeR, EdgeC;
+		if (RoadSpline->GetRoadEdgePointsAtS(S, EdgeL, EdgeR, EdgeC, ESplineCoordinateSpace::World))
+		{
+			return FMath::Max(FVector::Dist2D(EdgeL, EdgeR) * 0.5, 80.0);
+		}
 		return FMath::Max(RoadSpline->GetRoadHalfWidthAtS(S), 80.0);
 	}
 	return FMath::Max(MetaLandRoad::DefaultRoadLaneWidth * 0.5, 80.0);
-}
-
-static double InterfaceMinAlongCm(double HalfWidthCm)
-{
-	return FMath::Max(HalfWidthCm, 80.0);
-}
-
-static double BodyCornerNeedAlongCm(double HalfWidthCm, double AngleRad)
-{
-	return MetaLandRoad::CornerFilletNeedAlongCm(HalfWidthCm, AngleRad);
 }
 
 static double WidthAwareHandleLenCm(
@@ -1997,12 +2094,13 @@ static double WidthAwareHandleLenCm(
 	const double Span = FMath::Max(OutLen, 1.0);
 	if (AngleRad < FMath::DegreesToRadians(8.0))
 	{
-		return FMath::Min(Span * 0.32, HalfW * 0.45);
+		return FMath::Min(Span * 0.85, HalfW * 0.45);
 	}
 
-	const double Handle =
-		(4.0 / 3.0) * HalfW * FMath::Tan(FMath::Clamp(AngleRad * 0.25, 0.0, 0.65));
-	return FMath::Clamp(Handle, 16.0, Span * 0.32);
+	const double Quarter = FMath::Tan(FMath::Clamp(AngleRad * 0.25, 0.0, 0.65));
+	const double NeedH = (4.0 / 3.0) * HalfW * Quarter;
+	const double MaxH = FMath::Min(Span * 0.55, HalfW * 2.0);
+	return FMath::Clamp(NeedH, 16.0, MaxH);
 }
 
 void ApplyWidthAwareNewSpanTangents(
@@ -2039,66 +2137,35 @@ void ApplyWidthAwareNewSpanTangents(
 		return;
 	}
 
-	double NewLen = FMath::Max(FVector::Dist2D(JointPos, TipPos), 80.0);
+	const double NewLen = FMath::Max(FVector::Dist2D(JointPos, TipPos), 80.0);
 	const double BodyLen = FMath::Max(FVector::Dist2D(JointPos, BodyPos), 80.0);
 	const double Angle = FMath::Acos(FMath::Clamp(FVector::DotProduct(BodyDir, NewDir), -1.0, 1.0));
 	const double HalfW = ResolveJointHalfWidthCm(Spline, JointIndex);
-
-	TArray<double> InterfaceStations;
-	CollectJunctionInterfaceStations(Spline, InterfaceStations);
-	const bool bJointIsInterface = IsNearJunctionInterfaceS(
-		Spline->GetDistanceAlongSplineAtSplinePoint(JointIndex), InterfaceStations)
-		|| SegmentTouchesJunctionInterface(Spline, BodyIndex, JointIndex, InterfaceStations);
-	const double MinAlongCm = bJointIsInterface
-		? InterfaceMinAlongCm(HalfW)
-		: BodyCornerNeedAlongCm(HalfW, Angle);
-	if (NewLen < MinAlongCm)
-	{
-		FVector Pushed = JointPos + NewDir * MinAlongCm;
-		Pushed.Z = TipPos.Z;
-		Spline->SetLocationAtSplinePoint(NewTipIndex, Pushed, ESplineCoordinateSpace::World, false);
-		NewLen = MinAlongCm;
-	}
 	const double Handle = WidthAwareHandleLenCm(BodyLen, NewLen, Angle, HalfW);
 
-	FVector Arrive = Spline->GetArriveTangentAtSplinePoint(JointIndex, ESplineCoordinateSpace::World);
-	FVector Leave = Spline->GetLeaveTangentAtSplinePoint(JointIndex, ESplineCoordinateSpace::World);
+	const FVector Arrive = Spline->GetArriveTangentAtSplinePoint(JointIndex, ESplineCoordinateSpace::World);
+	const FVector Leave = Spline->GetLeaveTangentAtSplinePoint(JointIndex, ESplineCoordinateSpace::World);
 	Spline->SetSplinePointType(JointIndex, ESplinePointType::CurveCustomTangent, false);
-	if (bJointIsInterface)
+	if (bTipBeforeJoint)
 	{
-		if (bTipBeforeJoint)
-		{
-			Spline->SetTangentsAtSplinePoint(
-				JointIndex,
-				NewDir * Handle,
-				Leave,
-				ESplineCoordinateSpace::World,
-				false);
-		}
-		else
-		{
-			Spline->SetTangentsAtSplinePoint(
-				JointIndex,
-				Arrive,
-				NewDir * Handle,
-				ESplineCoordinateSpace::World,
-				false);
-		}
-	}
-	else if (bTipBeforeJoint)
-	{
+		const FVector KeepLeave = Leave.GetSafeNormal2D().IsNearlyZero()
+			? (BodyDir * Handle)
+			: Leave;
 		Spline->SetTangentsAtSplinePoint(
 			JointIndex,
 			NewDir * Handle,
-			BodyDir * Handle,
+			KeepLeave,
 			ESplineCoordinateSpace::World,
 			false);
 	}
 	else
 	{
+		const FVector KeepArrive = Arrive.GetSafeNormal2D().IsNearlyZero()
+			? (BodyDir * Handle)
+			: Arrive;
 		Spline->SetTangentsAtSplinePoint(
 			JointIndex,
-			BodyDir * Handle,
+			KeepArrive,
 			NewDir * Handle,
 			ESplineCoordinateSpace::World,
 			false);
@@ -2163,15 +2230,12 @@ bool TrySnapDrawToRoadCrossing(
 	}
 
 	const FVector2D A(FromPos.X, FromPos.Y);
-	FVector2D B(Cursor.X, Cursor.Y);
-	FVector2D AB = B - A;
-	if (AB.SizeSquared() < 1.0)
+	const FVector2D B(Cursor.X, Cursor.Y);
+	if ((B - A).SizeSquared() < 1.0)
 	{
 		return false;
 	}
-	const double Reach = FMath::Max(static_cast<double>(ReachCm), 280.0);
-	AB.Normalize();
-	B = FVector2D(FromPos.X, FromPos.Y) + AB * (FVector::Dist2D(FromPos, Cursor) + Reach);
+	const double Reach = FMath::Max(static_cast<double>(ReachCm), 80.0);
 
 	double BestDist = 1.0e12;
 	FVector Best = FVector::ZeroVector;
@@ -2215,6 +2279,11 @@ bool TrySnapDrawToRoadCrossing(
 			}
 			const FVector Cross(Hit.X, Hit.Y, 0.5 * (FromPos.Z + Cur.Z));
 			const double Dist = FVector::Dist2D(Cross, Cursor);
+			if (Dist > Reach)
+			{
+				Prev = Cur;
+				continue;
+			}
 			if (Dist < BestDist)
 			{
 				BestDist = Dist;
@@ -2264,6 +2333,10 @@ static void MoveOwnedMouthCut(
 	double BestAbs = OwnMouthTol + 1.0;
 	for (int32 i = 0; i < Road->JunctionTrimZones.Num(); ++i)
 	{
+		if (Road->JunctionTrimZones[i].Junction.IsValid())
+		{
+			continue;
+		}
 		const double Approach = Road->JunctionTrimZones[i].ApproachCutS;
 		const double Depart = Road->JunctionTrimZones[i].DepartCutS;
 		if (Near(Approach))
@@ -2311,7 +2384,8 @@ bool AddContinueDrawSplinePoint(
 	const FVector& WorldPos,
 	bool bInsertAtStart,
 	double MouthS,
-	const FVector& MouthCenter)
+	const FVector& MouthCenter,
+	bool bKeepWorldZ)
 {
 	if (!Road)
 	{
@@ -2325,42 +2399,17 @@ bool AddContinueDrawSplinePoint(
 	}
 
 	FVector SnapPos = WorldPos;
-	ProjectPointOntoLandscapeSurface(Road->GetWorld(), SnapPos, Road);
+	if (!bKeepWorldZ)
+	{
+		ProjectPointOntoLandscapeSurface(Road->GetWorld(), SnapPos, Road);
+	}
 
+	const double LengthBefore = Spline->GetSplineLength();
+	const bool bHubMouth = IsHubJunctionMouthS(Road, MouthS, LengthBefore);
 	const int32 NumBefore = Spline->GetNumberOfSplinePoints();
 	TArray<FLaneExtendPointFreeze> Freezes;
 	CaptureLaneExtendPointFreezes(Spline, 0, NumBefore, Freezes);
-
-	const int32 MouthIndex = bInsertAtStart ? 0 : (NumBefore - 1);
-	FVector MouthPos = (MouthS >= 0.0 && !MouthCenter.IsNearlyZero())
-		? MouthCenter
-		: Spline->GetLocationAtSplinePoint(MouthIndex, ESplineCoordinateSpace::World);
-	if (MouthS >= 0.0)
-	{
-		MouthPos = Spline->GetLocationAtDistanceAlongSpline(MouthS, ESplineCoordinateSpace::World);
-	}
-	FVector Outward;
-	if (MouthS >= 0.0)
-	{
-		Outward = Spline->GetDirectionAtDistanceAlongSpline(MouthS, ESplineCoordinateSpace::World).GetSafeNormal2D();
-		if (bInsertAtStart)
-		{
-			Outward = -Outward;
-		}
-	}
-	else
-	{
-		Outward = MouthOutwardFromSplinePoints(Spline, bInsertAtStart);
-	}
-	const double HalfW = ResolveJointHalfWidthCm(Spline, MouthIndex);
-	const double MinAlongCm = InterfaceMinAlongCm(HalfW);
-	const double Along = FVector::DotProduct(SnapPos - MouthPos, Outward);
-	if (!Outward.IsNearlyZero() && Along < MinAlongCm)
-	{
-		const FVector Lateral = SnapPos - MouthPos - Outward * Along;
-		SnapPos = MouthPos + Outward * MinAlongCm + Lateral;
-		ProjectPointOntoLandscapeSurface(Road->GetWorld(), SnapPos, Road);
-	}
+	(void)MouthCenter;
 
 	Road->Modify();
 	Spline->Modify();
@@ -2373,8 +2422,14 @@ bool AddContinueDrawSplinePoint(
 		: FMath::Max(NewIndex - 1, 0);
 	const int32 RestoreBegin = bInsertAtStart ? (NewIndex + 1) : 0;
 	RestoreJunctionInterfaceFreezes(Spline, RestoreBegin, Freezes);
-	ApplyWidthAwareNewSpanTangents(Spline, NeighborIndex, NewIndex);
-	RestoreJunctionInterfaceFreezes(Spline, RestoreBegin, Freezes);
+
+	const int32 NumPts = Spline->GetNumberOfSplinePoints();
+	if (NumPts >= 3)
+	{
+		const int32 TipIndex = bInsertAtStart ? 0 : (NumPts - 1);
+		const int32 JointIndex = bInsertAtStart ? 1 : (NumPts - 2);
+		ApplyWidthAwareNewSpanTangents(Spline, JointIndex, TipIndex);
+	}
 
 	if (UMetaLandRoadSplineComponent* RoadSpline = Cast<UMetaLandRoadSplineComponent>(Spline))
 	{
@@ -2398,11 +2453,67 @@ bool AddContinueDrawSplinePoint(
 		}
 	}
 	const double NewTipS = Spline->GetDistanceAlongSplineAtSplinePoint(NewIndex);
-	MoveOwnedMouthCut(Road, bInsertAtStart, MouthS, NewTipS);
+	if (!bHubMouth)
+	{
+		MoveOwnedMouthCut(Road, bInsertAtStart, MouthS, NewTipS);
+	}
 
 	Road->UpdateInterpolateType(NeighborIndex);
 	HideEditorSplineRibbon(Spline);
 	return true;
+}
+
+void ReconstructContinueDrawAuthoringSpline(AMoKuEditSplineActor* Road)
+{
+	if (!Road)
+	{
+		return;
+	}
+	UMoKuEditSplinesComponent* Spline = Road->GetSplineComponent();
+	if (!Spline || Spline->GetNumberOfSplinePoints() < 2)
+	{
+		return;
+	}
+
+	Road->Modify();
+	Spline->Modify();
+
+	struct FAuthoringKey
+	{
+		FVector Pos = FVector::ZeroVector;
+		FVector Arrive = FVector::ZeroVector;
+		FVector Leave = FVector::ZeroVector;
+		TEnumAsByte<ESplinePointType::Type> Type = ESplinePointType::Curve;
+	};
+	TArray<FAuthoringKey> Keys;
+	const int32 NumPts = Spline->GetNumberOfSplinePoints();
+	Keys.Reserve(NumPts);
+	for (int32 i = 0; i < NumPts; ++i)
+	{
+		FAuthoringKey Key;
+		Key.Pos = Spline->GetLocationAtSplinePoint(i, ESplineCoordinateSpace::World);
+		Key.Arrive = Spline->GetArriveTangentAtSplinePoint(i, ESplineCoordinateSpace::World);
+		Key.Leave = Spline->GetLeaveTangentAtSplinePoint(i, ESplineCoordinateSpace::World);
+		Key.Type = Spline->GetSplinePointType(i);
+		Keys.Add(Key);
+	}
+	for (int32 i = 0; i < Keys.Num(); ++i)
+	{
+		Spline->SetLocationAtSplinePoint(i, Keys[i].Pos, ESplineCoordinateSpace::World, false);
+		Spline->SetSplinePointType(i, Keys[i].Type, false);
+		Spline->SetTangentsAtSplinePoint(
+			i, Keys[i].Arrive, Keys[i].Leave, ESplineCoordinateSpace::World, false);
+	}
+
+	if (UMetaLandRoadSplineComponent* RoadSpline = Cast<UMetaLandRoadSplineComponent>(Spline))
+	{
+		RoadSpline->UpdateSplineKeepTangents(/*bUpdateSectionBounds*/ false);
+	}
+	else
+	{
+		Spline->UpdateSpline();
+	}
+	HideEditorSplineRibbon(Spline);
 }
 
 double CrossXY(const FVector& A, const FVector& B)
@@ -2975,8 +3086,8 @@ static double MouthReserveAlongCm(const FVector& Dir, const FVector& Chord, doub
 	{
 		return 0.0;
 	}
-	// Floor HalfW so the corridor leaves along the mouth before Dubins turns (Fig3).
-	return FMath::Max(MetaLandRoad::CornerFilletNeedAlongCm(HalfW, Hook), HalfW);
+	// Short collinear lead only — CornerFilletNeedAlong / HalfW floor made 直角延伸过长.
+	return FMath::Clamp(HalfW * 0.18, 36.0, 80.0);
 }
 
 static void FitMouthReserveLeads(
@@ -3009,22 +3120,58 @@ bool TryMakeLeaveArrivePlan(
 	const FVector& LeaveDir,
 	const FVector& ArriveDir,
 	double MinRadiusCm,
-	FLeaveArrivePlan& OutPlan)
+	FLeaveArrivePlan& OutPlan,
+	double HalfWidthCm)
 {
 	const FVector Leave = LeaveDir.GetSafeNormal2D();
 	const FVector Arrive = ArriveDir.GetSafeNormal2D();
-	if (!TryMakeLeaveArrivePlan_DubinsCSC(
-		P0, P1, Leave, Arrive, MinRadiusCm, OutPlan))
+	const FVector Mouth0 = P0;
+	const FVector Mouth1 = P1;
+	const FVector Chord = (Mouth1 - Mouth0).GetSafeNormal2D();
+	const double Dist = FVector::Dist2D(Mouth0, Mouth1);
+	const double HalfW = HalfWidthCm > 1.0
+		? HalfWidthCm
+		: FMath::Max(MinRadiusCm * 0.5, 80.0);
+
+	double Lead0 = MouthReserveAlongCm(Leave, Chord, HalfW);
+	double Lead1 = MouthReserveAlongCm(Arrive, Chord, HalfW);
+	FitMouthReserveLeads(Dist, HalfW, MinRadiusCm, Lead0, Lead1);
+
+	FVector Dubins0 = Mouth0 + Leave * Lead0;
+	FVector Dubins1 = Mouth1 - Arrive * Lead1;
+	const FVector InsetChord = (Dubins1 - Dubins0).GetSafeNormal2D();
+	const double MinDubins = FMath::Max(MinRadiusCm, HalfW * 2.0);
+	if (FVector::Dist2D(Dubins0, Dubins1) < MinDubins
+		|| (!InsetChord.IsNearlyZero() && !Chord.IsNearlyZero()
+			&& FVector::DotProduct(InsetChord, Chord) < 0.15))
 	{
-		return false;
+		Lead0 = 0.0;
+		Lead1 = 0.0;
+		Dubins0 = Mouth0;
+		Dubins1 = Mouth1;
 	}
 
-	// Mouth-reserve leads were a straight stub along the bar, then Dubins from
-	// an inset point. Green kinked at the orange mouth; A overlapped that stub.
-	OutPlan.Stub0 = P0;
-	OutPlan.Stub1 = P1;
-	OutPlan.LeaveLen = 0.0;
-	OutPlan.ArriveLen = 0.0;
+	if (!TryMakeLeaveArrivePlan_DubinsCSC(
+		Dubins0, Dubins1, Leave, Arrive, MinRadiusCm, OutPlan))
+	{
+		if (Lead0 <= 1.0 && Lead1 <= 1.0)
+		{
+			return false;
+		}
+		Lead0 = 0.0;
+		Lead1 = 0.0;
+		if (!TryMakeLeaveArrivePlan_DubinsCSC(
+			Mouth0, Mouth1, Leave, Arrive, MinRadiusCm, OutPlan))
+		{
+			return false;
+		}
+	}
+
+	// Outward stubs only (into the new corridor). Inward leads overlapped remaining-road.
+	OutPlan.Stub0 = Mouth0;
+	OutPlan.Stub1 = Mouth1;
+	OutPlan.LeaveLen = Lead0;
+	OutPlan.ArriveLen = Lead1;
 	return true;
 }
 
@@ -3191,6 +3338,10 @@ void KeyLeaveArrivePlan(const FLeaveArrivePlan& Plan, TArray<FVector>& OutKeys)
 			}
 			AddAway(AtNorm(Norm0 + Sweep), AwayFrom, StepCm);
 		};
+		if (Plan.LeaveLen > 1.0)
+		{
+			AddAway(Plan.P0, Plan.Stub0, 40.0);
+		}
 		AddArcBreaks(Plan.DubinsT, 0.0, Plan.P0);
 		if (Plan.DubinsP * R > 2.0 * StepCm)
 		{
@@ -3198,6 +3349,10 @@ void KeyLeaveArrivePlan(const FLeaveArrivePlan& Plan, TArray<FVector>& OutKeys)
 		}
 		AddAway(AtNorm(Plan.DubinsT + Plan.DubinsP), Plan.P1, StepCm);
 		AddArcBreaks(Plan.DubinsQ, Plan.DubinsT + Plan.DubinsP, Plan.P1);
+		if (Plan.ArriveLen > 1.0)
+		{
+			AddAway(Plan.P1, Plan.Stub1, 40.0);
+		}
 		OutKeys.Add(EndMouth);
 		break;
 	}
@@ -3627,6 +3782,12 @@ static bool BakeCornerRampAfterMouth(
 	const FVector Leave = LeaveDir.GetSafeNormal2D();
 	const FVector Arrive = ArriveDir.GetSafeNormal2D();
 	const FVector ChordDir = (EndPos - MouthPos).GetSafeNormal2D();
+	double HalfW = FMath::Max(MinRadiusCm * 0.5, 80.0);
+	if (const UMetaLandRoadSplineComponent* RoadSpline = Cast<UMetaLandRoadSplineComponent>(Spline))
+	{
+		const double MouthS = RoadSpline->GetDistanceAlongSplineAtSplinePoint(MouthIndex);
+		HalfW = FMath::Max(RoadSpline->GetRoadHalfWidthAtS(MouthS), 80.0);
+	}
 
 	FLeaveArrivePlan Plan;
 	if (!TryMakeLeaveArrivePlan(
@@ -3635,15 +3796,10 @@ static bool BakeCornerRampAfterMouth(
 		Leave.IsNearlyZero() ? ChordDir : Leave,
 		Arrive.IsNearlyZero() ? ChordDir : Arrive,
 		MinRadiusCm,
-		Plan))
+		Plan,
+		HalfW))
 	{
 		return false;
-	}
-	double HalfW = FMath::Max(MinRadiusCm, 80.0);
-	if (const UMetaLandRoadSplineComponent* RoadSpline = Cast<UMetaLandRoadSplineComponent>(Spline))
-	{
-		const double MouthS = RoadSpline->GetDistanceAlongSplineAtSplinePoint(MouthIndex);
-		HalfW = FMath::Max(RoadSpline->GetRoadHalfWidthAtS(MouthS), 80.0);
 	}
 	if (IsLeaveArrivePlanUnusable(Plan, HalfW))
 	{
@@ -3683,6 +3839,11 @@ static bool BakeCornerRampBeforeMouth(
 	const FVector Leave = LeaveDir.GetSafeNormal2D();
 	const FVector Arrive = ArriveDir.GetSafeNormal2D();
 	const FVector ChordDir = (EndPos - MouthPos).GetSafeNormal2D();
+	double HalfW = FMath::Max(MinRadiusCm * 0.5, 80.0);
+	if (const UMetaLandRoadSplineComponent* RoadSpline = Cast<UMetaLandRoadSplineComponent>(Spline))
+	{
+		HalfW = FMath::Max(RoadSpline->GetRoadHalfWidthAtS(0.0), 80.0);
+	}
 
 	FLeaveArrivePlan Plan;
 	if (!TryMakeLeaveArrivePlan(
@@ -3691,14 +3852,10 @@ static bool BakeCornerRampBeforeMouth(
 		Leave.IsNearlyZero() ? ChordDir : Leave,
 		Arrive.IsNearlyZero() ? ChordDir : Arrive,
 		MinRadiusCm,
-		Plan))
+		Plan,
+		HalfW))
 	{
 		return false;
-	}
-	double HalfW = FMath::Max(MinRadiusCm, 80.0);
-	if (const UMetaLandRoadSplineComponent* RoadSpline = Cast<UMetaLandRoadSplineComponent>(Spline))
-	{
-		HalfW = FMath::Max(RoadSpline->GetRoadHalfWidthAtS(0.0), 80.0);
 	}
 	if (IsLeaveArrivePlanUnusable(Plan, HalfW))
 	{
@@ -3939,6 +4096,12 @@ static void StripLeaveInsetBakeKey(const FLeaveArrivePlan& Plan, TArray<FVector>
 	{
 		return;
 	}
+	const FVector Out = Plan.Leave.GetSafeNormal2D();
+	const FVector StubDir = (Plan.P0 - Plan.Stub0).GetSafeNormal2D();
+	if (!Out.IsNearlyZero() && FVector::DotProduct(StubDir, Out) > 0.25)
+	{
+		return;
+	}
 	if (FVector::Dist2D(Keys[0], Plan.P0) < 40.0
 		&& FVector::Dist2D(Keys[0], Plan.Stub0) > 40.0)
 	{
@@ -4141,11 +4304,36 @@ static void ApplyCorridorEndCaps(
 
 	(void)SrcLeft;
 	(void)SrcRight;
-	(void)SrcLeave;
-	(void)Centerline;
-	(void)TargetOutward;
-	Spline->SetSplinePointType(MouthIndex, ESplinePointType::Linear, false);
-	Spline->SetSplinePointType(TipIndex, ESplinePointType::Linear, false);
+	FVector Leave = SrcLeave.GetSafeNormal2D();
+	if (Leave.IsNearlyZero())
+	{
+		Leave = CorridorLeaveFromCenterline(Centerline);
+	}
+	if (Leave.IsNearlyZero()
+		&& Spline->SplineCurves.Position.Points.IsValidIndex(MouthIndex)
+		&& Spline->SplineCurves.Position.Points.IsValidIndex(
+			MouthIndex < TipIndex ? (MouthIndex + 1) : (MouthIndex - 1)))
+	{
+		const int32 Next = MouthIndex < TipIndex ? (MouthIndex + 1) : (MouthIndex - 1);
+		Leave = (Spline->GetLocationAtSplinePoint(Next, ESplineCoordinateSpace::World)
+			- Spline->GetLocationAtSplinePoint(MouthIndex, ESplineCoordinateSpace::World))
+			.GetSafeNormal2D();
+	}
+	FVector Arrive = SnapTravelToOutwardBar(
+		TargetOutward,
+		(-TargetOutward).GetSafeNormal2D());
+	if (Arrive.IsNearlyZero())
+	{
+		Arrive = (-TargetOutward).GetSafeNormal2D();
+	}
+	if (!Leave.IsNearlyZero())
+	{
+		ApplyDubinsCustomTangent(Spline, MouthIndex, Leave, /*bLeaveOnly*/ true);
+	}
+	if (!Arrive.IsNearlyZero())
+	{
+		ApplyDubinsCustomTangent(Spline, TipIndex, Arrive, /*bLeaveOnly*/ false);
+	}
 }
 
 static int32 WriteDubinsTangentBakeKeysAfterInsert(
@@ -4279,6 +4467,10 @@ static void HideLeftoverAfterContinueBake(
 	Road->Modify();
 	for (FMetaLandRoadJunctionTrimZone& Zone : Road->JunctionTrimZones)
 	{
+		if (Zone.Junction.IsValid())
+		{
+			continue;
+		}
 		const bool bNearApproach =
 			Zone.ApproachCutS >= 0.0 && FMath::Abs(Zone.ApproachCutS - Approach) < 80.0;
 		const bool bNearDepart =
@@ -4310,7 +4502,11 @@ static void SealContinueDrawBakeTip(
 	}
 
 	const double NewTipS = Spline->GetDistanceAlongSplineAtSplinePoint(TipIndex);
-	MoveOwnedMouthCut(Road, bAttachAtStart, OldTipS, NewTipS);
+	const double Length = Spline->GetSplineLength();
+	if (!IsHubJunctionMouthS(Road, OldTipS, Length))
+	{
+		MoveOwnedMouthCut(Road, bAttachAtStart, OldTipS, NewTipS);
+	}
 	HideLeftoverAfterContinueBake(Road, Spline, TipIndex, bAttachAtStart);
 }
 
@@ -4335,23 +4531,18 @@ static int32 BakeDubinsCorridorAfterInsert(
 	}
 	const double MinR = DiffuseRadiusForLink(StartPos, EndPos, LeaveN, ArriveN, HalfW);
 	FLeaveArrivePlan Plan;
-	// Bake from the live mouth. Mouth-reserve Lead0 was a straight stub along
-	// the old CutS leave; A then curved from the previous key → 红框重叠.
-	if (!TryMakeLeaveArrivePlan_DubinsCSC(
+	if (!TryMakeLeaveArrivePlan(
 			StartPos,
 			EndPos,
 			LeaveN.IsNearlyZero() ? Chord : LeaveN,
 			ArriveN.IsNearlyZero() ? Chord : ArriveN,
 			MinR,
-			Plan)
+			Plan,
+			HalfW)
 		|| IsLeaveArrivePlanUnusable(Plan, HalfW))
 	{
 		return 0;
 	}
-	Plan.Stub0 = StartPos;
-	Plan.Stub1 = EndPos;
-	Plan.LeaveLen = 0.0;
-	Plan.ArriveLen = 0.0;
 	TArray<FVector> Keys;
 	KeyLeaveArrivePlan(Plan, Keys);
 	StripLeaveInsetBakeKey(Plan, Keys);
@@ -4487,7 +4678,8 @@ bool PinContinueDrawTipToTargetMouth(
 	const FVector& TargetOutward,
 	const TArray<FVector>* PreviewCenterline,
 	double PreviewMouthS,
-	const FVector& PreviewMouthCenter)
+	const FVector& PreviewMouthCenter,
+	bool bKeepAuthoringKeys)
 {
 	if (!Spline || Spline->GetNumberOfSplinePoints() < 1)
 	{
@@ -4507,10 +4699,19 @@ bool PinContinueDrawTipToTargetMouth(
 		DisplayTipPos);
 
 	const TArray<FVector>* CenterlineToBake = PreviewCenterline;
-	if (PreviewCenterline && PreviewCenterline->Num() >= 2
-		&& FVector::Dist2D((*PreviewCenterline)[0], DisplayTipPos) > 80.0)
+	if (PreviewCenterline && PreviewCenterline->Num() >= 2)
 	{
-		CenterlineToBake = nullptr;
+		const int32 LiveTipIndex = bAttachAtSplineStart
+			? 0
+			: (Spline->GetNumberOfSplinePoints() - 1);
+		const FVector LiveTip = Spline->SplineCurves.Position.Points.IsValidIndex(LiveTipIndex)
+			? Spline->GetLocationAtSplinePoint(LiveTipIndex, ESplineCoordinateSpace::World)
+			: DisplayTipPos;
+		if (FVector::Dist2D((*PreviewCenterline)[0], DisplayTipPos) > 120.0
+			&& FVector::Dist2D((*PreviewCenterline)[0], LiveTip) > 120.0)
+		{
+			CenterlineToBake = nullptr;
+		}
 	}
 
 	const int32 NumBefore = Spline->GetNumberOfSplinePoints();
@@ -4526,6 +4727,38 @@ bool PinContinueDrawTipToTargetMouth(
 	}
 
 	Spline->Modify();
+	if (bKeepAuthoringKeys)
+	{
+		if (bAttachAtSplineStart && OriginalNum > 0 && NumBefore > OriginalNum)
+		{
+			RestoreLaneExtendPointFreezes(Spline, NumBefore - OriginalNum, BodyFreezes, INDEX_NONE);
+		}
+		else
+		{
+			RestoreLaneExtendPointFreezes(Spline, 0, BodyFreezes, INDEX_NONE);
+		}
+		int32 TipIndex = bAttachAtSplineStart ? 0 : (Spline->GetNumberOfSplinePoints() - 1);
+		if (!TargetCenter.IsNearlyZero()
+			&& Spline->SplineCurves.Position.Points.IsValidIndex(TipIndex))
+		{
+			PinBakedTipToTargetMouthBar(
+				Spline,
+				TipIndex,
+				TargetCenter,
+				TargetOutward,
+				bAttachAtSplineStart,
+				INDEX_NONE);
+		}
+		if (UMetaLandRoadSplineComponent* RoadSpline = Cast<UMetaLandRoadSplineComponent>(Spline))
+		{
+			RoadSpline->UpdateSplineKeepTangents(/*bUpdateSectionBounds*/ false);
+		}
+		else
+		{
+			Spline->UpdateSpline();
+		}
+		return true;
+	}
 	bool bBaked = false;
 	const bool bHavePreview = CenterlineToBake && CenterlineToBake->Num() >= 2;
 	int32 PreviewLastBakeIndex = INDEX_NONE;
@@ -4565,25 +4798,22 @@ bool PinContinueDrawTipToTargetMouth(
 					HalfW = FMath::Max(RoadSpline->GetRoadHalfWidthAtS(FMath::Max(MouthS, 0.0)), 80.0);
 				}
 				FLeaveArrivePlan Plan;
-				if (TryMakeLeaveArrivePlan_DubinsCSC(
+				if (TryMakeLeaveArrivePlan(
 						MouthC,
 						TargetCenter,
 						LeaveN.IsNearlyZero() ? Chord : LeaveN,
 						ArriveN.IsNearlyZero() ? Chord : ArriveN,
 						DiffuseRadiusForLink(MouthC, TargetCenter, LeaveN, ArriveN, HalfW),
-						Plan)
+						Plan,
+						HalfW)
 					&& !IsLeaveArrivePlanUnusable(Plan, HalfW))
 				{
-					Plan.Stub0 = MouthC;
-					Plan.Stub1 = TargetCenter;
-					Plan.LeaveLen = 0.0;
-					Plan.ArriveLen = 0.0;
-				TArray<FVector> Keys;
-				KeyLeaveArrivePlan(Plan, Keys);
-				StripLeaveInsetBakeKey(Plan, Keys);
-				MixCorridorBakeKeyHeights(
-					Road ? Road->GetWorld() : nullptr, Road, Keys, MouthC.Z, TargetCenter.Z);
-				bBaked = WriteDubinsTangentBakeKeysAfterInsert(Spline, 0, Plan, Keys) > 0;
+					TArray<FVector> Keys;
+					KeyLeaveArrivePlan(Plan, Keys);
+					StripLeaveInsetBakeKey(Plan, Keys);
+					MixCorridorBakeKeyHeights(
+						Road ? Road->GetWorld() : nullptr, Road, Keys, MouthC.Z, TargetCenter.Z);
+					bBaked = WriteDubinsTangentBakeKeysAfterInsert(Spline, 0, Plan, Keys) > 0;
 				}
 			}
 			if (bBaked)
@@ -5119,7 +5349,8 @@ void BuildLaneWidthGuidanceRails(
 			TipT.IsNearlyZero() ? ChordDir : TipT,
 			Arrive,
 			MinRadiusCm,
-			Plan)
+			Plan,
+			HalfW)
 			&& !IsLeaveArrivePlanUnusable(Plan, HalfW))
 		{
 			TArray<FVector> CenterPath;
@@ -5384,12 +5615,254 @@ bool ResolveDrawTipLaneEdges(
 	return Spline->GetRoadEdgePointsAtS(TipS, OutLeft, OutRight, OutCenter, ESplineCoordinateSpace::World);
 }
 
-/** Prefer road/junction along ray — raised landscape often wins LineTraceSingle and blocks Ctrl cook. */
+static bool RayHitsRoadTriangle(
+	const FVector& Origin,
+	const FVector& Dir,
+	const FVector& V0,
+	const FVector& V1,
+	const FVector& V2,
+	float& OutT)
+{
+	const FVector Edge1 = V1 - V0;
+	const FVector Edge2 = V2 - V0;
+	const FVector P = FVector::CrossProduct(Dir, Edge2);
+	const float Det = static_cast<float>(FVector::DotProduct(Edge1, P));
+	if (FMath::Abs(Det) < KINDA_SMALL_NUMBER)
+	{
+		return false;
+	}
+	const float InvDet = 1.0f / Det;
+	const FVector TVec = Origin - V0;
+	const float U = static_cast<float>(FVector::DotProduct(TVec, P)) * InvDet;
+	if (U < 0.0f || U > 1.0f)
+	{
+		return false;
+	}
+	const FVector Q = FVector::CrossProduct(TVec, Edge1);
+	const float V = static_cast<float>(FVector::DotProduct(Dir, Q)) * InvDet;
+	if (V < 0.0f || U + V > 1.0f)
+	{
+		return false;
+	}
+	OutT = static_cast<float>(FVector::DotProduct(Edge2, Q)) * InvDet;
+	return OutT > KINDA_SMALL_NUMBER;
+}
+
+bool TryPickRoadBedAlongRay(
+	UWorld* World,
+	const FRay& WorldRay,
+	AMoKuEditSplineActor*& OutRoad,
+	FVector& OutCenterline,
+	double& OutS,
+	float& OutRayT)
+{
+	OutRoad = nullptr;
+	OutCenterline = FVector::ZeroVector;
+	OutS = 0.0;
+	OutRayT = TNumericLimits<float>::Max();
+	if (!World || WorldRay.Direction.IsNearlyZero())
+	{
+		return false;
+	}
+
+	const FVector Origin = WorldRay.Origin;
+	const FVector Dir = WorldRay.Direction.GetSafeNormal();
+	bool bHit = false;
+
+	for (TActorIterator<AMoKuEditSplineActor> It(World); It; ++It)
+	{
+		AMoKuEditSplineActor* Road = *It;
+		UMetaLandRoadSplineComponent* Spline = Road ? Cast<UMetaLandRoadSplineComponent>(Road->GetSplineComponent()) : nullptr;
+		if (!Spline || Spline->GetNumberOfSplinePoints() < 2)
+		{
+			continue;
+		}
+
+		// Pick uses the authored bed, not CutS mesh spans. A hole in DynamicMesh
+		// must still count as clicking that road (first-hit T).
+		TArray<TPair<double, double>> Spans;
+		Spans.Emplace(0.0, Spline->GetSplineLength());
+
+		for (const TPair<double, double>& Span : Spans)
+		{
+			const double SpanLen = Span.Value - Span.Key;
+			if (SpanLen <= KINDA_SMALL_NUMBER)
+			{
+				continue;
+			}
+			const int32 Samples = FMath::Clamp(FMath::CeilToInt(SpanLen / 80.0) + 1, 2, 128);
+			FVector PrevL, PrevR, PrevC;
+			double PrevS = Span.Key;
+			bool bHavePrev = Spline->GetRoadEdgePointsAtS(
+				PrevS, PrevL, PrevR, PrevC, ESplineCoordinateSpace::World);
+			for (int32 Step = 1; Step < Samples; ++Step)
+			{
+				const double NextS = FMath::Lerp(
+					Span.Key,
+					Span.Value,
+					static_cast<double>(Step) / static_cast<double>(Samples - 1));
+				FVector NextL, NextR, NextC;
+				if (!Spline->GetRoadEdgePointsAtS(
+					NextS, NextL, NextR, NextC, ESplineCoordinateSpace::World))
+				{
+					bHavePrev = false;
+					continue;
+				}
+				if (!bHavePrev)
+				{
+					PrevL = NextL;
+					PrevR = NextR;
+					PrevS = NextS;
+					bHavePrev = true;
+					continue;
+				}
+
+				float T = 0.0f;
+				const bool bTri0 = RayHitsRoadTriangle(Origin, Dir, PrevL, PrevR, NextR, T);
+				const bool bTri1 = !bTri0 && RayHitsRoadTriangle(Origin, Dir, PrevL, NextR, NextL, T);
+				if ((bTri0 || bTri1) && T < OutRayT)
+				{
+					OutRayT = T;
+					OutRoad = Road;
+					OutS = FMath::Lerp(PrevS, NextS, 0.5);
+					OutCenterline = FMath::Lerp(PrevC, NextC, 0.5);
+					bHit = true;
+				}
+
+				PrevL = NextL;
+				PrevR = NextR;
+				PrevC = NextC;
+				PrevS = NextS;
+				bHavePrev = true;
+			}
+		}
+	}
+
+	if (bHit && OutRoad)
+	{
+		if (UMetaLandRoadSplineComponent* HitSpline =
+			Cast<UMetaLandRoadSplineComponent>(OutRoad->GetSplineComponent()))
+		{
+			const FVector HitWorld = Origin + Dir * OutRayT;
+			OutS = HitSpline->GetDistanceAlongSplineAtLocation(HitWorld, ESplineCoordinateSpace::World);
+			OutCenterline = HitSpline->GetLocationAtDistanceAlongSpline(
+				OutS, ESplineCoordinateSpace::World);
+		}
+	}
+	return bHit;
+}
+
+bool TryPickRoadCenterlineNearPoint(
+	UWorld* World,
+	const FVector& WorldPos,
+	AMoKuEditSplineActor* IgnoreRoad,
+	AMoKuEditSplineActor*& OutRoad,
+	FVector& OutCenterline,
+	double& OutS)
+{
+	OutRoad = nullptr;
+	OutCenterline = FVector::ZeroVector;
+	OutS = 0.0;
+	if (!World)
+	{
+		return false;
+	}
+
+	double BestDist = TNumericLimits<double>::Max();
+	for (TActorIterator<AMoKuEditSplineActor> It(World); It; ++It)
+	{
+		AMoKuEditSplineActor* Road = *It;
+		USplineComponent* Spline = Road ? Road->GetSplineComponent() : nullptr;
+		if (!Spline || Road == IgnoreRoad || Spline->GetNumberOfSplinePoints() < 2)
+		{
+			continue;
+		}
+		const float Key = Spline->FindInputKeyClosestToWorldLocation(WorldPos);
+		const FVector OnRoad = Spline->GetLocationAtSplineInputKey(Key, ESplineCoordinateSpace::World);
+		const double Dist = FVector::Dist2D(WorldPos, OnRoad);
+		double Reach = 200.0;
+		if (UMetaLandRoadSplineComponent* RoadSpline = Cast<UMetaLandRoadSplineComponent>(Spline))
+		{
+			const double S = Spline->GetDistanceAlongSplineAtSplineInputKey(Key);
+			Reach = FMath::Max(RoadSpline->GetRoadHalfWidthAtS(S) + 80.0, 160.0);
+		}
+		if (Dist <= Reach && Dist < BestDist)
+		{
+			BestDist = Dist;
+			OutRoad = Road;
+			OutCenterline = OnRoad;
+			OutS = Spline->GetDistanceAlongSplineAtSplineInputKey(Key);
+		}
+	}
+	return OutRoad != nullptr;
+}
+
+bool TryPickClosestRoadToRay(
+	UWorld* World,
+	const FRay& WorldRay,
+	AMoKuEditSplineActor*& OutRoad,
+	FVector& OutCenterline,
+	double& OutS,
+	float& OutRayDist)
+{
+	OutRoad = nullptr;
+	OutCenterline = FVector::ZeroVector;
+	OutS = 0.0;
+	OutRayDist = TNumericLimits<float>::Max();
+	if (!World || WorldRay.Direction.IsNearlyZero())
+	{
+		return false;
+	}
+
+	const FVector Origin = WorldRay.Origin;
+	const FVector Dir = WorldRay.Direction.GetSafeNormal();
+	for (TActorIterator<AMoKuEditSplineActor> It(World); It; ++It)
+	{
+		AMoKuEditSplineActor* Road = *It;
+		UMetaLandRoadSplineComponent* Spline =
+			Road ? Cast<UMetaLandRoadSplineComponent>(Road->GetSplineComponent()) : nullptr;
+		if (!Spline || Spline->GetNumberOfSplinePoints() < 2)
+		{
+			continue;
+		}
+
+		const double Length = Spline->GetSplineLength();
+		if (Length <= KINDA_SMALL_NUMBER)
+		{
+			continue;
+		}
+		const int32 Samples = FMath::Clamp(FMath::CeilToInt(Length / 80.0) + 1, 2, 128);
+		for (int32 Step = 0; Step < Samples; ++Step)
+		{
+			const double S = Length * (static_cast<double>(Step) / static_cast<double>(Samples - 1));
+			const FVector OnRoad = Spline->GetLocationAtDistanceAlongSpline(
+				S, ESplineCoordinateSpace::World);
+			const float Along = static_cast<float>(FVector::DotProduct(OnRoad - Origin, Dir));
+			if (Along < 10.0f)
+			{
+				continue;
+			}
+			const float Dist = static_cast<float>(FVector::Dist(OnRoad, Origin + Dir * Along));
+			const double HalfW = FMath::Max(Spline->GetRoadHalfWidthAtS(S), 80.0);
+			if (Dist <= HalfW + 80.0 && Dist < OutRayDist)
+			{
+				OutRayDist = Dist;
+				OutRoad = Road;
+				OutCenterline = OnRoad;
+				OutS = S;
+			}
+		}
+	}
+	return OutRoad != nullptr;
+}
+
+/** First landscape/road along the ray. Prefer road/junction over terrain when asked. */
 bool ResolveCtrlDrawRayHit(
 	UWorld* World,
 	const FRay& WorldRay,
 	FHitResult& OutHit,
-	AActor*& OutHitActor)
+	AActor*& OutHitActor,
+	bool bPreferRoadOrJunction)
 {
 	OutHitActor = nullptr;
 	if (!World)
@@ -5412,11 +5885,14 @@ bool ResolveCtrlDrawRayHit(
 		return false;
 	}
 
+	(void)bPreferRoadOrJunction;
 	for (const FHitResult& Hit : Hits)
 	{
 		AActor* Actor = Hit.GetActor();
 		if (Actor
-			&& (Actor->IsA<AMoKuEditSplineActor>() || Actor->IsA<AMoKuEditIntersectionActor>()))
+			&& (Actor->IsA<AMoKuEditSplineActor>()
+				|| Actor->IsA<AMoKuEditIntersectionActor>()
+				|| Actor->IsA<ALandscapeProxy>()))
 		{
 			OutHit = Hit;
 			OutHitActor = Actor;

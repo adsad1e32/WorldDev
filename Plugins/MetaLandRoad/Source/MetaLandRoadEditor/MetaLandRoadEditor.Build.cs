@@ -52,6 +52,7 @@ public class MetaLandRoadEditor : ModuleRules
 			"ComponentVisualizers",
 			"MaterialEditor",
 			"AssetRegistry",
+			"AssetTools",
 			"TypedElementFramework",
 			"TypedElementRuntime",
 			"Projects",

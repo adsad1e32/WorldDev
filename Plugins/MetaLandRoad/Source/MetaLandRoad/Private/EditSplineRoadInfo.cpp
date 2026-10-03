@@ -141,7 +141,7 @@ IMPLEMENT_GLOBAL_SHADER(FRoadWeightBlurPS, "/Plugin/MetaLandRoad/Private/RoadLan
 
 static bool EnqueueRoadWeightBlur(AWorldSceneManagement* Owner, UTextureRenderTarget2D*& InOutWriteRT);
 
-static constexpr float GRoadProfileSampleStepCm = 100.0f;
+static constexpr float GRoadProfileSampleStepCm = 50.0f;
 static constexpr int32 GRoadProfileMaxSamples = 4096;
 
 static FMatrix44f MakeVertexAlignedRenderAreaToWorld(
@@ -255,9 +255,27 @@ static bool BuildRoadProfileSamples(
 
 		const int32 Num = FMath::Clamp(FMath::CeilToInt(SpanLength / GRoadProfileSampleStepCm) + 1, 2, GRoadProfileMaxSamples);
 		const double Step = SpanLength / static_cast<double>(Num - 1);
-		for (int32 SampleIndex = 0; SampleIndex < Num && OutSamples.Num() < GRoadProfileMaxSamples; ++SampleIndex)
+		TArray<double> Stations;
+		Stations.Reserve(Num + 32);
+		for (int32 SampleIndex = 0; SampleIndex < Num; ++SampleIndex)
 		{
-			const double S = Span.Key + Step * static_cast<double>(SampleIndex);
+			Stations.Add(Span.Key + Step * static_cast<double>(SampleIndex));
+		}
+		Spline->AppendBodyCornerCoverStations(Span.Key, Span.Value, Stations);
+		Stations.Sort();
+		for (int32 i = Stations.Num() - 1; i > 0; --i)
+		{
+			if (FMath::IsNearlyEqual(Stations[i], Stations[i - 1], 1.0))
+			{
+				Stations.RemoveAt(i);
+			}
+		}
+		for (const double S : Stations)
+		{
+			if (OutSamples.Num() >= GRoadProfileMaxSamples)
+			{
+				break;
+			}
 			FVector Left;
 			FVector Right;
 			FVector Center;
@@ -265,6 +283,8 @@ static bool BuildRoadProfileSamples(
 			{
 				continue;
 			}
+			Spline->ApplyBodyCornerCoverToEdges(
+				S, Left, Right, Center, ESplineCoordinateSpace::World);
 
 			FVector2D Right2D(Right.X - Center.X, Right.Y - Center.Y);
 			if (!Right2D.Normalize())
@@ -739,9 +759,9 @@ static bool BuildJunctionProfileSamples(
 			else if (Linked->StartOfJunction.Get() == Junction)
 			{
 				CutS = Linked->StartJunctionMeshTrimS;
-			}
-			else
-			{
+	}
+	else
+	{
 				for (const FMetaLandRoadJunctionTrimZone& Zone : Linked->JunctionTrimZones)
 				{
 					if (Zone.Junction.Get() == Junction)
@@ -1604,8 +1624,8 @@ bool AWorldSceneManagement::StampJunctionProfileCS(
 	TArray<FRoadProfileSampleGPU> Samples;
 	if (!BuildJunctionProfileSamples(Junction, LandscapeTransform, Samples))
 	{
-		return false;
-	}
+				return false;
+			}
 	if (WeightMode == 1u)
 	{
 		ApplyRoadWeightFalloffToProfileSamples(Samples, Junction->GetRoadWeightFalloffWidth());
@@ -1655,9 +1675,9 @@ void AWorldSceneManagement::RenderBrushActorContext(FEditorBrushRenderContext& B
 		if (StampJunctionProfileCS(BrushRenderContext, Junction, WeightMode))
 		{
 			++BrushRenderContext.RTIndex;
-		}
-		else
-		{
+	}
+	else
+	{
 			UE_LOG(LogTemp, Warning, TEXT("[RoadLandscape] Junction stamp skipped for %s — no mouth samples"), *Junction->GetName());
 		}
 		return;

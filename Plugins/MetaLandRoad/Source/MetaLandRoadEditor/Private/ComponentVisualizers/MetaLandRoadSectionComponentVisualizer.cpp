@@ -7,6 +7,7 @@
 #include "MetaLandRoadLaneEditPick.h"
 #include "MetaLandRoadLaneVisualization.h"
 #include "MetaLandRoadEditorModule.h"
+#include "MetaLandRoadCurbEditor.h"
 #include "MetaLandRoadEditorMode.h"
 #include "MoKuEditorUtils.h"
 #include "MetaLandRoadProfile.h"
@@ -1121,7 +1122,10 @@ void FMoKuEditSplinesComponentVisualizer::DrawVisualizationHUD(const UActorCompo
 		return;
 	}
 
-	FSplineComponentVisualizer::DrawVisualizationHUD(Component, Viewport, View, Canvas);
+	(void)Viewport;
+	(void)View;
+	(void)Canvas;
+	(void)Component;
 }
 
 const UMetaLandRoadSplineComponent* FMoKuEditSplinesComponentVisualizer::UpdateSelectedComponentAndSectionAndLane(HComponentVisProxy* VisProxy)
@@ -2668,8 +2672,22 @@ bool FMoKuEditSplinesComponentVisualizer::HandleInputDelta(
 			return false;
 		}
 
-		return FSplineComponentVisualizer::HandleInputDelta(
+		const bool bMoved = FSplineComponentVisualizer::HandleInputDelta(
 			ViewportClient, Viewport, DeltaTranslate, DeltaRotate, DeltaScale);
+		if (bMoved)
+		{
+			if (UMetaLandRoadSplineComponent* RoadSpline = GetEditedMetaLandRoadSpline())
+			{
+				TArray<int32> MovedKeys;
+				for (const int32 Key : SelectionState->GetSelectedKeys())
+				{
+					MovedKeys.Add(Key);
+				}
+				RoadSpline->RefreshAutoTangentsAroundKeys(MovedKeys);
+				RoadSpline->UpdateSplineKeepTangents(/*bUpdateSectionBounds*/ false);
+			}
+		}
+		return bMoved;
 	}
 
 	const EMetaLandRoadSectionSelectionState State = RoadSectionSelectionState->GetStateVerified();
@@ -3650,11 +3668,22 @@ void FMoKuEditSplinesComponentVisualizer::TrackingStopped(FEditorViewportClient*
 
 	if (FMetaLandRoadEditorModule::Get().IsNativeEditMode() && !IsSectionLineEditMode())
 	{
-		SplineComp->EnsureAllCurvePointTypesForSmoothCorners();
-		if (AMoKuEditSplineActor* RoadActor = Cast<AMoKuEditSplineActor>(SplineComp->GetOwner()))
+		TArray<int32> MovedKeys;
+		if (SelectionState)
 		{
-			RoadActor->UpdateInterpolateType(0);
+			for (const int32 Key : SelectionState->GetSelectedKeys())
+			{
+				MovedKeys.Add(Key);
+			}
+			const int32 Seg = SelectionState->GetSelectedSegmentIndex();
+			if (MovedKeys.Num() == 0 && Seg != INDEX_NONE)
+			{
+				MovedKeys.Add(Seg);
+				MovedKeys.Add(Seg + 1);
+			}
 		}
+		SplineComp->RefreshAutoTangentsAroundKeys(MovedKeys);
+		SplineComp->UpdateSplineKeepTangents(/*bUpdateSectionBounds*/ false);
 	}
 
 	if (RoadSectionSelectionState
@@ -4504,6 +4533,97 @@ void FMoKuEditSplinesComponentVisualizer::AppendMetaLandRoadCurveMenu(FMenuBuild
 	MenuBuilder.EndSection();
 }
 
+void FMoKuEditSplinesComponentVisualizer::GenerateSidewalkContextMenuSections(FMenuBuilder& InMenuBuilder) const
+{
+	FMoKuEditSplinesComponentVisualizer* MutableThis =
+		const_cast<FMoKuEditSplinesComponentVisualizer*>(this);
+	InMenuBuilder.BeginSection("SidewalkKeys", LOCTEXT("SidewalkMenu", "Sidewalk"));
+	InMenuBuilder.AddMenuEntry(
+		LOCTEXT("AddSidewalkKey", "Add Key"),
+		LOCTEXT("AddSidewalkKeyTip", "Add a span key on the highlighted edge."),
+		FSlateIcon(),
+		FUIAction(
+			FExecuteAction::CreateSP(MutableThis, &FMoKuEditSplinesComponentVisualizer::OnAddSidewalkKey),
+			FCanExecuteAction::CreateLambda([]()
+			{
+				return FMetaLandRoadEditorModule::Get().GetSidewalkHoverEdgeSign() != 0
+					&& FMetaLandRoadEditorModule::Get().GetSidewalkHoverS() >= 0.0;
+			})));
+	InMenuBuilder.AddMenuEntry(
+		LOCTEXT("DeleteSidewalkKey", "Delete Key"),
+		LOCTEXT("DeleteSidewalkKeyTip", "Delete the selected span key. The first key stays."),
+		FSlateIcon(),
+		FUIAction(
+			FExecuteAction::CreateSP(MutableThis, &FMoKuEditSplinesComponentVisualizer::OnDeleteSidewalkKey),
+			FCanExecuteAction::CreateLambda([]()
+			{
+				return FMetaLandRoadEditorModule::Get().GetSidewalkKeyIndex() > 0;
+			})));
+	InMenuBuilder.EndSection();
+}
+
+void FMoKuEditSplinesComponentVisualizer::OnAddSidewalkKey()
+{
+	UMetaLandRoadSplineComponent* SplineComp = GetEditedMetaLandRoadSpline();
+	if (!SplineComp)
+	{
+		if (GEditor)
+		{
+			for (FSelectionIterator It(GEditor->GetSelectedActorIterator()); It; ++It)
+			{
+				if (AMoKuEditSplineActor* Road = Cast<AMoKuEditSplineActor>(*It))
+				{
+					SplineComp = Road->GetSplineComponent();
+					break;
+				}
+			}
+		}
+	}
+	if (UMetaLandRoadSplineComponent* Focus = FMetaLandRoadEditorModule::Get().GetSidewalkFocusSpline())
+	{
+		SplineComp = Focus;
+	}
+	const double S = FMetaLandRoadEditorModule::Get().GetSidewalkHoverS();
+	if (!SplineComp || S < 0.0)
+	{
+		return;
+	}
+	MetaLandRoadCurbEditor::EnableSidewalksOnSpline(SplineComp);
+	if (FMetaLandRoadEditorModule::Get().GetSidewalkHoverEdgeSign() != 0)
+	{
+		FMetaLandRoadEditorModule::Get().SetSidewalkEdgeSign(
+			FMetaLandRoadEditorModule::Get().GetSidewalkHoverEdgeSign());
+	}
+	MetaLandRoadCurbEditor::AddCurbKeyAtS(SplineComp, S);
+	FMetaLandRoadEditorModule::Get().BroadcastSidewalkEditorRefresh();
+}
+
+void FMoKuEditSplinesComponentVisualizer::OnDeleteSidewalkKey()
+{
+	UMetaLandRoadSplineComponent* SplineComp = FMetaLandRoadEditorModule::Get().GetSidewalkFocusSpline();
+	if (!SplineComp)
+	{
+		SplineComp = GetEditedMetaLandRoadSpline();
+	}
+	if (!SplineComp && GEditor)
+	{
+		for (FSelectionIterator It(GEditor->GetSelectedActorIterator()); It; ++It)
+		{
+			if (AMoKuEditSplineActor* Road = Cast<AMoKuEditSplineActor>(*It))
+			{
+				SplineComp = Road->GetSplineComponent();
+				break;
+			}
+		}
+	}
+	if (!SplineComp)
+	{
+		return;
+	}
+	MetaLandRoadCurbEditor::RemoveSelectedCurbKey(SplineComp);
+	FMetaLandRoadEditorModule::Get().BroadcastSidewalkEditorRefresh();
+}
+
 TSharedPtr<SWidget> FMoKuEditSplinesComponentVisualizer::GenerateContextMenu() const
 {
 	if (FMetaLandRoadEditorModule::Get().ShouldDrawPropSettingOverlay())
@@ -4511,6 +4631,13 @@ TSharedPtr<SWidget> FMoKuEditSplinesComponentVisualizer::GenerateContextMenu() c
 		FMenuBuilder PropMenu(true, nullptr);
 		GeneratePropSettingContextMenuSections(PropMenu);
 		return PropMenu.MakeWidget();
+	}
+
+	if (FMetaLandRoadEditorModule::Get().ShouldDrawSidewalkOverlay())
+	{
+		FMenuBuilder SidewalkMenu(true, nullptr);
+		GenerateSidewalkContextMenuSections(SidewalkMenu);
+		return SidewalkMenu.MakeWidget();
 	}
 
 	if (FMetaLandRoadEditorModule::Get().ShouldDrawLandscapeAttributeOverlay())
@@ -4761,7 +4888,8 @@ void FMoKuEditSplinesComponentVisualizer::UpdateEditorViewportTick()
 		|| FMetaLandRoadEditorModule::Get().IsLaneEditMode()
 		|| FMetaLandRoadEditorModule::Get().ShouldShowNativeEditOverlay()
 		|| FMetaLandRoadEditorModule::Get().ShouldDrawLandscapeAttributeOverlay()
-		|| FMetaLandRoadEditorModule::Get().ShouldDrawPropSettingOverlay())
+		|| FMetaLandRoadEditorModule::Get().ShouldDrawPropSettingOverlay()
+		|| FMetaLandRoadEditorModule::Get().ShouldDrawSidewalkOverlay())
 	{
 		StartEditorViewportTick();
 		return;
@@ -4810,6 +4938,12 @@ bool FMoKuEditSplinesComponentVisualizer::TickEditorViewport(float /*DeltaTime*/
 	if (FMetaLandRoadEditorModule::Get().ShouldDrawPropSettingOverlay())
 	{
 		TickPropSettingHover();
+		return true;
+	}
+
+	if (FMetaLandRoadEditorModule::Get().ShouldDrawSidewalkOverlay())
+	{
+		TickSidewalkHover();
 		return true;
 	}
 

@@ -5,6 +5,7 @@
 #include "MoKuEditSplinesComponent.h"
 #include "MetaLandRoadProfile.h"
 #include "MetaLandRoadSplineComponent.h"
+#include "MetaLandRoadCurbProfile.h"
 #include "MetaLandRoadPropInstances.h"
 #include "MetaLandRoadModule.h"
 #include "MoKuEditorUtils.h"
@@ -1040,6 +1041,163 @@ void AMoKuEditSplineActor::PostActorCreated()
 	Super::PostActorCreated();
 
 }
+void AMoKuEditSplineActor::RebuildSidewalkMeshes()
+{
+	UMetaLandRoadSplineComponent* Spline = SplineComponent;
+	if (!Spline || !SceneRoot)
+	{
+		return;
+	}
+
+	TArray<TPair<double, double>> Spans;
+	GetJunctionMeshGenerationSpans(Spans);
+	if (Spans.Num() == 0)
+	{
+		const double Length = Spline->GetSplineLength();
+		if (Length > KINDA_SMALL_NUMBER)
+		{
+			Spans.Emplace(0.0, Length);
+		}
+	}
+
+	TSet<UDynamicMeshComponent*> Used;
+	const int32 NumSections = Spline->GetLaneSectionsNum();
+	for (int32 SectionIndex = 0; SectionIndex < NumSections; ++SectionIndex)
+	{
+		const FMetaLandRoadLaneSection& Section = Spline->GetLaneSection(SectionIndex);
+		auto BuildFace = [&](const TArray<FMetaLandRoadLane>& Face, int32 LaneSign)
+		{
+			for (int32 LaneArrayIndex = 0; LaneArrayIndex < Face.Num(); ++LaneArrayIndex)
+			{
+				const FMetaLandRoadLaneSidewalk* Sidewalk =
+					Face[LaneArrayIndex].LaneInstance.GetPtr<FMetaLandRoadLaneSidewalk>();
+				if (!Sidewalk)
+				{
+					continue;
+				}
+				const int32 LaneIndex = LaneSign > 0 ? (LaneArrayIndex + 1) : -(LaneArrayIndex + 1);
+				FDynamicMesh3 SidewalkMesh;
+				for (const TPair<double, double>& Span : Spans)
+				{
+					const double A = FMath::Max(Span.Key, Section.SOffset);
+					const double B = FMath::Min(Span.Value, Section.SOffsetEnd_Cached);
+					if (B - A < 2.0)
+					{
+						continue;
+					}
+					const int32 Steps = FMath::Clamp(FMath::CeilToInt(static_cast<float>(B - A) / 100.0f), 4, 64);
+					MetaLandRoadCurb::AppendSidewalkLane(
+						Spline,
+						SectionIndex,
+						LaneIndex,
+						A,
+						B,
+						Steps,
+						0.0f,
+						true,
+						SidewalkMesh);
+				}
+
+				const FName CompName(*FString::Printf(TEXT("Sidewalk_%d_%d"), SectionIndex, LaneIndex));
+				UDynamicMeshComponent* Comp = nullptr;
+				for (UDynamicMeshComponent* Existing : SidewalkMeshComponents)
+				{
+					if (Existing && Existing->GetFName() == CompName)
+					{
+						Comp = Existing;
+						break;
+					}
+				}
+				if (SidewalkMesh.TriangleCount() == 0)
+				{
+					if (Comp)
+					{
+						Comp->DestroyComponent();
+						SidewalkMeshComponents.Remove(Comp);
+					}
+					continue;
+				}
+				if (!Comp)
+				{
+					Comp = NewObject<UDynamicMeshComponent>(this, CompName);
+					Comp->SetupAttachment(SceneRoot);
+					if (GetWorld())
+					{
+						Comp->RegisterComponent();
+					}
+					AddInstanceComponent(Comp);
+					SidewalkMeshComponents.Add(Comp);
+				}
+
+				FinalizeRoadMeshUVs(SidewalkMesh);
+				FinalizeRoadMeshNormalsAndOverlays(SidewalkMesh);
+				Comp->SetRelativeLocation(FVector::ZeroVector);
+				Comp->SetRelativeRotation(FRotator::ZeroRotator);
+				const FTransform SplineToMesh =
+					Comp->GetComponentTransform().Inverse() * Spline->GetComponentTransform();
+				if (!SplineToMesh.Equals(FTransform::Identity, 0.05))
+				{
+					for (const int32 Vid : SidewalkMesh.VertexIndicesItr())
+					{
+						SidewalkMesh.SetVertex(
+							Vid, SplineToMesh.TransformPosition(SidewalkMesh.GetVertex(Vid)));
+					}
+				}
+				if (UDynamicMesh* DynamicMesh = Comp->GetDynamicMesh())
+				{
+					DynamicMesh->Reset();
+					DynamicMesh->SetMesh(MoveTemp(SidewalkMesh));
+				}
+
+				UMaterialInterface* CurbMat = nullptr;
+				if (const UMetaLandRoadCurbProfile* Profile =
+					UMetaLandRoadCurbProfile::Resolve(Sidewalk->CurbProfileAsset, NAME_None))
+				{
+					CurbMat = Profile->Material;
+				}
+				if (!CurbMat)
+				{
+					CurbMat = UMetaLandRoadCurbProfile::FindFirstMaterial(Spline);
+				}
+				Comp->EmptyOverrideMaterials();
+				Comp->SetMaterial(0, CurbMat);
+				Comp->SetVisibility(true);
+				Comp->SetHiddenInGame(false);
+				Comp->SetCastShadow(false);
+				Comp->bSelectable = true;
+				Comp->SetTangentsType(EDynamicMeshComponentTangentsMode::AutoCalculated);
+				Comp->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
+				Comp->bEnableComplexCollision = true;
+				Comp->CollisionType = CTF_UseSimpleAndComplex;
+				Comp->NotifyMeshUpdated();
+				if (Comp->IsRegistered())
+				{
+					Comp->UpdateCollision(false);
+				}
+				Used.Add(Comp);
+			}
+		};
+		BuildFace(Section.Right, 1);
+		BuildFace(Section.Left, -1);
+	}
+
+	for (int32 Index = SidewalkMeshComponents.Num() - 1; Index >= 0; --Index)
+	{
+		UDynamicMeshComponent* Comp = SidewalkMeshComponents[Index];
+		if (!Comp)
+		{
+			SidewalkMeshComponents.RemoveAt(Index);
+			continue;
+		}
+		if (Used.Contains(Comp))
+		{
+			continue;
+		}
+		Comp->DestroyComponent();
+		SidewalkMeshComponents.RemoveAt(Index);
+	}
+}
+
 void AMoKuEditSplineActor::RefreshDynamicRoadMesh()
 {
 	if (!SplineComponent || SplineComponent->bIsRefreshingRoadMesh)
@@ -1131,6 +1289,8 @@ void AMoKuEditSplineActor::RefreshDynamicRoadMesh()
 			}
 		}
 	}
+
+	RebuildSidewalkMeshes();
 
 	SplineComponent->RefreshLaneVisualization();
 

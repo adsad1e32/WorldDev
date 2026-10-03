@@ -2,26 +2,19 @@
 #include "MetaLandRoadInteractiveToolDraw.h"
 #include "InteractiveToolManager.h"
 #include "InteractiveGizmoManager.h"
-#include "ToolBuilderUtil.h"
 #include "BaseBehaviors/ClickDragBehavior.h"
 #include "BaseBehaviors/MouseHoverBehavior.h"
 #include "MoKuEditSplineActor.h"
-#include "UnrealEdGlobals.h"
 #include "CollisionQueryParams.h"
 #include "Engine/World.h"
 #include "Engine/Engine.h"
 #include "SceneManagement.h"
 #include "Components/SplineComponent.h"
-#include "Editor/UnrealEdEngine.h"
 #include "Editor.h"
-#include "Algo/Copy.h"
 #include "MoKuEditSplinesComponent.h"
 #include "MetaLandRoadProfile.h"
-#include "BaseGizmos/TransformGizmoUtil.h"
-#include "ToolSceneQueriesUtil.h"
 #include "SocketMarkbleGizmo.h"
 #include "EngineUtils.h"
-#include "Engine/StaticMeshSocket.h"
 #include "MoKuEditorUtils.h"
 #include "MoKuEditIntersectionActor.h"
 #include "MoKuEditBaseActor.h"
@@ -30,11 +23,9 @@
 #include "Tools/UEdMode.h"
 #include "EditSplineRoadInfo.h"
 #include "WorldLandscapeBlueprintBrush.h"
-#include "PrimitiveDrawingUtils.h"
 #include "MetaLandRoadLaneVisualization.h"
 #include "MetaLandRoadEditorModule.h"
 #include "ComponentVisualizers/MetaLandRoadSectionComponentVisualizer.h"
-#include "Utils/MetaLandRoadCompVisUtils.h"
 #include "MetaLandRoadEditorMode.h"
 #include "MetaLandRoadTypes.h"
 #include "MetaLandRoadSplineComponent.h"
@@ -43,12 +34,10 @@
 #include "LevelEditorViewport.h"
 #include "SceneView.h"
 #include "Framework/Application/SlateApplication.h"
-#include "Engine/Engine.h"
 #include "Engine/Font.h"
 #include "CanvasItem.h"
 #include "CanvasTypes.h"
 #include "Engine/Selection.h"
-#include "SceneView.h"
 
 
 #define LOCTEXT_NAMESPACE "UMetaLandRoadInteractiveTool"
@@ -186,7 +175,10 @@ FInputRayHit UMetaLandRoadInteractiveTool::BeginHoverSequenceHitTest(const FInpu
 	UMetaLandRoadEditorMode* RoadMode = ResolveMetaLandRoadEditorMode(this);
 	const bool bPendingAnchor = RoadMode && RoadMode->GetEditTarget().bHasPendingAnchor;
 	// Once a mouth is selected, hover must drive green rails even if the ray misses mesh.
-	if (!IsDrawSessionActive() && !bHasEndSnapGhost && !bPendingAnchor)
+	if (!IsDrawSessionActive()
+		&& !bContinueDrawSession
+		&& !bHasEndSnapGhost
+		&& !bPendingAnchor)
 	{
 		return FInputRayHit();
 	}
@@ -264,6 +256,17 @@ void UMetaLandRoadInteractiveTool::DrawHUD(FCanvas* Canvas, IToolsContextRenderA
 void UMetaLandRoadInteractiveTool::AddSplinePoint(const FVector& InHitPos, const FRotator& InHitRot, bool InteractiveGizmo,const FVector& InTangent,UInteractiveGizmo* InGizmoInfo)
 {
 	FScopedTransaction Transaction(LOCTEXT("MoKuEdit_Add Point", "Add MoKu Spline Control Point"));
+	Modify();
+	if (ActiveActor)
+	{
+		ActiveActor->Modify();
+		if (UMoKuEditSplinesComponent* LiveSpline = Cast<AMoKuEditSplineActor>(ActiveActor)
+			? Cast<AMoKuEditSplineActor>(ActiveActor)->GetSplineComponent()
+			: nullptr)
+		{
+			LiveSpline->Modify();
+		}
+	}
 	// Drawing clicks refresh road mesh  - must not Recook junctions until A finish.
 	TGuardValue<bool> SuppressJunctionRecook(
 		AMoKuEditSplineActor::bSuppressJunctionRecookFromRoadRefresh, true);
@@ -342,6 +345,16 @@ void UMetaLandRoadInteractiveTool::AddSplinePoint(const FVector& InHitPos, const
 		if (!InteractiveGizmo)
 		{
 			SplineComponent->RemoveSplinePoint(1);
+			ActiveActor->SetActorLocation(SnapHitPos);
+			SplineComponent->SetLocationAtSplinePoint(
+				0, FVector::ZeroVector, ESplineCoordinateSpace::Local, false);
+			SplineComponent->SetSplinePointType(0, ESplinePointType::CurveCustomTangent, false);
+			SplineComponent->SetTangentsAtSplinePoint(
+				0,
+				FVector::ZeroVector,
+				FVector::ZeroVector,
+				ESplineCoordinateSpace::Local,
+				false);
 		}
 	}
 	else
@@ -351,26 +364,66 @@ void UMetaLandRoadInteractiveTool::AddSplinePoint(const FVector& InHitPos, const
 			AMoKuEditSplineActor* SplineActor = Cast<AMoKuEditSplineActor>(ActiveActor);
 			SplineComponent = SplineActor->GetSplineComponent();
 			if (!InteractiveGizmo)
-			{	
-				if (StateOfEditor == EMoKuEditState::Forward)
+			{
+				const int32 NumBefore = SplineComponent->GetNumberOfSplinePoints();
+				TArray<FLaneExtendPointFreeze> CommittedFreezes;
+				if (NumBefore >= 1)
 				{
-					SplineComponent->AddSplinePointLocation(SnapHitPos, 0);
+					CaptureLaneExtendPointFreezes(SplineComponent, 0, NumBefore, CommittedFreezes);
+				}
+				const bool bForward = (StateOfEditor == EMoKuEditState::Forward);
+				if (bForward)
+				{
+					SplineComponent->AddSplinePointAtIndex(
+						SnapHitPos, 0, ESplineCoordinateSpace::World, false);
 				}
 				if (StateOfEditor == EMoKuEditState::Defult)
 				{
-					SplineComponent->AddSplinePointLocation(SnapHitPos, SplineComponent->GetNumberOfSplinePoints());
+					SplineComponent->AddSplinePointAtIndex(
+						SnapHitPos,
+						SplineComponent->GetNumberOfSplinePoints(),
+						ESplineCoordinateSpace::World,
+						false);
 				}
 				HideEditorSplineRibbon(SplineComponent);
-				if (!bContinueDrawSession)
-				{
-					SplineActor->SetSplineComponent(SplineComponent);
-				}
 				const int32 NumPts = SplineComponent->GetNumberOfSplinePoints();
+				int32 JointIndex = INDEX_NONE;
+				if (NumPts == 2)
+				{
+					const int32 I0 = bForward ? 1 : 0;
+					const int32 I1 = bForward ? 0 : 1;
+					const FVector P0 = SplineComponent->GetLocationAtSplinePoint(
+						I0, ESplineCoordinateSpace::World);
+					const FVector P1 = SplineComponent->GetLocationAtSplinePoint(
+						I1, ESplineCoordinateSpace::World);
+					const FVector Dir = (P1 - P0).GetSafeNormal2D();
+					const double Handle = FMath::Max(FVector::Dist2D(P0, P1), 80.0) * 0.35;
+					const FVector Tan = Dir.IsNearlyZero() ? FVector::ZeroVector : (Dir * Handle);
+					SplineComponent->SetSplinePointType(0, ESplinePointType::CurveCustomTangent, false);
+					SplineComponent->SetSplinePointType(1, ESplinePointType::CurveCustomTangent, false);
+					SplineComponent->SetTangentsAtSplinePoint(
+						0, Tan, Tan, ESplineCoordinateSpace::World, false);
+					SplineComponent->SetTangentsAtSplinePoint(
+						1, Tan, Tan, ESplineCoordinateSpace::World, false);
+				}
 				if (NumPts >= 3)
 				{
-					const int32 TipIndex = (StateOfEditor == EMoKuEditState::Forward) ? 0 : (NumPts - 1);
-					const int32 JointIndex = (StateOfEditor == EMoKuEditState::Forward) ? 1 : (NumPts - 2);
+					const int32 TipIndex = bForward ? 0 : (NumPts - 1);
+					JointIndex = bForward ? 1 : (NumPts - 2);
 					ApplyWidthAwareNewSpanTangents(SplineComponent, JointIndex, TipIndex);
+				}
+				if (UMetaLandRoadSplineComponent* RoadSpline =
+					Cast<UMetaLandRoadSplineComponent>(SplineComponent))
+				{
+					RoadSpline->UpdateSplineKeepTangents(/*bUpdateSectionBounds*/ false);
+				}
+				if (CommittedFreezes.Num() > 0 && NumPts >= 3)
+				{
+					RestoreLaneExtendPointFreezes(
+						SplineComponent,
+						bForward ? 1 : 0,
+						CommittedFreezes,
+						JointIndex);
 					if (UMetaLandRoadSplineComponent* RoadSpline =
 						Cast<UMetaLandRoadSplineComponent>(SplineComponent))
 					{
@@ -383,25 +436,35 @@ void UMetaLandRoadInteractiveTool::AddSplinePoint(const FVector& InHitPos, const
 				FVector InterPos = SnapHitPos + Tangent.GetSafeNormal()*50;
 				ProjectPointOntoLandscapeSurface(
 					TargetWorld ? TargetWorld : GetWorld(), InterPos, SplineActor);
-				SplineComponent->AddSplinePointLocation(InterPos, SplineComponent->GetNumberOfSplinePoints());
-				SplineComponent->AddSplinePointLocation(SnapHitPos, SplineComponent->GetNumberOfSplinePoints());
-				SplineActor->SetSplineComponent(SplineComponent);
-
+				SplineComponent->AddSplinePointAtIndex(
+					InterPos,
+					SplineComponent->GetNumberOfSplinePoints(),
+					ESplineCoordinateSpace::World,
+					false);
+				SplineComponent->AddSplinePointAtIndex(
+					SnapHitPos,
+					SplineComponent->GetNumberOfSplinePoints(),
+					ESplineCoordinateSpace::World,
+					false);
+				if (UMetaLandRoadSplineComponent* RoadSpline =
+					Cast<UMetaLandRoadSplineComponent>(SplineComponent))
+				{
+					RoadSpline->UpdateSplineKeepTangents(/*bUpdateSectionBounds*/ false);
+				}
 			}
 		}
-		ActiveActor->IsInit = false;
-		
 	}
 
-	if (bContinueDrawSession)
+	if (SplineComponent)
 	{
 		HideEditorSplineRibbon(SplineComponent);
-		if (PreviewComponent)
-		{
-			HideEditorSplineRibbon(PreviewComponent);
-		}
-		ActiveActor->Modify();
-		Modify();
+	}
+	if (PreviewComponent)
+	{
+		HideEditorSplineRibbon(PreviewComponent);
+	}
+	if (bContinueDrawSession)
+	{
 		if (GEditor)
 		{
 			GEditor->RedrawLevelEditingViewports(false);
@@ -410,30 +473,14 @@ void UMetaLandRoadInteractiveTool::AddSplinePoint(const FVector& InHitPos, const
 	}
 
 	RefreshGizmoInfo();
-	GEditor->SelectActor(ActiveActor, true, true, false, true);
-	// Keep spline ribbon hidden after selection (mesh + green guidance only).
-	HideEditorSplineRibbon(SplineComponent);
-	if (PreviewComponent)
+	if (GEditor && ActiveActor)
 	{
-		HideEditorSplineRibbon(PreviewComponent);
+		GEditor->SelectActor(ActiveActor, true, true, false, true);
 	}
-	ActiveActor->Modify();
-	Modify();
-
-	if (SplineComponent)
+	if (AMoKuEditSplineActor* Road = Cast<AMoKuEditSplineActor>(ActiveActor))
 	{
-		FProperty* SplineCurvesProperty = FindFProperty<FProperty>(
-			UMoKuEditSplinesComponent::StaticClass(),
-			GET_MEMBER_NAME_CHECKED(USplineComponent, SplineCurves));
-		if (SplineCurvesProperty)
-		{
-			FPropertyChangedEvent PropertyChangedEvent(SplineCurvesProperty, EPropertyChangeType::ValueSet);
-			SplineComponent->PostEditChangeProperty(PropertyChangedEvent);
-			this->PostEditChangeProperty(PropertyChangedEvent);
-		}
-		HideEditorSplineRibbon(SplineComponent);
+		RefreshRoadMeshSuppressJunction(Road);
 	}
-
 	if (GEditor)
 	{
 		GEditor->RedrawLevelEditingViewports(false);
@@ -466,9 +513,16 @@ void UMetaLandRoadInteractiveTool::GetSplitIntersectionData(AActor* InSplitActor
 			IntersectData.EndValue = FMath::Clamp(IntersectData.EndValue, 0, SplineLength);
 
 			DrawOutSplinePos = SplineComp->GetLocationAtDistanceAlongSpline(SampleDist, ESplineCoordinateSpace::World);
-			const float SnapDistCm = GetConnectionSnapDistanceCm();
 			const float DistToSplineCm = FVector::Dist2D(DrawOutSplinePos, InWorldPos);
-			if (DistToSplineCm < SnapDistCm)
+			double SnapReachCm = GetConnectionSnapDistanceCm();
+			if (const UMetaLandRoadSplineComponent* RoadSpline =
+				Cast<UMetaLandRoadSplineComponent>(SplineComp))
+			{
+				SnapReachCm = FMath::Max(
+					SnapReachCm,
+					RoadSpline->GetRoadHalfWidthAtS(SampleDist) + 40.0);
+			}
+			if (DistToSplineCm <= SnapReachCm)
 			{
 				bSplineSnapActive = true;
 				IntersectData.TValue = SplineComp->GetDistanceAlongSplineAtLocation(DrawOutSplinePos, ESplineCoordinateSpace::World);
@@ -513,9 +567,7 @@ void UMetaLandRoadInteractiveTool::OnClickDrag(const FInputDeviceRay& DragPos)
 }
 void UMetaLandRoadInteractiveTool::OnClickRelease(const FInputDeviceRay& ReleasePos)
 {
-
-	GEditor->EndTransaction();
-
+	(void)ReleasePos;
 }
 void UMetaLandRoadInteractiveTool::OnTerminateDragSequence()
 {
@@ -582,20 +634,19 @@ void UMetaLandRoadInteractiveTool::UpdateDrawCrossingJudge()
 	FVector From = FVector::ZeroVector;
 	if (bContinueDrawSession)
 	{
-		From = ContinueDrawMouthCenter;
+		const double LiveTipS = (ContinueDrawInsertS >= 0.0)
+			? ContinueDrawInsertS
+			: ContinueDrawMouthS;
+		if (LiveTipS >= 0.0)
+		{
+			From = Spline->GetLocationAtDistanceAlongSpline(
+				LiveTipS, ESplineCoordinateSpace::World);
+		}
 		if (From.IsNearlyZero())
 		{
-			if (ContinueDrawMouthS >= 0.0)
-			{
-				From = Spline->GetLocationAtDistanceAlongSpline(
-					ContinueDrawMouthS, ESplineCoordinateSpace::World);
-			}
-			else
-			{
-				const bool bInsertAtStart = (ContinueDrawState == EMoKuEditState::Forward);
-				const int32 Tip = bInsertAtStart ? 0 : (Spline->GetNumberOfSplinePoints() - 1);
-				From = Spline->GetLocationAtSplinePoint(Tip, ESplineCoordinateSpace::World);
-			}
+			const bool bInsertAtStart = (ContinueDrawState == EMoKuEditState::Forward);
+			const int32 Tip = bInsertAtStart ? 0 : (Spline->GetNumberOfSplinePoints() - 1);
+			From = Spline->GetLocationAtSplinePoint(Tip, ESplineCoordinateSpace::World);
 		}
 	}
 	else
@@ -648,6 +699,8 @@ void UMetaLandRoadInteractiveTool::EndLaneExtendVisualSession(bool bClearActiveA
 	UpdateEditState(false);
 	bSplineSnapActive = false;
 	bInsertJunction = false;
+	InsertJunctionSourceRoad = nullptr;
+	InsertJunctionWorld = FVector::ZeroVector;
 	bHasGuidancePlaneZ = false;
 	SetToolSession(EMetaLandRoadToolSession::Idle);
 	bRoadSpawnedFromLaneAnchorDraw = false;
@@ -701,11 +754,6 @@ void UMetaLandRoadInteractiveTool::EndLaneExtendVisualSession(bool bClearActiveA
 }
 
 bool UMetaLandRoadInteractiveTool::ShouldSuppressLanePickOverlay() const
-{
-	return GetEditState() && bCtrlModifierOn && bSplineSnapActive;
-}
-
-bool UMetaLandRoadInteractiveTool::ShouldSuppressLanePickEditHover() const
 {
 	return GetEditState() && bCtrlModifierOn && bSplineSnapActive;
 }
@@ -831,6 +879,8 @@ void UMetaLandRoadInteractiveTool::ResetDrawSessionState()
 	StateOfEditor = EMoKuEditState::Defult;
 	bSplineSnapActive = false;
 	bInsertJunction = false;
+	InsertJunctionSourceRoad = nullptr;
+	InsertJunctionWorld = FVector::ZeroVector;
 	bHasGuidancePlaneZ = false;
 	SetToolSession(EMetaLandRoadToolSession::Idle);
 	bRoadSpawnedFromLaneAnchorDraw = false;
@@ -867,6 +917,8 @@ void UMetaLandRoadInteractiveTool::ResetDrawSessionState()
 	}
 }
 
+static void InvalidateContinueDrawMouthVisuals();
+
 void UMetaLandRoadInteractiveTool::ClearContinueDrawMouthArm()
 {
 	bContinueDrawMouthArmed = false;
@@ -879,8 +931,10 @@ void UMetaLandRoadInteractiveTool::ClearContinueDrawMouthArm()
 		ContinueDrawMouthRight = FVector::ZeroVector;
 		ContinueDrawMouthCenter = FVector::ZeroVector;
 		ContinueDrawMouthS = -1.0;
+		ContinueDrawInsertS = -1.0;
 		ContinueDrawMouthSpanIndex = INDEX_NONE;
 		bContinueDrawMouthIsSpanEnd = true;
+		InvalidateContinueDrawMouthVisuals();
 	}
 }
 
@@ -950,6 +1004,15 @@ static FMetaLandRoadDrawAnchor GContinueDrawOverlay;
 static bool GContinueDrawOverlayValid = false;
 static TWeakObjectPtr<AMoKuEditSplineActor> GContinueDrawOverlayRoad;
 static EMoKuEditState GContinueDrawOverlayState = EMoKuEditState::Defult;
+
+static void InvalidateContinueDrawMouthVisuals()
+{
+	GContinueDrawMouthCache = FContinueDrawMouthCache();
+	GContinueDrawOverlay = FMetaLandRoadDrawAnchor();
+	GContinueDrawOverlayValid = false;
+	GContinueDrawOverlayRoad.Reset();
+	GContinueDrawOverlayState = EMoKuEditState::Defult;
+}
 
 static bool ResolveContinueDrawMouthPair(
 	AMoKuEditSplineActor* Road,
@@ -1143,14 +1206,6 @@ bool UMetaLandRoadInteractiveTool::TryGetContinueDrawMouthOverlay(FMetaLandRoadD
 		return false;
 	}
 
-	if (GContinueDrawOverlayValid
-		&& GContinueDrawOverlayRoad.Get() == ContinueDrawRoad.Get()
-		&& GContinueDrawOverlayState == ContinueDrawState)
-	{
-		OutAnchor = GContinueDrawOverlay;
-		return OutAnchor.IsValid();
-	}
-
 	AMoKuEditSplineActor* Road = ContinueDrawRoad.Get();
 	UMetaLandRoadSplineComponent* Spline = Road ? Road->GetSplineComponent() : nullptr;
 	const bool bNearEnd = ContinueDrawState != EMoKuEditState::Forward;
@@ -1262,6 +1317,10 @@ bool UMetaLandRoadInteractiveTool::TryArmContinueDrawMouth()
 	ContinueDrawMouthRight = BestR;
 	ContinueDrawMouthCenter = NewMouthCenter;
 	ContinueDrawMouthS = MouthS;
+	if (!bContinueDrawSession)
+	{
+		ContinueDrawInsertS = MouthS;
+	}
 	ContinueDrawMouthSpanIndex = SpanIndex;
 	bContinueDrawMouthIsSpanEnd = bSpanEnd;
 	bContinueDrawMouthArmed = true;
@@ -1269,18 +1328,13 @@ bool UMetaLandRoadInteractiveTool::TryArmContinueDrawMouth()
 	{
 		ClearDrawGuidanceRails();
 	}
-	if (!GContinueDrawOverlayValid
-		|| GContinueDrawOverlayRoad.Get() != Road
-		|| GContinueDrawOverlayState != ContinueDrawState)
+	GContinueDrawOverlayValid = BuildFullMouthAnchorAtTip(Spline, bSpanEnd, GContinueDrawOverlay);
+	if (GContinueDrawOverlayValid)
 	{
-		GContinueDrawOverlayValid = BuildFullMouthAnchorAtTip(Spline, bSpanEnd, GContinueDrawOverlay);
-		if (GContinueDrawOverlayValid)
-		{
-			GContinueDrawOverlay.AnchorS = MouthS;
-		}
-		GContinueDrawOverlayRoad = Road;
-		GContinueDrawOverlayState = ContinueDrawState;
+		GContinueDrawOverlay.AnchorS = MouthS;
 	}
+	GContinueDrawOverlayRoad = Road;
+	GContinueDrawOverlayState = ContinueDrawState;
 	return true;
 }
 
@@ -1329,16 +1383,16 @@ bool UMetaLandRoadInteractiveTool::TryCommitContinueDrawMouth(
 		return false;
 	}
 
+	const float MouthPlaneZ = static_cast<float>(ContinueDrawMouthCenter.Z);
 	FVector ClickPos = ResultHitPos;
-	if (PressPos.WorldRay.Direction.SizeSquared() > KINDA_SMALL_NUMBER
-		&& FindRayHit(PressPos.WorldRay, ClickPos).bHit)
+	if (!GetContinueDrawCursorWorld(ClickPos, MouthPlaneZ))
 	{
-		ResultHitPos = ClickPos;
+		if (ClickPos.IsNearlyZero())
+		{
+			ClickPos = ContinueDrawMouthCenter;
+		}
 	}
-	else if (ClickPos.IsNearlyZero())
-	{
-		GetContinueDrawCursorWorld(ClickPos);
-	}
+	ResultHitPos = ClickPos;
 
 	if (bRequireClickOnBar)
 	{
@@ -1353,6 +1407,7 @@ bool UMetaLandRoadInteractiveTool::TryCommitContinueDrawMouth(
 	}
 
 	FScopedTransaction Transaction(LOCTEXT("ContinueDrawRoad", "Continue Draw Road"));
+	Modify();
 	ActiveActor = Road;
 	StateOfEditor = ContinueDrawState;
 	UpdateEditState(true);
@@ -1366,7 +1421,6 @@ bool UMetaLandRoadInteractiveTool::TryCommitContinueDrawMouth(
 	{
 		ContinueDrawOriginalNumPoints = Spline->GetNumberOfSplinePoints();
 		HideEditorSplineRibbon(Spline);
-		Spline->bDeferRoadMeshRefresh = true;
 	}
 	GuidancePlaneZ = static_cast<float>(ContinueDrawMouthCenter.Z);
 	bHasGuidancePlaneZ = true;
@@ -1379,10 +1433,12 @@ bool UMetaLandRoadInteractiveTool::TryCommitContinueDrawMouth(
 		ResultHitPos = CommitCursor;
 	}
 	bContinueDrawSession = true;
+	ContinueDrawInsertS = ContinueDrawMouthS;
 	ClearContinueDrawMouthArm();
-	UpdateDrawGuidanceRails();
+	ClearDrawGuidanceRails();
 	if (GEditor)
 	{
+		GEditor->SelectActor(Road, true, true, true, true);
 		GEditor->RedrawLevelEditingViewports(false);
 	}
 	return true;
@@ -1403,7 +1459,9 @@ bool UMetaLandRoadInteractiveTool::TryHandleContinueDrawClick(const FInputDevice
 	{
 		return false;
 	}
-	return TryCommitContinueDrawMouth(PressPos);
+	// Arm already passed hover range. Do not re-test with a mesh first-hit
+	// (that point is not the C plane cursor, so the click looks "off the bar").
+	return TryCommitContinueDrawMouth(PressPos, /*bRequireClickOnBar*/ false);
 }
 
 void UMetaLandRoadInteractiveTool::UpdateEndSnapMixHoverPreview(const FVector& CursorWorld)
@@ -2162,7 +2220,9 @@ void UMetaLandRoadInteractiveTool::FinalizeLaneDrawEndConnection(
 				TargetOutward,
 				PreviewCenterline,
 				PreviewMouthS,
-				PreviewMouthCenter))
+				PreviewMouthCenter,
+				/*bKeepAuthoringKeys*/ bContinueDrawFinish
+					&& !(PreviewCenterline && PreviewCenterline->Num() >= 2)))
 			{
 				return;
 			}
@@ -2472,7 +2532,7 @@ float UMetaLandRoadInteractiveTool::GetConnectionSnapDistanceCm() const
 		return FMath::Max(50.0f, OutputProperties->ConnectionSnapDistanceCm);
 	}
 	const float W = FMath::Max(ResolveActiveTipRoadWidthCm(), 50.0f);
-	return FMath::Clamp(W * 0.85f, 280.0f, 900.0f);
+	return FMath::Clamp(W * 0.4f, 80.0f, 280.0f);
 }
 
 int32 UMetaLandRoadInteractiveTool::ResolveEndConnectTargetLaneCount() const
@@ -4087,7 +4147,9 @@ bool UMetaLandRoadInteractiveTool::OnUpdateHover(const FInputDeviceRay& DevicePo
 {
 	// Alt+W/E/T: CompVis owns hover/pick. Skip world line-traces here  - they fight
 	// key editing and add heavy per-frame cost (feels like a frozen viewport).
-	if (FModuleManager::Get().IsModuleLoaded(TEXT("MetaLandRoad")))
+	// C continue-draw still needs hover to rebuild green rails after the first click.
+	if (!bContinueDrawSession
+		&& FModuleManager::Get().IsModuleLoaded(TEXT("MetaLandRoad")))
 	{
 		const FMetaLandRoadEditorModule& Module = FMetaLandRoadEditorModule::Get();
 		if (Module.ShouldShowNativeEditOverlay()
@@ -4361,6 +4423,36 @@ void UMetaLandRoadInteractiveTool::CookJunctionForActiveRoad(
 		return;
 	}
 
+	AMoKuEditSplineActor* ForcedOtherRoad = nullptr;
+	FVector ForcedIntersectWorld = FVector::ZeroVector;
+	if (bInsertJunction && !InsertJunctionWorld.IsNearlyZero())
+	{
+		ForcedOtherRoad = InsertJunctionSourceRoad.Get();
+		ForcedIntersectWorld = InsertJunctionWorld;
+		UE_LOG(
+			LogTemp,
+			Log,
+			TEXT("[CtrlT] cook new=%s other=%s"),
+			*FinishActor->GetName(),
+			ForcedOtherRoad ? *ForcedOtherRoad->GetName() : TEXT("null"));
+		const int32 LastPt = Comp->GetNumberOfSplinePoints() - 1;
+		const FVector P0 = Comp->GetLocationAtSplinePoint(0, ESplineCoordinateSpace::World);
+		const FVector P1 = Comp->GetLocationAtSplinePoint(LastPt, ESplineCoordinateSpace::World);
+		const int32 Tip = (FVector::Dist2D(P0, ForcedIntersectWorld)
+			<= FVector::Dist2D(P1, ForcedIntersectWorld))
+			? 0
+			: LastPt;
+		if (FVector::Dist2D(
+			Comp->GetLocationAtSplinePoint(Tip, ESplineCoordinateSpace::World),
+			ForcedIntersectWorld) > 1.0)
+		{
+			FinishActor->Modify();
+			Comp->Modify();
+			Comp->SetLocationAtSplinePoint(
+				Tip, ForcedIntersectWorld, ESplineCoordinateSpace::World, true);
+		}
+	}
+
 	// Lane-anchor Direct skips hub cook during free extend; force=true for Ctrl+click road-hit interrupt only.
 	const bool bLaneDirectConnectFinish =
 		!bForceHubJunctionCook
@@ -4377,7 +4469,10 @@ void UMetaLandRoadInteractiveTool::CookJunctionForActiveRoad(
 			RoadMode->ProcessInteractiveFinishedRoadDraw(
 				FinishActor,
 				/*bFullWorldRebuild=*/false,
-				MaxHeightDelta);
+				MaxHeightDelta,
+				/*bSelectCookedJunction=*/bFinishEditSession,
+				ForcedOtherRoad,
+				ForcedIntersectWorld);
 		}
 		else if (GEngine)
 		{
@@ -4426,8 +4521,21 @@ void UMetaLandRoadInteractiveTool::OnFinishedSplineEdit()
 	const bool bContinueDrawFinish = bContinueDrawSession;
 	const int32 SavedContinueDrawOriginalNumPoints = ContinueDrawOriginalNumPoints;
 	const TArray<FVector> SavedGuidanceCenterline = GuidanceCenterline;
-	const double SavedContinueDrawMouthS = ContinueDrawMouthS;
-	const FVector SavedContinueDrawMouthCenter = ContinueDrawMouthCenter;
+	const double SavedContinueDrawMouthS = (ContinueDrawInsertS >= 0.0)
+		? ContinueDrawInsertS
+		: ContinueDrawMouthS;
+	FVector SavedContinueDrawMouthCenter = ContinueDrawMouthCenter;
+	if (AMoKuEditSplineActor* TipRoad = Cast<AMoKuEditSplineActor>(ActiveActor))
+	{
+		if (UMoKuEditSplinesComponent* TipSpline = TipRoad->GetSplineComponent())
+		{
+			if (SavedContinueDrawMouthS >= 0.0)
+			{
+				SavedContinueDrawMouthCenter = TipSpline->GetLocationAtDistanceAlongSpline(
+					SavedContinueDrawMouthS, ESplineCoordinateSpace::World);
+			}
+		}
+	}
 	const bool bSavedGuidanceInvalid = bDrawGuidanceInvalid;
 	const bool bContinueDrawAttachAtStart =
 		bContinueDrawFinish && StateOfEditor == EMoKuEditState::Forward;
@@ -4451,6 +4559,10 @@ void UMetaLandRoadInteractiveTool::OnFinishedSplineEdit()
 	}
 
 	UMoKuEditSplinesComponent* Comp = FinishActor ? FinishActor->GetSplineComponent() : nullptr;
+	if (bContinueDrawFinish && bEndSnapFinish && Comp)
+	{
+		ContinueDrawOriginalNumPoints = Comp->GetNumberOfSplinePoints();
+	}
 	const bool bCanFinishRoad = FinishActor
 		&& Comp
 		&& Comp->GetNumberOfSplinePoints() >= 2;
@@ -4486,6 +4598,10 @@ void UMetaLandRoadInteractiveTool::OnFinishedSplineEdit()
 				&SavedGuidanceCenterline,
 				SavedContinueDrawMouthS,
 				SavedContinueDrawMouthCenter);
+			if (bContinueDrawFinish && SavedGuidanceCenterline.Num() < 2)
+			{
+				ReconstructContinueDrawAuthoringSpline(FinishActor);
+			}
 			// Mouth connect only  - hub cook is click-on-road (unless Cook On A is enabled).
 			if (bCookOnA)
 			{
@@ -4498,6 +4614,10 @@ void UMetaLandRoadInteractiveTool::OnFinishedSplineEdit()
 		}
 		else if (FinishActor && bCanFinishRoad)
 		{
+			if (bContinueDrawFinish)
+			{
+				ReconstructContinueDrawAuthoringSpline(FinishActor);
+			}
 			if (bCookOnA)
 			{
 				CookJunctionForActiveRoad(/*bFinishEditSession=*/true, /*bForceHubJunctionCook=*/false);
@@ -4677,17 +4797,67 @@ void UMetaLandRoadInteractiveTool::PostEditUndo()
 	Super::PostEditUndo();
 
 	const bool bLaneExtendActive = IsLaneAnchorDrawSession() || bRoadSpawnedFromLaneAnchorDraw;
-	if (!bLaneExtendActive)
-	{
-		ClearDrawGuidanceRails();
-		bSplineSnapActive = false;
-	}
-	else
+	if (bLaneExtendActive)
 	{
 		ResyncLaneExtendSessionAfterUndo();
 		if (GEditor)
 		{
 			GEditor->RedrawLevelEditingViewports(false);
+		}
+	}
+	else if (!IsDrawSessionActive())
+	{
+		ClearDrawGuidanceRails();
+		bContinueDrawSession = false;
+		ClearContinueDrawMouthArm();
+		PreviewComponent = nullptr;
+		bHasGuidancePlaneZ = false;
+		bSplineSnapActive = false;
+		bInsertJunction = false;
+		if (AMoKuEditSplineActor* Road = Cast<AMoKuEditSplineActor>(ActiveActor))
+		{
+			if (UMoKuEditSplinesComponent* Spline = Road->GetSplineComponent())
+			{
+				Spline->bDeferRoadMeshRefresh = false;
+			}
+		}
+		if (!IsValid(ActiveActor))
+		{
+			ActiveActor = nullptr;
+		}
+		if (GEditor)
+		{
+			GEditor->RedrawLevelEditingViewports(false);
+		}
+	}
+	else
+	{
+		AMoKuEditSplineActor* Road = Cast<AMoKuEditSplineActor>(ActiveActor);
+		UMoKuEditSplinesComponent* Spline = (Road && IsValid(Road))
+			? Road->GetSplineComponent()
+			: nullptr;
+		const bool bDrawGone = !IsValid(ActiveActor)
+			|| !Spline
+			|| Spline->GetNumberOfSplinePoints() < 1;
+		if (bDrawGone)
+		{
+			ClearDrawGuidanceRails();
+			UpdateEditState(false);
+			bContinueDrawSession = false;
+			ClearContinueDrawMouthArm();
+			ActiveActor = nullptr;
+			PreviewComponent = nullptr;
+			bHasGuidancePlaneZ = false;
+			bSplineSnapActive = false;
+			bInsertJunction = false;
+		}
+		else
+		{
+			if (AMoKuEditSplineActor* LiveRoad = Cast<AMoKuEditSplineActor>(ActiveActor))
+			{
+				RefreshRoadMeshSuppressJunction(LiveRoad);
+			}
+			UpdateDrawGuidanceRails();
 		}
 	}
 

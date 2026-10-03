@@ -260,6 +260,11 @@ public:
 		const UMetaLandRoadSplineComponent* SplineComp,
 		FPrimitiveDrawInterface* PDI,
 		const FSceneView* View = nullptr) const;
+	void DrawSidewalkOverlay(FPrimitiveDrawInterface* PDI, const FSceneView* View) const;
+	bool HandleSidewalkClick(
+		FEditorViewportClient* InViewportClient,
+		HHitProxy* HitProxy,
+		const FViewportClick& Click);
 	bool HandlePropSettingClick(
 		FEditorViewportClient* InViewportClient,
 		HHitProxy* HitProxy,
@@ -386,6 +391,9 @@ protected:
 		float Alpha,
 		double WorldS);
 	void GeneratePropSettingContextMenuSections(FMenuBuilder& InMenuBuilder) const;
+	void GenerateSidewalkContextMenuSections(FMenuBuilder& InMenuBuilder) const;
+	void OnAddSidewalkKey();
+	void OnDeleteSidewalkKey();
 	bool HandlePropSettingInputDelta(
 		FEditorViewportClient* ViewportClient,
 		FViewport* Viewport,
@@ -473,5 +481,6 @@ protected:
 	void TickLaneEditHover();
 	void TickLandscapeAttributeHover();
 	void TickPropSettingHover();
+	void TickSidewalkHover();
 	void UpdateNativeHoverCacheFromViewport();
 };

@@ -62,6 +62,14 @@ protected:
 	void EnsurePropSettingDetailsView();
 	void RefreshPropSettingDetails();
 	void OnPropSettingDetailsFinished(const FPropertyChangedEvent& PropertyChangedEvent);
+	void OnSidewalkAttributeClicked();
+	void OnSidewalkShowClicked();
+	void OnSidewalkHideClicked();
+	void OnSidewalkAddKeyClicked();
+	void OnSidewalkDeleteKeyClicked();
+	void EnsureSidewalkDetailsView();
+	void RefreshSidewalkDetails();
+	void OnSidewalkDetailsFinished(const FPropertyChangedEvent& PropertyChangedEvent);
 	UMetaLandRoadSplineComponent* FindSelectedRoadSpline() const;
 	void EnsureLandscapeKeyDetailsView();
 	void EnsureJunctionLandscapeDetailsView();
@@ -78,4 +86,8 @@ protected:
 	TSharedPtr<class IStructureDetailsView> PropSettingDetailsView;
 	TSharedPtr<class FStructOnScope> PropSettingEditStruct;
 	bool bRefreshingPropSettingDetails = false;
+
+	TSharedPtr<class IStructureDetailsView> SidewalkDetailsView;
+	TSharedPtr<class FStructOnScope> SidewalkEditStruct;
+	bool bRefreshingSidewalkDetails = false;
 };
